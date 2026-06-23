@@ -49,6 +49,7 @@ class ROS2ControlReceiver:
         """
         self._name = name
         self._robot_prim = robot_prim
+        self._rigid_prim = None  # lazily created SingleRigidPrim, cached across ticks
         
         # configuration
         self._enable_ros2 = False
@@ -75,7 +76,7 @@ class ROS2ControlReceiver:
         
     def initialize(self, enable_ros2=True, vel_topic="/oceansim/robot/vel_cmd", force_topic="/oceansim/robot/force_cmd"):
         """
-        initialize reciever function
+        initialize receiver function
         
         Args:
             enable_ros2 (bool): whether using ros2
@@ -176,7 +177,7 @@ class ROS2ControlReceiver:
         
         include linear and angular velocity
         """
-        print(f'[{self._name}] recieve ROS2 msg, type: {type(msg).__name__}, linear: {msg.linear}, angular: {msg.angular}')
+        print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, linear: {msg.linear}, angular: {msg.angular}')
         
         if not self._enable_ros2:
             print(f'[{self._name}] ROS2 is not enabled, ignore msg')
@@ -191,7 +192,7 @@ class ROS2ControlReceiver:
             
             print(f'Received velocity - Linear: {self.linear_vel}, Angular: {self.angular_vel}')
             # self._update_receive_stats(current_time)
-            
+
         except Exception as e:
             print(f'[{self._name}] Vel Receive Failed: {e}')
         
@@ -201,7 +202,7 @@ class ROS2ControlReceiver:
         
         include force and torque
         """
-        print(f'[{self._name}] recieve ROS2 msg, type: {type(msg).__name__}, force: {msg.force}, torque: {msg.torque}')
+        print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, force: {msg.force}, torque: {msg.torque}')
 
         if not self._enable_ros2:
             print(f'[{self._name}] ROS2 is not enabled, ignore msg')
@@ -236,15 +237,16 @@ class ROS2ControlReceiver:
                     self._update_count = 0
 
                     rclpy.spin_once(self._ros2_vel_node, timeout_sec=0.0)
-                    
-                    rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
-                    rigid_prim.set_linear_velocity(np.array([0.0, 0.0, 0.0]))  # reset
-                    rigid_prim.set_angular_velocity(np.array([0.0, 0.0, 0.0]))  # reset
-                    rigid_prim.set_linear_velocity(np.array(self.linear_vel))
-                    rigid_prim.set_angular_velocity(np.array(self.angular_vel))
+
+                    if self._rigid_prim is None:
+                        self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
+                    self._rigid_prim.set_linear_velocity(np.array([0.0, 0.0, 0.0]))  # reset
+                    self._rigid_prim.set_angular_velocity(np.array([0.0, 0.0, 0.0]))  # reset
+                    self._rigid_prim.set_linear_velocity(np.array(self.linear_vel))
+                    self._rigid_prim.set_angular_velocity(np.array(self.angular_vel))
 
             elif self._ros2_control_mode == ROS2_CONTROL_MODE.FORCE: # force mode
-                # using PXR API to contorl
+                # using PXR API to control
                 if PXR_AVAILABLE:
                     
                     self._update_count += 1

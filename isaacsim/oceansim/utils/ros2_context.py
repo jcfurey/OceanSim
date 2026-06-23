@@ -14,23 +14,28 @@ Note: ``rclpy`` is provided by the ``isaacsim.ros2.bridge`` extension, which mus
 be activated before the OceanSim extension (see the ROS2 Bridge docs).
 """
 
+import threading
+
 import rclpy
 
 _refcount = 0
+_lock = threading.Lock()
 
 
 def acquire():
     """Ensure the shared rclpy context is initialized and register a holder."""
     global _refcount
-    if not rclpy.ok():
-        rclpy.init()
-    _refcount += 1
+    with _lock:
+        if not rclpy.ok():
+            rclpy.init()
+        _refcount += 1
 
 
 def release():
     """Release a holder, shutting down rclpy once the last holder is gone."""
     global _refcount
-    if _refcount > 0:
-        _refcount -= 1
-    if _refcount == 0 and rclpy.ok():
-        rclpy.shutdown()
+    with _lock:
+        if _refcount > 0:
+            _refcount -= 1
+        if _refcount == 0 and rclpy.ok():
+            rclpy.shutdown()

@@ -246,11 +246,11 @@ class UIBuilder:
         On pressing the Load Button, a new instance of World() is created and then this function is called.
         The user should now load their assets onto the stage and add them to the World Scene.
         """
-        try: 
+        try:
             open_stage(self.scene_path_field.get_value_as_string())
             print('USD scene is loaded.')
-        except:
-            print('Path is not valid or scene can not be opened. Default to current stage')
+        except Exception as e:
+            print(f'Path is not valid or scene can not be opened ({e}). Default to current stage')
 
 
 

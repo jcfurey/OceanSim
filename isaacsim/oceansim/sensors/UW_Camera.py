@@ -86,8 +86,8 @@ class UW_Camera(Camera):
         Args:
             UW_param (np.ndarray, optional): Underwater parameters array:
                 [0:3] - Backscatter value (RGB)
-                [3:6] - Attenuation coefficients (RGB)
-                [6:9] - Backscatter coefficients (RGB)
+                [3:6] - Backscatter coefficients (RGB)
+                [6:9] - Attenuation coefficients (RGB)
                 Defaults to typical coastal water values.
             viewport (bool, optional): Enable viewport visualization. Defaults to True.
             writing_dir (str, optional): Directory to save rendered images. Defaults to None.

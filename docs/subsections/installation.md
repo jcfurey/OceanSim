@@ -28,7 +28,7 @@ Then, run the following to configure OceanSim to point to your asset path:
 cd /path/to/OceanSim
 python3 config/register_asset_path.py /path/to/OceanSim_assets
 ```
-For Isaac Sim 4.5, we follow the official [workstation installation guide](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_workstation.html).
+For older releases (e.g. Isaac Sim 4.5), follow the official [workstation installation guide](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_workstation.html) and check out the matching OceanSim release tag.
 
 **NOTE**: The main branch is always the latest release and does not have backward compatibility due to Omniverse being a fast evolving ecosystem. 
 Please download previous release and the installation is exactly the same as above.
