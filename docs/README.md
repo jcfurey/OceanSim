@@ -6,7 +6,7 @@
 [![Website](https://img.shields.io/website?down_color=red&down_message=offline&up_color=blue&up_message=online&url=https%3A%2F%2Fumfieldrobotics.github.io%2FOceanSim%2F)](https://umfieldrobotics.github.io/OceanSim/)
 [![Subscription Form](https://img.shields.io/badge/Subscribe-Form-blue.svg)](https://docs.google.com/forms/d/e/1FAIpQLSfKWMhE4L6R4jjvEw_bfMtLigXbv5WZeijDah5vk2SpQZW1hA/viewform)
 [![arXiv](https://img.shields.io/badge/arXiv-2503.01074-b31b1b.svg)](https://arxiv.org/abs/2503.01074)
-[![IsaacSim 5.0.0](https://img.shields.io/badge/IsaacSim-5.0.0-brightgreen.svg)](https://docs.isaacsim.omniverse.nvidia.com/latest/index.html)
+[![IsaacSim 6.0.1](https://img.shields.io/badge/IsaacSim-6.0.1-brightgreen.svg)](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/index.html)
 <!-- add and scale media/oceansim_demo.gif to full width-->
 <!-- ![OceanSim Demo](../media/oceansim_demo.gif) \ -->
 <a href="https://umfieldrobotics.github.io/OceanSim/">
@@ -30,6 +30,7 @@ OceanSim is a high-fidelity underwater simulation framework designed to accelera
 
 
 ## Latest Updates
+- `[2025/9]` ROS2 bridge support (control + underwater image publishing) is now merged into the main branch. See [ROS2 Bridge](#ros2-bridge) below.
 - `[2025/9]` OceanSim is now compatible with Isaac Sim 5.0 GA.
 - `[2025/4]` OceanSim is featured by [NVIDIA Robotics](https://www.linkedin.com/posts/nvidiarobotics_robotics-underwaterrobotics-simulation-activity-7313986055894880257-Dfmq?utm_source=share&utm_medium=member_desktop&rcm=ACoAACB8Y7sB7ikB6wVGPL5NrxYkNwk8RTEJ-3Y)!
 - `[2025/4]` 🔥 Beta version of OceanSim is released!
@@ -48,6 +49,30 @@ We divide the documentation into three parts:
 - [Installation](subsections/installation.md)
 - [Running OceanSim](subsections/running_example.md)
 - [Building Your Own Digital Twins with OceanSim](subsections/building_own_digital_twin.md)
+
+## ROS2 Bridge
+OceanSim ships an optional ROS2 bridge so the provided example can be driven from, and publish to, a ROS2 graph.
+
+Set up your ROS2 workspace with Isaac Sim by following the official [Isaac Sim ROS 2 installation tutorial](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/install_ros.html). On Isaac Sim 6.0.1 the default target is Ubuntu 24.04 with ROS 2 Jazzy (ROS 2 Humble on Ubuntu 22.04 is also supported).
+
+Before the OceanSim extension is activated, the `isaacsim.ros2.bridge` extension must be activated, otherwise `rclpy` will fail to load. We suggest setting `isaacsim.ros2.bridge` to **AUTOLOADED** in *Window → Extensions*.
+
+### ROS2 control
+We provide an example util at `isaacsim/oceansim/utils/ros2_control.py` to consult and develop on. It extends the control mode to **ROS control** in the **sensor_example** extension.
+
+### ROS2 underwater image publishing
+The `UW_Camera` class (`isaacsim/oceansim/sensors/UW_Camera.py`) can publish underwater images over ROS2. For testing, we provide a subscriber example at `isaacsim/oceansim/utils/ros2_image_subscriber.py`.
+
+Test steps:
+1. Check the *Underwater Camera* checkbox in the **sensor_example** extension.
+2. Run the simulation.
+3. In a terminal, run the subscriber:
+```
+cd /path/to/oceansim/utils
+python3 ros2_image_subscriber.py
+```
+
+Great appreciation to [Tang-JingWei](https://github.com/Tang-JingWei) for contributing the ROS bridge example for OceanSim.
 
 ## Support and Contributing
 We welcome contributions and discussions from the community!
@@ -96,4 +121,3 @@ If you use the sonar model in OceanSim, please also cite the HoloOcean paper as 
 ---
 
 *OceanSim - A GPU-Accelerated Underwater Robot Perception Simulation Framework*
-

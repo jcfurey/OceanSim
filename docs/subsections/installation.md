@@ -2,14 +2,14 @@
 We design OceanSim as an extension package for NVIDIA Isaac Sim. This design allows better integration with Isaac Sim and users can pair OceanSim with other Isaac Sim extensions. This document provides a step-by-step guide to install OceanSim.
 
 ## Prerequisites
-OceanSim does not enforce any additional prerequisites beyond those required by Isaac Sim. Please refer to the [official Isaac Sim documentation](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/requirements.html#system-requirements) for the prerequisites.
+OceanSim does not enforce any additional prerequisites beyond those required by Isaac Sim. Please refer to the [official Isaac Sim documentation](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/requirements.html#system-requirements) for the prerequisites.
 
-OceanSim is now compatible with Isaac Sim 5.0. Due to the changes in Isaac Sim 5.0 compared to previous versions, OceanSim main branch release may not work with older versions of Isaac Sim.
+OceanSim is now compatible with Isaac Sim 6.0.1. Due to the changes in recent Isaac Sim releases compared to previous versions, the OceanSim main branch release may not work with older versions of Isaac Sim.
 
 We have tested OceanSim on Ubuntu 20.04, 22.04, and 24.04. We have also tested OceanSim using various GPUs, including NVIDIA RTX 3090, RTX A6000, and RTX 4080 Super, TX 5070Ti. 
 
 ## Installation
-For Isaac Sim 5.0, we build from their [source code](https://github.com/isaac-sim/IsaacSim).
+For Isaac Sim 6.0.1, we build from their [source code](https://github.com/isaac-sim/IsaacSim). If you plan to use the [ROS2 Bridge](../README.md#ros2-bridge), set up your ROS2 workspace by following the official [Isaac Sim ROS 2 installation tutorial](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/install_ros.html) (Ubuntu 24.04 + ROS 2 Jazzy by default; ROS 2 Humble on Ubuntu 22.04 is also supported).
 
 
 
