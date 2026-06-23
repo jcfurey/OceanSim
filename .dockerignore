@@ -1,0 +1,12 @@
+# Keep the build context (and image) small: documentation media and git
+# metadata are not needed at runtime.
+.git
+.github
+media/
+*.gif
+docs/static/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.DS_Store

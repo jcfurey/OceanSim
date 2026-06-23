@@ -33,6 +33,23 @@ For Isaac Sim 4.5, we follow the official [workstation installation guide](https
 **NOTE**: The main branch is always the latest release and does not have backward compatibility due to Omniverse being a fast evolving ecosystem. 
 Please download previous release and the installation is exactly the same as above.
 
+## Running in Docker (Isaac Sim 6.0.1 + ROS 2 Jazzy)
+A [`Dockerfile`](../../Dockerfile) is provided that builds on NVIDIA's official Isaac Sim 6.0.1 container (Ubuntu 24.04) and layers ROS 2 Jazzy and OceanSim on top.
+
+Prerequisites: an NVIDIA GPU with a recent driver, [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), and an [NGC](https://catalog.ngc.nvidia.com/) login to pull the base image (`docker login nvcr.io`).
+
+```bash
+# Build the image
+docker build -t oceansim:6.0.1 .
+
+# Launch with GPU access and X11 display passthrough
+./docker/run.sh
+```
+
+The [`docker/run.sh`](../../docker/run.sh) helper handles display passthrough for you: it runs `xhost +local:root` to authorize the container against your host X server, forwards `DISPLAY`, mounts `/tmp/.X11-unix` and your `.Xauthority`, and requests the GPU via `--runtime=nvidia --gpus all`. Inside the container, start the GUI with `./isaac-sim.sh`. To pass your downloaded USD assets, set `OCEANSIM_ASSETS=/path/to/OceanSim_assets` before running, then inside the container run `python3 config/register_asset_path.py /isaac-sim/OceanSim_assets` from the OceanSim directory (`/isaac-sim/extsUser/OceanSim`).
+
+When you are done, you can revoke the X server grant with `xhost -local:root`.
+
 ## Launching OceanSim
 There is no separate building process needed for OceanSim, as it is an extension. To load OceanSim: 
 - IsaacSim, follow `Window -> Extensions`
