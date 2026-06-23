@@ -26,6 +26,8 @@ from sensor_msgs.msg import CompressedImage
 import time
 import cv2
 
+from isaacsim.oceansim.utils import ros2_context
+
 class UW_Camera(Camera):
 
     def __init__(self, 
@@ -140,6 +142,9 @@ class UW_Camera(Camera):
         self._last_publish_time = 0.0
         self._ros2_pub_frequency = ros2_pub_frequency     # publish frequency, hz
         self._ros2_pub_jpeg_quality = ros2_pub_jpeg_quality
+        self._ros2_acquired = False
+        self._ros2_uw_img_node = None
+        self._uw_img_pub = None
         self._setup_ros2_publisher()
         
         print(f'[{self._name}] Initialized successfully. Data writing: {self._writing}')
@@ -152,10 +157,9 @@ class UW_Camera(Camera):
             if not self._enable_ros2_pub:
                 return
             
-            # Initialize ROS2 context if not already done
-            if not rclpy.ok():
-                rclpy.init()
-                print(f'[{self._name}] ROS2 context initialized')
+            # Initialize/share the rclpy context (ref-counted across components)
+            ros2_context.acquire()
+            self._ros2_acquired = True
 
             # Create uw image publisher node
             node_name = f'oceansim_rob_uw_img_pub_{self._name.lower()}'.replace(' ', '_')
@@ -179,7 +183,7 @@ class UW_Camera(Camera):
 
             # fps control
             current_time = time.time()
-            if current_time - self._last_publish_time < (1.0 / self._frequency):
+            if current_time - self._last_publish_time < (1.0 / self._ros2_pub_frequency):
                 return
 
             # Convert the image
@@ -292,9 +296,18 @@ class UW_Camera(Camera):
         rep.AnnotatorCache.clear(self._rgba_annot)
         rep.AnnotatorCache.clear(self._depth_annot)
 
+        # Tear down ROS2 publisher and release the shared rclpy context
+        if self._ros2_uw_img_node is not None:
+            self._ros2_uw_img_node.destroy_node()
+            self._ros2_uw_img_node = None
+            self._uw_img_pub = None
+        if self._ros2_acquired:
+            ros2_context.release()
+            self._ros2_acquired = False
+
         if self._viewport:
             self.ui_destroy()
-            
+
         print(f'[{self._name}] Annotator detached. AnnotatorCache cleaned.')
     
     

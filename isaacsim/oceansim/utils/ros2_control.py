@@ -16,6 +16,8 @@ so, we suggest that make sure the extension isaacsim.ros2.bridge is being setup 
 '''
 import rclpy
 
+from isaacsim.oceansim.utils import ros2_context
+
 try:
     from pxr import Gf, PhysxSchema
     PXR_AVAILABLE = True
@@ -50,7 +52,8 @@ class ROS2ControlReceiver:
         
         # configuration
         self._enable_ros2 = False
-        
+        self._ros2_acquired = False
+
         self._ros2_control_mode = ROS2_CONTROL_MODE.VEL  # control mode
         self._ros2_vel_node = None
         self._ros2_force_node = None
@@ -133,11 +136,10 @@ class ROS2ControlReceiver:
             from geometry_msgs.msg import Twist, Wrench
             from std_msgs.msg import Header
             
-            # Initialize ROS2 context if not already done
-            if not rclpy.ok():
-                rclpy.init()
-                print(f'[{self._name}] ROS2 context initialized')
-            
+            # Initialize/share the rclpy context (ref-counted across components)
+            ros2_context.acquire()
+            self._ros2_acquired = True
+
             # Create velocity subscriber node
             node_name = f'oceansim_rob_velocity_control_{self._name.lower()}'.replace(' ', '_')
             self._ros2_vel_node = rclpy.create_node(node_name)
@@ -160,6 +162,7 @@ class ROS2ControlReceiver:
             
         except Exception as e:
             self._enable_ros2 = False
+            print(f'[{self._name}] ROS2 subscriber setup failed: {e}')
 
     def _setup_ros2_control_mode(self, ctrl_mode):
         if ctrl_mode == "velocity control":
@@ -269,8 +272,10 @@ class ROS2ControlReceiver:
         if self._enable_ros2:
             if self._ros2_vel_node:
                 self._ros2_vel_node.destroy_node()
+                self._ros2_vel_node = None
             if self._ros2_force_node:
                 self._ros2_force_node.destroy_node()
+                self._ros2_force_node = None
 
         self._update_count = 0
         self.force_cmd = [0.0, 0.0, 0.0]
@@ -278,7 +283,10 @@ class ROS2ControlReceiver:
         self.linear_vel = [0.0, 0.0, 0.0]
         self.angular_vel = [0.0, 0.0, 0.0]
 
-        rclpy.shutdown()
+        # Release the shared rclpy context (only shuts down once all holders release)
+        if self._ros2_acquired:
+            ros2_context.release()
+            self._ros2_acquired = False
 
         print(f'[{self._name}] ROS2_Control_receiver closed.') 
 
