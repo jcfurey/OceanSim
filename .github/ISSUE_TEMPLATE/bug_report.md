@@ -25,7 +25,7 @@ If applicable, add screenshots to help explain your problem.
 
 **Desktop (please complete the following information):**
  - OS: [e.g. Ubuntu, Mint]
- - IsaaSim Version [e.g. 4.5.0]
+ - Isaac Sim Version [e.g. 6.0.1]
 
 **Additional context**
 Add any other context about the problem here.

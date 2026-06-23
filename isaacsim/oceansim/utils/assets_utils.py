@@ -29,8 +29,8 @@ def get_oceansim_assets_path() -> str:
         )
         
     asset_path = json_data["asset_path"]
-    
-    if not os.path.isdir(asset_path):
+
+    if not asset_path or not os.path.isdir(asset_path):
         raise FileNotFoundError(f"The provided asset path does not exist: {asset_path}. "
                                 "Run /path/to/oceansim/config/register_asset_path.py /path/to/assets as described in the ReadMe.")
 

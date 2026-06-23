@@ -141,9 +141,9 @@ class MHL_Sensor_Example_Scenario():
             self.waypoints = read_data_from_file(waypoint_path)
             print('Waypoints loaded successfully.')
             print(f'Waypoint[0]: {self.waypoints[0]}')
-        except:
+        except Exception as e:
             self.waypoints = read_data_from_file(default_waypoint_path)
-            print('Fail to load this waypoints. Back to default waypoints.')
+            print(f'Fail to load waypoints from {waypoint_path} ({e}). Back to default waypoints.')
 
         
     def teardown_scenario(self):

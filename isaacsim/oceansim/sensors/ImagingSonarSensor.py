@@ -238,8 +238,8 @@ class ImagingSonarSensor(Camera):
             - Automatically skips frames with no detected objects
         """
         # Due to the time to load annotator to cuda, the first few simulation tick gives no annotation in memory.
-        # This would also reult error when no mesh within the sonar fov
-        # NOTE: Isaac Sim annotator output has squeezed the first dimention after 5.0 update: (1,N,3) -> (N,3)   
+        # This would also result in an error when no mesh within the sonar fov
+        # NOTE: Isaac Sim annotator output has squeezed the first dimension after 5.0 update: (1,N,3) -> (N,3)
         if len(self.semanticSeg_annot.get_data()['info']['idToLabels']) !=0:
             self.scan_data['pcl'] = self.pointcloud_annot.get_data(device=self._device)['data']  # shape :(N,3) <class 'warp.types.array'>
             self.scan_data['normals'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointNormals'] # shape :(N,4) <class 'warp.types.array'>

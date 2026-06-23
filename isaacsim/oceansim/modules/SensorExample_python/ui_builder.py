@@ -364,7 +364,7 @@ class UIBuilder():
         The user may assume that their objects are properly initialized, and that the timeline is paused on timestep 0.
 
         They may also assume that objects that were added to the World.Scene have been moved to their default positions.
-        I.e. the cube prim will move back to the posiheirtion it was in when it was created in self._setup_scene().
+        I.e. the cube prim will move back to the position it was in when it was created in self._setup_scene().
         """
         self._reset_scenario()
 
@@ -488,6 +488,10 @@ class UIBuilder():
 
     def _on_ros2_control_mode_dropdown_clicked(self, mode):
         self._scenario._ros2_control_mode = mode
+        if self._scenario._ros2_control_receiver is None:
+            print('ROS2 control receiver is not initialized; ignoring control mode change. '
+                  'Make sure the isaacsim.ros2.bridge extension is enabled and the scenario is loaded.')
+            return
         self._scenario._ros2_control_receiver._setup_ros2_control_mode(
                 self._scenario._ros2_control_mode
             )

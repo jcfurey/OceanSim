@@ -19,7 +19,14 @@ For more instructions when using this example, refer to the following, which you
   - guides on developing your own digital twins.
 - User can test this demo on their own scene by copying the USD file path to `Path to USD`, otherwise a default one is loaded.
 - For DVL sensor, scene has to be toggled with static collider for beam interaction!
-- Manual control:
+- The `Control Mode` dropdown in the `World Controls` panel offers the following options:
+  - `No control`: Robot will remain static.
+  - `Straight line`: Robot will travel in the local +x direction at v=0.5 m/s.
+  - `Waypoints`: Robot follows a sequence of poses. Selecting this reveals a `Waypoints` panel with a file picker; a demo file is provided at `demo/demo_waypoints.txt`.
+  - `Manual control`: Drive the robot with the keyboard (see key bindings below).
+  - `ROS control`: Drive the robot from a ROS2 graph. Selecting this reveals the `ROS2 Control Mode Setting` panel. The `isaacsim.ros2.bridge` extension must be enabled first — see the [ROS2 Bridge](../README.md#ros2-bridge) section for setup and usage.
+
+- Manual control key bindings:
 
 <div align="center">
 
@@ -39,10 +46,6 @@ For more instructions when using this example, refer to the following, which you
 | Right key| -roll   |
 
 </div>
-
-- Automatic Control:
-  - `Straight line`: Robot will travel to local x direction with v=0.5m/s
-- No control: Robot will remain static.
 
 ### Running the example
 To run the example after selecting the sensors and their configurations, first `Load`, and then click `Run`.
