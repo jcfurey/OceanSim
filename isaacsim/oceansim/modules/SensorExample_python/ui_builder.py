@@ -12,7 +12,7 @@ from isaacsim.core.prims import SingleRigidPrim, SingleGeometryPrim
 from isaacsim.core.utils.prims import get_prim_at_path
 from isaacsim.core.utils.stage import get_current_stage, add_reference_to_stage, create_new_stage, open_stage
 from isaacsim.core.utils.rotations import euler_angles_to_quat
-from isaacsim.core.utils.semantics import add_update_semantics
+from isaacsim.core.utils.semantics import add_labels  # Isaac 6.0.1 renamed add_update_semantics -> add_labels
 from isaacsim.gui.components import CollapsableFrame, StateButton, get_style, setup_ui_headers, CheckBox, combo_cb_xyz_plot_builder, combo_cb_plot_builder, dropdown_builder, str_builder
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
@@ -263,17 +263,15 @@ class UIBuilder():
             # Toggle MHL mesh's collider
             SingleGeometryPrim(prim_path=MHL_prim_path, collision=True)
             # apply a reflectivity of 1.0 to mesh of the scene for sonar simulation
-            add_update_semantics(prim=get_prim_at_path(MHL_prim_path + "/Mesh/mesh"),
-                                type_label='reflectivity',
-                                semantic_label='1.0')
+            add_labels(get_prim_at_path(MHL_prim_path + "/Mesh/mesh"),
+                       labels=['1.0'], instance_name='reflectivity')
             # Load the rock
             rock_prim_path = '/World/rock'
             rock_usd_path = get_oceansim_assets_path() + "/collected_rock/rock.usd"
             rock_prim = add_reference_to_stage(usd_path=rock_usd_path, prim_path=rock_prim_path)
             # apply a reflectivity of 2.0 for sonar simulation
-            add_update_semantics(prim=get_prim_at_path(rock_prim_path+ '/Mesh/mesh'),
-                                type_label='reflectivity',
-                                semantic_label='2.0')
+            add_labels(get_prim_at_path(rock_prim_path+ '/Mesh/mesh'),
+                       labels=['2.0'], instance_name='reflectivity')
             # Toggle collider for the rock
             rock_collider_prim = SingleGeometryPrim(prim_path=rock_prim_path,
                             collision=True)

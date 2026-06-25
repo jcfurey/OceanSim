@@ -154,9 +154,39 @@ def main(argv):
     from isaacsim.core.utils.prims import get_prim_at_path
     from isaacsim.core.utils.stage import add_reference_to_stage, create_new_stage
     from isaacsim.core.utils.rotations import euler_angles_to_quat
-    from isaacsim.core.utils.semantics import add_update_semantics
+    from isaacsim.core.utils.semantics import add_labels  # Isaac 6.0.1 renamed add_update_semantics -> add_labels
     from isaacsim.core.prims import SingleRigidPrim, SingleGeometryPrim
     from pxr import PhysxSchema
+
+    # Isaac 6.0.1 turns `isaacsim` into a regular package with a fixed __path__
+    # (['.../python_packages/isaacsim']), so the OceanSim dir on PYTHONPATH is NOT
+    # merged into the namespace and `import isaacsim.oceansim` fails. Splice the
+    # OceanSim package dir ($OCEANSIM_ROOT/isaacsim) into isaacsim.__path__ so the
+    # submodule resolves. (Inside Isaac, OceanSim is normally a kit extension; the
+    # standalone runner has to wire it up by hand.)
+    import importlib
+    import isaacsim as _isaacsim_pkg
+    _oceansim_ns = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))  # -> $OCEANSIM_ROOT/isaacsim
+    if _oceansim_ns not in _isaacsim_pkg.__path__:
+        _isaacsim_pkg.__path__.append(_oceansim_ns)
+    importlib.invalidate_caches()
+
+    # The headless runner only needs the GUI-free `scenario` module, but importing
+    # it would run `SensorExample_python/__init__.py` -> `from .extension import *`,
+    # which drags in the GUI `ui_builder` (LoadButton/ResetButton from
+    # `isaacsim.examples.extension.core_connectors`, removed in Isaac 6.0.1).
+    # Pre-seed a stub for that package so `scenario` loads as a submodule WITHOUT
+    # executing the package __init__. (oceansim/ and modules/ have no __init__.)
+    import sys
+    import types
+    _sep_name = "isaacsim.oceansim.modules.SensorExample_python"
+    if _sep_name not in sys.modules:
+        _sep = types.ModuleType(_sep_name)
+        _sep.__path__ = [os.path.join(_oceansim_ns, "oceansim", "modules",
+                                      "SensorExample_python")]
+        _sep.__package__ = _sep_name
+        sys.modules[_sep_name] = _sep
 
     from isaacsim.oceansim.modules.SensorExample_python.scenario import (
         MHL_Sensor_Example_Scenario)
@@ -177,13 +207,13 @@ def main(argv):
         add_reference_to_stage(usd_path=assets + "/collected_MHL/mhl_scaled.usd",
                                prim_path=mhl_path)
         SingleGeometryPrim(prim_path=mhl_path, collision=True)
-        add_update_semantics(prim=get_prim_at_path(mhl_path + "/Mesh/mesh"),
-                             type_label="reflectivity", semantic_label="1.0")
+        add_labels(get_prim_at_path(mhl_path + "/Mesh/mesh"),
+                   labels=["1.0"], instance_name="reflectivity")
         rock_path = "/World/rock"
         add_reference_to_stage(usd_path=assets + "/collected_rock/rock.usd",
                                prim_path=rock_path)
-        add_update_semantics(prim=get_prim_at_path(rock_path + "/Mesh/mesh"),
-                             type_label="reflectivity", semantic_label="2.0")
+        add_labels(get_prim_at_path(rock_path + "/Mesh/mesh"),
+                   labels=["2.0"], instance_name="reflectivity")
         rock = SingleGeometryPrim(prim_path=rock_path, collision=True)
         rock.set_collision_approximation("convexDecomposition")
         SingleRigidPrim(prim_path=rock_path, translation=np.array([1.0, 0.1, -1.5]),
