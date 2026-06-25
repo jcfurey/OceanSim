@@ -360,20 +360,34 @@ class OceanSimSensorPublisher:
     def _publish_sonar(self, stamp):
         """Build a ProjectedSonarImage from the OceanSim imaging sonar.
 
-        The OceanSim sonar bins returns onto a polar (azimuth x range) grid; we
-        expose it as the standard ``marine_acoustic_msgs/ProjectedSonarImage``
-        used by ``sonar_image_proc`` / ``sonar_proc``.  The intensity image is
-        emitted as one ``uint8`` value per (beam, range) cell, row-major over
-        beams (matching ``SonarImageData`` conventions).
+        OceanSim bins each ping onto a polar grid stored in
+        ``ImagingSonarSensor.sonar_map`` -- a Warp ``vec3`` array of shape
+        ``(n_range, n_azimuth)`` whose third channel is the processed,
+        display-normalised intensity in ``[0, 1]`` (see
+        ``utils/ImagingSonar_kernels.make_sonar_map_*``).  We expose it as the
+        standard ``marine_acoustic_msgs/ProjectedSonarImage`` used by
+        ``sonar_image_proc`` / ``sonar_proc``, emitting one ``uint8`` intensity
+        per (beam, range) cell, row-major over beams (``SonarImageData``
+        convention).
+
+        Note: ``make_sonar_image()`` is deliberately *not* used here -- it
+        returns the RGBA viewport texture (shape ``(n_range, n_azimuth, 4)``),
+        not the per-beam intensities the sonar pipeline expects.
         """
         from marine_acoustic_msgs.msg import (
             ProjectedSonarImage, PingInfo, SonarImageData)
         from geometry_msgs.msg import Vector3
 
-        image = np.asarray(self._sonar.make_sonar_image())  # (n_beams, n_range) intensities
-        if image.ndim != 2 or image.size == 0:
+        sonar_map = getattr(self._sonar, "sonar_map", None)
+        if sonar_map is None:
             return
-        n_beams, n_range = image.shape
+        grid = sonar_map.numpy() if hasattr(sonar_map, "numpy") else np.asarray(sonar_map)
+        # (n_range, n_azimuth, 3) vec3 grid; channel 2 is intensity in [0, 1].
+        if grid.ndim != 3 or grid.shape[2] < 3 or grid.size == 0:
+            return
+        # Transpose polar (range, azimuth) -> (beam, range), row-major over beams.
+        intensity = np.ascontiguousarray(grid[:, :, 2].T)
+        n_beams, n_range = intensity.shape
 
         min_range, max_range = self._sonar.get_range()
         hori_fov, _vert_fov = self._sonar.get_fov()  # degrees
@@ -403,7 +417,8 @@ class OceanSimSensorPublisher:
         data.is_bigendian = False
         data.dtype = SonarImageData.DTYPE_UINT8
         data.beam_count = int(n_beams)
-        img8 = np.clip(image, 0, 255).astype(np.uint8)
+        # Intensity is normalised to [0, 1]; scale to the full uint8 range.
+        img8 = np.clip(intensity * 255.0, 0.0, 255.0).astype(np.uint8)
         data.data = img8.reshape(-1).tobytes()
         msg.image = data
         self._sonar_pub.publish(msg)
