@@ -52,8 +52,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-std-msgs \
         ros-${ROS_DISTRO}-vision-msgs \
         ros-${ROS_DISTRO}-cv-bridge \
+        ros-${ROS_DISTRO}-rmw-zenoh-cpp \
         python3-opencv \
     && rm -rf /var/lib/apt/lists/*
+
+# Default the ROS 2 middleware to Zenoh so the sim joins the same graph as the
+# rest of the robot stack (which runs rmw_zenoh_cpp). Deployment-specific zenoh
+# config (ROS_DOMAIN_ID, peer/router endpoints) is NOT baked in — it is supplied
+# at runtime by sourcing the workspace's bashrc.d/99-zenoh_configs.bashrc, so the
+# endpoint config stays single-sourced with the rest of the stack.
+ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
 # Install OceanSim into the Isaac Sim user-extensions directory so it is
 # discoverable in the extension browser.
