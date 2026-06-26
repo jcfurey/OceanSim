@@ -89,7 +89,9 @@ class _RateGate:
     def ready(self, now: float) -> bool:
         if self._period <= 0.0:
             return True
-        if self._last is None or (now - self._last) >= self._period:
+        # Reset if sim time jumped backward (e.g. a world reset) so publishing
+        # resumes immediately instead of stalling until `now` catches back up.
+        if self._last is None or now < self._last or (now - self._last) >= self._period:
             self._last = now
             return True
         return False

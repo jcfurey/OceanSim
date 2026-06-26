@@ -350,8 +350,10 @@ class ImagingSonarSensor(Camera):
             # are placed at the index corresponding to the key
             # First two entry are always zero because {'0': {'class': 'BACKGROUND'}, '1': {'class': 'UNLABELLED'}}
             # eg: indexToProp = [0, 0, 0.1, 1 .....] 
-            max_id = max(idToLabels.keys(), default=-1)
-            indexToProp_array = np.ones((int(max_id)+1,))
+            # idToLabels keys are strings ('0', '1', ...); compare them numerically
+            # so an id >= 10 does not lexicographically undersize the array.
+            max_id = max((int(k) for k in idToLabels.keys()), default=-1)
+            indexToProp_array = np.ones((max_id + 1,))
             for id in idToLabels.keys():
                 for property in idToLabels.get(id):
                     if property == query_property:
