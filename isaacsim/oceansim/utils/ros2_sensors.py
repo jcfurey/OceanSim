@@ -419,7 +419,10 @@ class OceanSimSensorPublisher:
         ping = PingInfo()
         ping.frequency = float(getattr(self._sonar, "frequency", 1.2e6))
         ping.sound_speed = float(self._cfg["sound_speed"])
-        ping.tx_beamwidths = [math.radians(hori_fov)] * n_beams
+        # An imaging sonar has a SINGLE transmit beam insonifying the whole
+        # horizontal swath, and one receive beam per bearing. So tx_beamwidths is
+        # a single element (the tx swath), while rx_beamwidths is per receive beam.
+        ping.tx_beamwidths = [math.radians(hori_fov)]
         ping.rx_beamwidths = [math.radians(hori_fov / max(n_beams, 1))] * n_beams
         msg.ping_info = ping
 
