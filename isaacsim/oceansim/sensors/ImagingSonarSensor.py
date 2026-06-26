@@ -237,18 +237,77 @@ class ImagingSonarSensor(Camera):
             - First few frames may be empty due to CUDA initialization
             - Automatically skips frames with no detected objects
         """
-        # Due to the time to load annotator to cuda, the first few simulation tick gives no annotation in memory.
-        # This would also result in an error when no mesh within the sonar fov
-        # NOTE: Isaac Sim annotator output has squeezed the first dimension after 5.0 update: (1,N,3) -> (N,3)
-        if len(self.semanticSeg_annot.get_data()['info']['idToLabels']) !=0:
-            self.scan_data['pcl'] = self.pointcloud_annot.get_data(device=self._device)['data']  # shape :(N,3) <class 'warp.types.array'>
-            self.scan_data['normals'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointNormals'] # shape :(N,4) <class 'warp.types.array'>
-            self.scan_data['semantics'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointSemantic'] # shape: (N) <class 'warp.types.array'>
-            self.scan_data['viewTransform'] = self.cameraParams_annot.get_data()['cameraViewTransform'].reshape(4,4).T # 4 by 4 np.ndarray extrinsic matrix
-            self.scan_data['idToLabels'] = self.semanticSeg_annot.get_data()['info']['idToLabels'] # dict 
-            return True
-        else:
+        # Due to the time to load annotator to cuda, the first few simulation ticks give no annotation in memory.
+        # This is also the case when no mesh is within the sonar fov.
+        sem_data = self.semanticSeg_annot.get_data()
+        id_to_labels = self._annot_get(sem_data, ('info', 'idToLabels'), 'semantic_segmentation')
+
+        # No labels yet (CUDA warmup) or nothing in the FOV -> skip this frame.
+        if len(id_to_labels) == 0:
             return False
+
+        # Pull each annotator's data once per frame (avoids redundant get_data() calls
+        # that could also return differing snapshots).
+        pcl_data = self.pointcloud_annot.get_data(device=self._device)
+        cam_data = self.cameraParams_annot.get_data()
+
+        pcl = self._annot_get(pcl_data, ('data',), 'pointcloud')
+        normals = self._annot_get(pcl_data, ('info', 'pointNormals'), 'pointcloud')
+        semantics = self._annot_get(pcl_data, ('info', 'pointSemantic'), 'pointcloud')
+        view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
+
+        # Isaac Sim has changed the pointcloud annotator's leading dimension across
+        # releases ((1,N,..) after the 5.0 squeeze, but not guaranteed elsewhere).
+        # Normalise to the per-point layout the warp kernels expect regardless of
+        # which layout the active Replicator build returns.
+        self.scan_data['pcl'] = self._squeeze_leading(pcl, 2, 'pcl')               # (N,3)
+        self.scan_data['normals'] = self._squeeze_leading(normals, 2, 'normals')   # (N,4)
+        self.scan_data['semantics'] = self._squeeze_leading(semantics, 1, 'semantics')  # (N,)
+        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T      # 4x4 extrinsic
+        self.scan_data['idToLabels'] = id_to_labels                               # dict
+        return True
+
+    @staticmethod
+    def _annot_get(data, key_path, annot_name):
+        """Fetch a nested key from an annotator's get_data() dict.
+
+        Raises a precise error (naming the missing key and listing what *is*
+        present) if the schema differs from what OceanSim expects -- e.g. after
+        an Isaac Sim / Replicator upgrade renames or moves an output field --
+        instead of an opaque KeyError deep in the scan pipeline.
+        """
+        node = data
+        for i, key in enumerate(key_path):
+            if not isinstance(node, dict) or key not in node:
+                available = list(node.keys()) if isinstance(node, dict) else type(node).__name__
+                raise KeyError(
+                    f"[ImagingSonarSensor] '{annot_name}' annotator output is missing "
+                    f"'{'->'.join(key_path[:i + 1])}'. The Isaac Sim Replicator annotator "
+                    f"schema likely changed. Present at this level: {available}."
+                )
+            node = node[key]
+        return node
+
+    @staticmethod
+    def _squeeze_leading(arr, expected_ndim, name):
+        """Drop a leading singleton batch dim if present so ``arr`` has
+        ``expected_ndim`` dims.
+
+        Handles the (1,N,..) <-> (N,..) pointcloud-annotator shape differences
+        between Isaac Sim releases. Raises a clear error if the shape is neither
+        the expected layout nor a leading-singleton of it.
+        """
+        shape = tuple(arr.shape)
+        ndim = len(shape)
+        if ndim == expected_ndim:
+            return arr
+        if ndim == expected_ndim + 1 and shape[0] == 1:
+            return arr[0]
+        raise ValueError(
+            f"[ImagingSonarSensor] unexpected '{name}' shape {shape}; expected "
+            f"{expected_ndim} dim(s), optionally with a leading singleton. The "
+            f"Replicator pointcloud annotator layout may have changed."
+        )
 
 
     def make_sonar_data(self, 
