@@ -65,6 +65,11 @@ def parse_args(argv):
     p.add_argument("--headless", dest="headless", action="store_true", default=None)
     p.add_argument("--no-headless", dest="headless", action="store_false")
     p.add_argument("--no-sonar", dest="sonar", action="store_false", default=None)
+    p.add_argument("--sonar-backend", default=None,
+                   choices=["oceansim", "rtx_acoustic"],
+                   help="Sonar implementation: 'oceansim' (custom imaging sonar, "
+                        "default) or 'rtx_acoustic' (Isaac native RTX acoustic, "
+                        "experimental).")
     p.add_argument("--no-camera", dest="camera", action="store_false", default=None)
     p.add_argument("--no-dvl", dest="dvl", action="store_false", default=None)
     p.add_argument("--no-baro", dest="baro", action="store_false", default=None)
@@ -83,6 +88,10 @@ def load_config(args):
         "robot": {"translation": [-2.0, 0.0, -0.8], "mass": 5.0,
                   "linear_damping": 10.0, "angular_damping": 10.0},
         "sensors": {"sonar": True, "camera": True, "dvl": True, "baro": True},
+        # Sonar backend: "oceansim" = custom imaging sonar (Camera + pointcloud
+        # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
+        # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
+        "sonar_backend": "oceansim",
         "publisher": {},
         "water_surface_z": 1.43389,
     }
@@ -100,6 +109,8 @@ def load_config(args):
         cfg["asset_path"] = args.asset_path
     if args.control_mode is not None:
         cfg["control_mode"] = args.control_mode
+    if args.sonar_backend is not None:
+        cfg["sonar_backend"] = args.sonar_backend
     for key, val in (("sonar", args.sonar), ("camera", args.camera),
                      ("dvl", args.dvl), ("baro", args.baro)):
         if val is not None:
@@ -242,11 +253,22 @@ def main(argv):
     sensors = cfg["sensors"]
     sonar = cam = dvl = baro = None
     if sensors.get("sonar"):
-        from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
-        sonar = ImagingSonarSensor(
+        sonar_backend = cfg.get("sonar_backend", "oceansim")
+        _sonar_xform = dict(
             prim_path=robot_path + "/sonar", translation=np.array([0.3, 0.0, 0.3]),
-            orientation=euler_angles_to_quat(np.array([0.0, 45, 0.0]), degrees=True),
-            range_res=0.005, angular_res=0.25, hori_res=4000)
+            orientation=euler_angles_to_quat(np.array([0.0, 45, 0.0]), degrees=True))
+        if sonar_backend == "rtx_acoustic":
+            # Isaac native RTX acoustic sensor (experimental). Avoids the 6.0.1
+            # pointcloud-annotator SIGSEGV; output mapping is a scaffold (see class).
+            from isaacsim.oceansim.sensors.RtxAcousticSensor import RtxAcousticSensor
+            print("[oceansim_ros2] sonar backend: rtx_acoustic (native, experimental)")
+            sonar = RtxAcousticSensor(
+                range_res=0.005, angular_res=0.25, **_sonar_xform)
+        else:
+            from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+            print("[oceansim_ros2] sonar backend: oceansim (custom imaging sonar)")
+            sonar = ImagingSonarSensor(
+                range_res=0.005, angular_res=0.25, hori_res=4000, **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
         cam = UW_Camera(prim_path=robot_path + "/UW_camera",

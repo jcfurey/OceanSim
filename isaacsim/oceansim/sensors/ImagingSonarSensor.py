@@ -128,18 +128,13 @@ class ImagingSonarSensor(Camera):
             near_distance=self.min_range,
             far_distance=self.max_range
         )
-        # This is a bug. Needs to call initialize() before changing aperture
-        # https://forums.developer.nvidia.com/t/error-when-setting-a-cameras-vertical-horizontal-aperture/271314
-        # This line initialize the camera
-        self.initialize(physics_sim_view)
-
-        # Assume the default focal length to compute the desired horizontal aperture
-        # The reason why we are doing this is because Isaac sim will fix vertical aperture
-        # given aspect ratio for mandating square pixles
-        # https://forums.developer.nvidia.com/t/how-to-modify-the-cameras-field-of-view/278427/5
-        self.focal_length = self.get_focal_length()
-        horizontal_aper = 2 * self.focal_length * np.tan(np.deg2rad(self.hori_fov) / 2)
-        self.set_horizontal_aperture(horizontal_aper)
+        # Isaac Sim 6.0.1 port: do NOT call self.initialize() here. The runner
+        # builds the sonar BEFORE world.reset() (oceansim_ros2.py), and reset
+        # reopens the stage -- which invalidates a render product created in
+        # __init__ (hydra texture gets released -> native SIGSEGV in
+        # librtx.syntheticdata when the annotators later attach). Mirror UW_Camera:
+        # the scenario calls sonar_initialize() AFTER world.reset(), so we defer
+        # initialize() + the aperture setup into sonar_initialize() below.
         # Notice if you would like to observe sonar view from linked viewport.
         # Only horizontal fov is displayed correctly while the vertical fov is
         # followed by your viewport aspect ratio settings.
@@ -179,34 +174,58 @@ class ImagingSonarSensor(Camera):
         self._device = str(wp.get_preferred_device())
         self.scan_data = {}
         self.id = 0
+        self._scan_logged = False  # one-shot shape diagnostic in scan()
 
-        self.pointcloud_annot = rep.AnnotatorRegistry.get_annotator(
-            name="pointcloud",
-            init_params={"includeUnlabelled": include_unlabelled},
-            do_array_copy=if_array_copy,
-            device=self._device
-            )
-        
+        # Initialize the camera (creates the render product) HERE -- post
+        # world.reset() (deferred from __init__ for the Isaac Sim 6.0.1 port; see
+        # __init__). UW_Camera does the same via its scenario-driven initialize().
+        # Then set the horizontal aperture (needs initialize() first, per the
+        # upstream aperture-ordering bug) so the sonar FOV geometry is correct.
+        self.initialize()
+        self.focal_length = self.get_focal_length()
+        horizontal_aper = 2 * self.focal_length * np.tan(np.deg2rad(self.hori_fov) / 2)
+        self.set_horizontal_aperture(horizontal_aper)
+
+        # Isaac Sim 6.0.1 port (FIX for the world.play() SIGSEGV): the old
+        # `pointcloud` COMPOSITE annotator crashes natively at play() on 6.0.1
+        # (dangling SdfPath in the RTX SDG pipeline; bisected to this one
+        # annotator). Replace it with PRIMITIVE AOVs and reconstruct the point
+        # cloud from depth, exactly as Isaac's own Camera.get_pointcloud() does:
+        #   - distance_to_image_plane (depth) -> Camera.get_pointcloud() world pts
+        #   - normals                          -> per-pixel surface normals
+        #   - semantic_segmentation            -> per-pixel reflectivity labels
+        # distance_to_camera is proven safe on 6.0.1 (UW_Camera uses it); these
+        # primitive per-pixel annotators avoid the composite that broke. We attach
+        # them through the base Camera's add_*_to_frame() helpers so get_depth() /
+        # get_pointcloud() can consume them. CameraParams stays (lightweight
+        # metadata) for the cameraViewTransform the warp kernels need.
         self.cameraParams_annot = rep.AnnotatorRegistry.get_annotator(
             name="CameraParams",
             do_array_copy=if_array_copy,
             device=self._device
             )
-        
-        self.semanticSeg_annot = rep.AnnotatorRegistry.get_annotator(
-            name='semantic_segmentation',
-            init_params={"colorize": False},
-            do_array_copy=if_array_copy,
-            device=self._device
-        )
 
         print(f'[{self._name}] Using {self._device}' )
         print(f'[{self._name}] Render query res: {self.hori_res} x {self.vert_res}. Binning res: {self.r.shape[0]} x {self.r.shape[1]}')
 
-        self.pointcloud_annot.attach(self._render_product_path)
+        # Attach with hydra-texture updates disabled (NVIDIA MobilityGen pattern,
+        # IsaacSim .../mobility_gen/.../camera.py enable_rendering/finalize_rendering)
+        # so the SDG graph is never evaluated half-built during attach.
+        _rp = getattr(self, "_render_product", None)
+        if _rp is not None:
+            _rp.hydra_texture.set_updates_enabled(False)
+        self.add_distance_to_image_plane_to_frame()
+        self.add_normals_to_frame()
+        # Segment by the custom 'reflectivity' semantic type (the OceanSim runner
+        # labels meshes via add_labels(..., instance_name='reflectivity', e.g. tank
+        # '1.0', rock '2.0')). The default 'class' type yields only BACKGROUND/
+        # UNLABELLED, so make_indexToProp would fall back to uniform reflectivity=1.
+        self.add_semantic_segmentation_to_frame(
+            init_params={"semanticTypes": ["reflectivity"], "colorize": False})
         self.cameraParams_annot.attach(self._render_product_path)
-        self.semanticSeg_annot.attach(self._render_product_path)
-        
+        if _rp is not None:
+            _rp.hydra_texture.set_updates_enabled(True)
+
         if output_dir is not None:
             self.writing = True
             self.backend = rep.BackendDispatch({"paths": {"out_dir": output_dir}})
@@ -237,35 +256,78 @@ class ImagingSonarSensor(Camera):
             - First few frames may be empty due to CUDA initialization
             - Automatically skips frames with no detected objects
         """
-        # Due to the time to load annotator to cuda, the first few simulation ticks give no annotation in memory.
+        # Due to the time to load annotators to cuda, the first few simulation ticks give no annotation in memory.
         # This is also the case when no mesh is within the sonar fov.
-        sem_data = self.semanticSeg_annot.get_data()
+        # Semantic labels double as the warmup gate.
+        sem_data = self._custom_annotators["semantic_segmentation"].get_data()
         id_to_labels = self._annot_get(sem_data, ('info', 'idToLabels'), 'semantic_segmentation')
 
         # No labels yet (CUDA warmup) or nothing in the FOV -> skip this frame.
         if len(id_to_labels) == 0:
             return False
 
-        # Pull each annotator's data once per frame (avoids redundant get_data() calls
-        # that could also return differing snapshots).
-        pcl_data = self.pointcloud_annot.get_data(device=self._device)
-        cam_data = self.cameraParams_annot.get_data()
+        # Isaac Sim 6.0.1: reconstruct the point cloud from the depth AOV instead of
+        # the (crashing) pointcloud annotator. Camera.get_pointcloud() falls back to
+        # a perspective projection of distance_to_image_plane when no pointcloud
+        # annotator is attached, returning world points row-major over (H, W) -- so
+        # the per-pixel normals / semantics flatten the same way and stay aligned.
+        depth = self._custom_annotators["distance_to_image_plane"].get_data(device=self._device)
+        depth_np = np.squeeze(self._to_numpy(depth))
+        if depth_np.ndim != 2 or depth_np.size == 0:
+            return False
+        pcl_np = self._to_numpy(self.get_pointcloud(device=self._device, world_frame=True))
+        if pcl_np.size == 0:
+            return False
 
-        pcl = self._annot_get(pcl_data, ('data',), 'pointcloud')
-        normals = self._annot_get(pcl_data, ('info', 'pointNormals'), 'pointcloud')
-        semantics = self._annot_get(pcl_data, ('info', 'pointSemantic'), 'pointcloud')
+        normals_img = self._to_numpy(self._custom_annotators["normals"].get_data(device=self._device))
+        sem_img = np.squeeze(self._to_numpy(self._annot_get(sem_data, ('data',), 'semantic_segmentation')))
+        cam_data = self.cameraParams_annot.get_data()
         view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
 
-        # Isaac Sim has changed the pointcloud annotator's leading dimension across
-        # releases ((1,N,..) after the 5.0 squeeze, but not guaranteed elsewhere).
-        # Normalise to the per-point layout the warp kernels expect regardless of
-        # which layout the active Replicator build returns.
-        self.scan_data['pcl'] = self._squeeze_leading(pcl, 2, 'pcl')               # (N,3)
-        self.scan_data['normals'] = self._squeeze_leading(normals, 2, 'normals')   # (N,4)
-        self.scan_data['semantics'] = self._squeeze_leading(semantics, 1, 'semantics')  # (N,)
-        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T      # 4x4 extrinsic
-        self.scan_data['idToLabels'] = id_to_labels                               # dict
+        n_px = depth_np.size
+        normals_flat = normals_img.reshape(-1, normals_img.shape[-1])[:, :3]   # (H*W, 3) world normals
+        sem_flat = sem_img.reshape(-1).astype(np.uint32)                       # (H*W,)
+        if pcl_np.shape[0] != n_px or normals_flat.shape[0] != n_px or sem_flat.shape[0] != n_px:
+            # Layout/size mismatch -> can't align points with AOVs; skip safely.
+            return False
+
+        # Keep only pixels with a finite hit inside the sonar range window.
+        depth_flat = depth_np.reshape(-1)
+        valid = (np.isfinite(depth_flat)
+                 & (depth_flat > self.min_range)
+                 & (depth_flat < self.max_range)
+                 & np.isfinite(pcl_np).all(axis=1))
+        if not getattr(self, "_scan_logged", False):
+            self._scan_logged = True
+            uniq_sem = np.unique(sem_flat[valid]) if np.any(valid) else np.array([])
+            print(f"[{self._name}] scan: depth{tuple(depth_np.shape)} pcl{tuple(pcl_np.shape)} "
+                  f"normals{tuple(normals_img.shape)} sem{tuple(sem_img.shape)} "
+                  f"valid={int(valid.sum())}/{n_px}", flush=True)
+            # Material-reflectivity check: idToLabels should carry the 'reflectivity'
+            # values, and the in-FOV pixels should span >1 semantic id (contrast).
+            print(f"[{self._name}] reflectivity: idToLabels={id_to_labels} "
+                  f"unique_sem_in_fov={uniq_sem.tolist()[:12]}", flush=True)
+        if not np.any(valid):
+            return False
+
+        self.scan_data['pcl'] = wp.array(
+            np.ascontiguousarray(pcl_np[valid], dtype=np.float32), dtype=wp.float32)        # (N,3)
+        self.scan_data['normals'] = wp.array(
+            np.ascontiguousarray(normals_flat[valid], dtype=np.float32), dtype=wp.float32)  # (N,3)
+        self.scan_data['semantics'] = wp.array(
+            np.ascontiguousarray(sem_flat[valid]), dtype=wp.uint32)                         # (N,)
+        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T              # 4x4 extrinsic
+        self.scan_data['idToLabels'] = id_to_labels                                       # dict
         return True
+
+    @staticmethod
+    def _to_numpy(arr):
+        """Coerce an annotator return (warp array, numpy, or None) to numpy."""
+        if arr is None:
+            return np.array([])
+        if hasattr(arr, "numpy"):
+            return arr.numpy()
+        return np.asarray(arr)
 
     @staticmethod
     def _annot_get(data, key_path, annot_name):
@@ -357,7 +419,14 @@ class ImagingSonarSensor(Camera):
             for id in idToLabels.keys():
                 for property in idToLabels.get(id):
                     if property == query_property:
-                        indexToProp_array[int(id)] = idToLabels.get(id).get(property)
+                        # Reflectivity labels are strings ('1.0', '2.0'); cast to
+                        # float. Non-numeric entries (e.g. a 'reflectivity':
+                        # 'BACKGROUND'/'UNLABELLED' fallback) keep the default 1.0
+                        # instead of raising ValueError mid-scan.
+                        try:
+                            indexToProp_array[int(id)] = float(idToLabels.get(id).get(property))
+                        except (TypeError, ValueError):
+                            pass
             return indexToProp_array
 
         if self.scan():
@@ -668,14 +737,25 @@ class ImagingSonarSensor(Camera):
             - Required for proper shutdown when done using the sensor
             - Also closes viewport window if one was created
         """
-        self.pointcloud_annot.detach(self._render_product_path)
+        # Same hydra-texture gating as sonar_initialize(): detaching also mutates
+        # the SDGPipeline graph, so disable updates first to avoid a teardown-time
+        # variant of the partial-graph SIGSEGV. (UNTESTED — see sonar_initialize.)
+        _rp = getattr(self, "_render_product", None)
+        if _rp is not None:
+            _rp.hydra_texture.set_updates_enabled(False)
+        # Remove the primitive AOVs (attached via the base Camera helpers) + the
+        # manual CameraParams annotator.
+        try:
+            self.remove_distance_to_image_plane_from_frame()
+            self.remove_normals_from_frame()
+            self.remove_semantic_segmentation_from_frame()
+        except Exception as exc:  # noqa: BLE001
+            print(f'[{self._name}] annotator removal warning: {exc}')
         self.cameraParams_annot.detach(self._render_product_path)
-        self.semanticSeg_annot.detach(self._render_product_path)
+        if _rp is not None:
+            _rp.hydra_texture.set_updates_enabled(True)
 
-        rep.AnnotatorCache.clear(self.pointcloud_annot)
         rep.AnnotatorCache.clear(self.cameraParams_annot)
-        rep.AnnotatorCache.clear(self.semanticSeg_annot)
-
 
         print(f'[{self._name}] Annotator detached. AnnotatorCache cleaned.')
 
