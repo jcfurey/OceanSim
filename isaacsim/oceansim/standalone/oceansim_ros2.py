@@ -174,8 +174,10 @@ def main(argv):
 
     # The headless runner only needs the GUI-free `scenario` module, but importing
     # it would run `SensorExample_python/__init__.py` -> `from .extension import *`,
-    # which drags in the GUI `ui_builder` (LoadButton/ResetButton from
-    # `isaacsim.examples.extension.core_connectors`, removed in Isaac 6.0.1).
+    # which drags in the GUI `ui_builder` -- omni.ui widgets plus LoadButton/
+    # ResetButton from `isaacsim.examples.extension.core_connectors` (deprecated
+    # in Isaac 6.0, but still importable). omni.ui is not available in a headless
+    # kit app, so executing that import chain fails regardless of LoadButton.
     # Pre-seed a stub for that package so `scenario` loads as a submodule WITHOUT
     # executing the package __init__. (oceansim/ and modules/ have no __init__.)
     import sys

@@ -5,6 +5,7 @@ from enum import Enum
 
 from isaacsim.core.prims import SingleRigidPrim
 from isaacsim.core.utils.prims import get_prim_path
+from isaacsim.core.utils.rotations import quat_to_rot_matrix
 
 '''
 Attention:
@@ -242,8 +243,12 @@ class ROS2ControlReceiver:
                         self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
                     self._rigid_prim.set_linear_velocity(np.array([0.0, 0.0, 0.0]))  # reset
                     self._rigid_prim.set_angular_velocity(np.array([0.0, 0.0, 0.0]))  # reset
-                    self._rigid_prim.set_linear_velocity(np.array(self.linear_vel))
-                    self._rigid_prim.set_angular_velocity(np.array(self.angular_vel))
+                    # The incoming Twist is a body-frame command (ROS cmd_vel
+                    # convention), but Isaac's set_*_velocity take world-frame
+                    # vectors. Rotate body -> world by the robot's orientation.
+                    lin_w, ang_w = self._body_to_world(self.linear_vel, self.angular_vel)
+                    self._rigid_prim.set_linear_velocity(lin_w)
+                    self._rigid_prim.set_angular_velocity(ang_w)
 
             elif self._ros2_control_mode == ROS2_CONTROL_MODE.FORCE: # force mode
                 # using PXR API to control
@@ -269,26 +274,41 @@ class ROS2ControlReceiver:
         except Exception as e:
             print(f'[{self._name}] Control Update Failed: {e}')
     
+    def _body_to_world(self, lin_body, ang_body):
+        """Rotate a body-frame velocity command into the world frame.
+
+        Isaac's set_linear_velocity / set_angular_velocity expect world-frame
+        vectors, while ROS Twist commands are conventionally body-frame. The
+        robot's current orientation (wxyz) gives the body->world rotation R, so
+        v_world = R @ v_body.
+        """
+        lin_b = np.asarray(lin_body, dtype=float)
+        ang_b = np.asarray(ang_body, dtype=float)
+        _, quat_wxyz = self._rigid_prim.get_world_pose()
+        rot = quat_to_rot_matrix(np.asarray(quat_wxyz, dtype=float))
+        return rot @ lin_b, rot @ ang_b
+
     def close(self):
-        # Clean up ROS2 resources
-        if self._enable_ros2:
-            if self._ros2_vel_node:
-                self._ros2_vel_node.destroy_node()
-                self._ros2_vel_node = None
-            if self._ros2_force_node:
-                self._ros2_force_node.destroy_node()
-                self._ros2_force_node = None
+        try:
+            # Clean up ROS2 resources
+            if self._enable_ros2:
+                if self._ros2_vel_node:
+                    self._ros2_vel_node.destroy_node()
+                    self._ros2_vel_node = None
+                if self._ros2_force_node:
+                    self._ros2_force_node.destroy_node()
+                    self._ros2_force_node = None
 
-        self._update_count = 0
-        self.force_cmd = [0.0, 0.0, 0.0]
-        self.torque_cmd = [0.0, 0.0, 0.0]
-        self.linear_vel = [0.0, 0.0, 0.0]
-        self.angular_vel = [0.0, 0.0, 0.0]
-
-        # Release the shared rclpy context (only shuts down once all holders release)
-        if self._ros2_acquired:
-            ros2_context.release()
-            self._ros2_acquired = False
-
-        print(f'[{self._name}] ROS2_Control_receiver closed.') 
+            self._update_count = 0
+            self.force_cmd = [0.0, 0.0, 0.0]
+            self.torque_cmd = [0.0, 0.0, 0.0]
+            self.linear_vel = [0.0, 0.0, 0.0]
+            self.angular_vel = [0.0, 0.0, 0.0]
+        finally:
+            # Always release the shared rclpy context, even if node teardown
+            # raised, so the ref count never leaks.
+            if self._ros2_acquired:
+                ros2_context.release()
+                self._ros2_acquired = False
+            print(f'[{self._name}] ROS2_Control_receiver closed.') 
 

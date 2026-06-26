@@ -89,7 +89,9 @@ class _RateGate:
     def ready(self, now: float) -> bool:
         if self._period <= 0.0:
             return True
-        if self._last is None or (now - self._last) >= self._period:
+        # Reset if sim time jumped backward (e.g. a world reset) so publishing
+        # resumes immediately instead of stalling until `now` catches back up.
+        if self._last is None or now < self._last or (now - self._last) >= self._period:
             self._last = now
             return True
         return False
@@ -133,6 +135,8 @@ class OceanSimSensorPublisher:
         "publish_clock": True,
         # sonar acoustic params (used to fill ProjectedSonarImage.ping_info)
         "sound_speed": 1500.0,
+        # gravity magnitude (m/s^2) used to build the IMU specific force
+        "gravity": 9.81,
     }
 
     def __init__(self, robot_prim, sonar=None, dvl=None, baro=None, config=None):
@@ -164,8 +168,8 @@ class OceanSimSensorPublisher:
         self._baro_gate = _RateGate(self._cfg["baro_rate"])
         self._sonar_gate = _RateGate(self._cfg["sonar_rate"])
 
-        # IMU finite-difference state
-        self._last_body_lin_vel = None
+        # IMU finite-difference state (world-frame velocity, for specific force)
+        self._last_world_lin_vel = None
         self._last_imu_time = None
 
     # ------------------------------------------------------------------ setup
@@ -306,7 +310,14 @@ class OceanSimSensorPublisher:
     def _publish_imu(self, stamp, sim_time):
         from sensor_msgs.msg import Imu
         _, quat, lin_vel_w, ang_vel_w = self._robot_state()
-        lin_b, ang_b = self._to_body(quat, lin_vel_w, ang_vel_w)
+
+        # world -> body rotation (R^T) shared by angular velocity and accel.
+        if quat_to_rot_matrix is not None:
+            rot = quat_to_rot_matrix(np.asarray(quat, dtype=float))
+        else:  # pragma: no cover - fallback if Isaac util unavailable
+            rot = self._rot_from_quat(quat)
+        rt = rot.T
+        ang_b = rt @ ang_vel_w
 
         msg = Imu()
         msg.header.stamp = stamp
@@ -320,15 +331,24 @@ class OceanSimSensorPublisher:
         msg.angular_velocity.y = float(ang_b[1])
         msg.angular_velocity.z = float(ang_b[2])
 
-        # Linear acceleration: finite difference of body-frame linear velocity.
-        if self._last_body_lin_vel is not None and self._last_imu_time is not None:
+        # Linear acceleration = specific force, i.e. what a real accelerometer
+        # measures: f = R^T * (a_world - g_world). Gravity points down (-z), so at
+        # rest the reading is +g on the axis opposing gravity (REP-145). a_world is
+        # the finite difference of *world*-frame linear velocity; before a second
+        # sample exists (or right after a reset) we assume a_world = 0 so the
+        # static gravity term is still reported instead of a spurious zero.
+        g = float(self._cfg["gravity"])
+        a_world = np.zeros(3)
+        if self._last_world_lin_vel is not None and self._last_imu_time is not None:
             dt = sim_time - self._last_imu_time
             if dt > 1e-6:
-                acc = (lin_b - self._last_body_lin_vel) / dt
-                msg.linear_acceleration.x = float(acc[0])
-                msg.linear_acceleration.y = float(acc[1])
-                msg.linear_acceleration.z = float(acc[2])
-        self._last_body_lin_vel = lin_b
+                a_world = (lin_vel_w - self._last_world_lin_vel) / dt
+        f_world = a_world - np.array([0.0, 0.0, -g])  # subtract gravity vector
+        f_body = rt @ f_world
+        msg.linear_acceleration.x = float(f_body[0])
+        msg.linear_acceleration.y = float(f_body[1])
+        msg.linear_acceleration.z = float(f_body[2])
+        self._last_world_lin_vel = lin_vel_w
         self._last_imu_time = sim_time
 
         msg.orientation_covariance = self._diag3(1e-3, 1e-3, 1e-3)
@@ -399,7 +419,10 @@ class OceanSimSensorPublisher:
         ping = PingInfo()
         ping.frequency = float(getattr(self._sonar, "frequency", 1.2e6))
         ping.sound_speed = float(self._cfg["sound_speed"])
-        ping.tx_beamwidths = [math.radians(hori_fov)] * n_beams
+        # An imaging sonar has a SINGLE transmit beam insonifying the whole
+        # horizontal swath, and one receive beam per bearing. So tx_beamwidths is
+        # a single element (the tx swath), while rx_beamwidths is per receive beam.
+        ping.tx_beamwidths = [math.radians(hori_fov)]
         ping.rx_beamwidths = [math.radians(hori_fov / max(n_beams, 1))] * n_beams
         msg.ping_info = ping
 
