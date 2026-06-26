@@ -190,7 +190,10 @@ def make_sonar_image(sonar_data: wp.array(ndim=2, dtype=wp.vec3),
     i, j = wp.tid()
     width = sonar_data.shape[1]
     sonar_rgb = wp.uint8(sonar_data[i,j][2] * wp.float32(255))
-    sonar_image[i,width-j,0] = sonar_rgb
-    sonar_image[i,width-j,1] = sonar_rgb
-    sonar_image[i,width-j,2] = sonar_rgb
-    sonar_image[i,width-j,3] = wp.uint8(255)
+    # Flip columns (mirror the image) while keeping the index in [0, width-1];
+    # `width - j` would write index `width` (out of bounds) when j == 0.
+    col = width - 1 - j
+    sonar_image[i,col,0] = sonar_rgb
+    sonar_image[i,col,1] = sonar_rgb
+    sonar_image[i,col,2] = sonar_rgb
+    sonar_image[i,col,3] = wp.uint8(255)

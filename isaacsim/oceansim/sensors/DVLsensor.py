@@ -64,6 +64,10 @@ class DVLsensor:
         
         sinElev = np.sin(np.deg2rad(self._elevation))
         cosElev = np.cos(np.deg2rad(self._elevation))
+        if sinElev == 0 or cosElev == 0:
+            raise ValueError(
+                f"[{self._name}] DVL beam elevation must not be 0 or 90 degrees "
+                f"(got {self._elevation}); the velocity transform divides by sin/cos(elevation).")
         self._transform = np.array([[1/(2*sinElev), 0, -1/(2*sinElev), 0],
                                     [0, 1/(2*sinElev), 0, -1/(2*sinElev)],
                                     [1/(4*cosElev), 1/(4*cosElev), 1/(4*cosElev), 1/(4*cosElev)]

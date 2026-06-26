@@ -32,7 +32,9 @@ class keyboard_cmd:
                                         "DOWN": [0.0, 0.0, -1.0],
                                         }
                 ) -> None:
-        self._base_command = base_command
+        # Copy so the (mutable) default argument is never mutated in place by the
+        # += / -= updates below, which would leak command state across instances.
+        self._base_command = np.array(base_command, dtype=float)
 
         self._input_keyboard_mapping = input_keyboard_mapping
 

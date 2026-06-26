@@ -614,7 +614,7 @@ class ImagingSonarSensor(Camera):
         
         with self._window.frame:
             with ui.ZStack(height=720, width = 720):
-                ui.Rectangle(widthstyle={"background_color": 0xFF000000})
+                ui.Rectangle(style={"background_color": 0xFF000000})
                 ui.Label('Run the scenario for image to be received',
                          style={'font_size': 55,'alignment': ui.Alignment.CENTER},
                          word_wrap=True)
