@@ -84,7 +84,8 @@ class UW_Camera(Camera):
                    camera_frame_id="camera",
                    image_raw_topic="/oceansim/robot/image_raw",
                    depth_topic="/oceansim/robot/depth",
-                   camera_info_topic="/oceansim/robot/camera_info"):
+                   camera_info_topic="/oceansim/robot/camera_info",
+                   publish_image_raw=True, publish_depth=True):
         
         """Configure underwater rendering properties and initialize pipelines.
     
@@ -148,6 +149,11 @@ class UW_Camera(Camera):
         self._depth_topic = depth_topic
         self._camera_info_topic = camera_info_topic
         self._camera_frame_id = camera_frame_id
+        # Raw (rgb8, ~6 MB/frame) and depth (32FC1, ~8 MB/frame) are heavy over
+        # the wire (esp. Zenoh); let deployments drop them and keep the compressed
+        # stream. CompressedImage + CameraInfo are always published.
+        self._publish_image_raw = publish_image_raw
+        self._publish_depth = publish_depth
         self._last_publish_time = 0.0
         self._ros2_pub_frequency = ros2_pub_frequency     # publish frequency, hz
         self._ros2_pub_jpeg_quality = ros2_pub_jpeg_quality
@@ -228,10 +234,12 @@ class UW_Camera(Camera):
                 node_name, parameter_overrides=[Parameter('use_sim_time', value=True)])
             self._uw_img_pub = self._ros2_uw_img_node.create_publisher(
                 CompressedImage, self._uw_img_topic, 10)
-            self._image_raw_pub = self._ros2_uw_img_node.create_publisher(
-                Image, self._image_raw_topic, 10)
-            self._depth_pub = self._ros2_uw_img_node.create_publisher(
-                Image, self._depth_topic, 10)
+            if self._publish_image_raw:
+                self._image_raw_pub = self._ros2_uw_img_node.create_publisher(
+                    Image, self._image_raw_topic, 10)
+            if self._publish_depth:
+                self._depth_pub = self._ros2_uw_img_node.create_publisher(
+                    Image, self._depth_topic, 10)
             self._camera_info_pub = self._ros2_uw_img_node.create_publisher(
                 CameraInfo, self._camera_info_topic, 10)
 
@@ -259,8 +267,6 @@ class UW_Camera(Camera):
             uw_image_cpu = uw_img.numpy()
             if uw_image_cpu.dtype != np.uint8:
                 uw_image_cpu = uw_image_cpu.astype(np.uint8)   # UW_render returns 'rgba'
-            rgb = np.ascontiguousarray(uw_image_cpu[:, :, :3])  # drop alpha
-            h, w = rgb.shape[0], rgb.shape[1]
 
             # compressed (jpeg)
             bgr = cv2.cvtColor(uw_image_cpu, cv2.COLOR_RGBA2BGR)
@@ -274,16 +280,19 @@ class UW_Camera(Camera):
                 cmsg.data = jpg.tobytes()
                 self._uw_img_pub.publish(cmsg)
 
-            # raw rgb8
-            imsg = Image()
-            imsg.header.stamp = stamp
-            imsg.header.frame_id = frame
-            imsg.height, imsg.width = h, w
-            imsg.encoding = 'rgb8'
-            imsg.is_bigendian = 0
-            imsg.step = w * 3
-            imsg.data = rgb.tobytes()
-            self._image_raw_pub.publish(imsg)
+            # raw rgb8 (optional; the rgb copy + tobytes() are ~6 MB each/frame)
+            if self._image_raw_pub is not None:
+                rgb = np.ascontiguousarray(uw_image_cpu[:, :, :3])  # drop alpha
+                h, w = rgb.shape[0], rgb.shape[1]
+                imsg = Image()
+                imsg.header.stamp = stamp
+                imsg.header.frame_id = frame
+                imsg.height, imsg.width = h, w
+                imsg.encoding = 'rgb8'
+                imsg.is_bigendian = 0
+                imsg.step = w * 3
+                imsg.data = rgb.tobytes()
+                self._image_raw_pub.publish(imsg)
 
             # depth 32FC1 (planar z-depth, metres) — convert from the radial
             # distance_to_camera the UW kernel uses to ROS's planar convention.

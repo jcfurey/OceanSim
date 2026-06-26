@@ -422,7 +422,10 @@ class OceanSimSensorPublisher:
         msg.header.frame_id = self._cfg["sonar_frame_id"]
 
         ping = PingInfo()
-        ping.frequency = float(getattr(self._sonar, "frequency", 1.2e6))
+        # ImagingSonarSensor is a Camera and may expose frequency=None; guard so
+        # float(None) doesn't throw (and fall back to a nominal acoustic freq).
+        _sonar_freq = getattr(self._sonar, "frequency", None)
+        ping.frequency = float(_sonar_freq) if _sonar_freq else 1.2e6
         ping.sound_speed = float(self._cfg["sound_speed"])
         # Match the real Oculus driver / marine_acoustic_msgs convention: BOTH
         # arrays are per-beam (length n_beams). rx_beamwidths is the azimuth
