@@ -71,8 +71,14 @@ def bin_intensity(pcl: wp.array(dtype=wp.vec3),
     # Calculate the bin indices for range and azimuth
     x_bin_idx = wp.int32((x - x_offset) / x_res)
     y_bin_idx = wp.int32((y - y_offset) / y_res)
-    wp.atomic_add(bin_sum, x_bin_idx, y_bin_idx, intensity[tid])
-    wp.atomic_add(bin_count, x_bin_idx, y_bin_idx, 1)
+    # Drop points that fall outside the binning grid. Points at the camera far
+    # clip (== max_range) or at the FOV edges land one index past the grid, and
+    # Warp does no bounds checking in release mode, so an unchecked atomic_add
+    # here is an out-of-bounds write (memory corruption / crash).
+    if (x_bin_idx >= 0 and x_bin_idx < bin_sum.shape[0]
+            and y_bin_idx >= 0 and y_bin_idx < bin_sum.shape[1]):
+        wp.atomic_add(bin_sum, x_bin_idx, y_bin_idx, intensity[tid])
+        wp.atomic_add(bin_count, x_bin_idx, y_bin_idx, 1)
 
 @wp.kernel 
 def average(sum: wp.array(ndim=2, dtype=wp.float32),
@@ -148,7 +154,11 @@ def make_sonar_map_all(r: wp.array(ndim=2, dtype=wp.float32),
                        gain: wp.float32,
                        result: wp.array(ndim=2, dtype=wp.vec3)):
     i, j = wp.tid()
-    intensity[i,j] = intensity[i,j]/max_intensity[0]
+    # Guard against an empty frame (no in-grid returns -> global max 0), which
+    # would otherwise divide by zero and emit NaN intensities. Mirrors the
+    # per-range guard in make_sonar_map_range.
+    if max_intensity[0] != 0.0:
+        intensity[i,j] = intensity[i,j]/max_intensity[0]
     intensity[i,j] += offset
     intensity[i,j] *= gain
     intensity[i,j] *= (0.5 + gau_noise[i,j])
