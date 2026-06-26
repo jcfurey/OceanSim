@@ -405,12 +405,17 @@ class OceanSimSensorPublisher:
         # (n_range, n_azimuth, 3) vec3 grid; channel 2 is intensity in [0, 1].
         if grid.ndim != 3 or grid.shape[2] < 3 or grid.size == 0:
             return
-        # Transpose polar (range, azimuth) -> (beam, range), row-major over beams.
-        intensity = np.ascontiguousarray(grid[:, :, 2].T)
-        n_beams, n_range = intensity.shape
+        # marine_acoustic_msgs SonarImageData is RANGE-major: element (range r,
+        # beam b) lives at flat index r*n_beams + b. This matches sonar_image_proc
+        # (sonar_image_msg_interface.h), sonar_proc, and the real Oculus driver
+        # (oculus_sonar_driver/ping_to_sonar_image.h, which pushes r outer / b
+        # inner). The grid is already (n_range, n_azimuth), so use it directly --
+        # transposing to beam-major scrambles the image for every consumer.
+        intensity = np.ascontiguousarray(grid[:, :, 2])
+        n_range, n_beams = intensity.shape
 
         min_range, max_range = self._sonar.get_range()
-        hori_fov, _vert_fov = self._sonar.get_fov()  # degrees
+        hori_fov, vert_fov = self._sonar.get_fov()  # degrees
 
         msg = ProjectedSonarImage()
         msg.header.stamp = stamp
@@ -419,18 +424,27 @@ class OceanSimSensorPublisher:
         ping = PingInfo()
         ping.frequency = float(getattr(self._sonar, "frequency", 1.2e6))
         ping.sound_speed = float(self._cfg["sound_speed"])
-        # An imaging sonar has a SINGLE transmit beam insonifying the whole
-        # horizontal swath, and one receive beam per bearing. So tx_beamwidths is
-        # a single element (the tx swath), while rx_beamwidths is per receive beam.
-        ping.tx_beamwidths = [math.radians(hori_fov)]
+        # Match the real Oculus driver / marine_acoustic_msgs convention: BOTH
+        # arrays are per-beam (length n_beams). rx_beamwidths is the azimuth
+        # (horizontal) beamwidth of each receive beam; tx_beamwidths is the
+        # elevation (vertical) beamwidth of the transmit swath. sonar_proc indexes
+        # both per beam (tx -> vertical uncertainty, rx -> horizontal uncertainty),
+        # so a length-1 tx array reads out of bounds.
+        ping.tx_beamwidths = [math.radians(vert_fov)] * n_beams
         ping.rx_beamwidths = [math.radians(hori_fov / max(n_beams, 1))] * n_beams
         msg.ping_info = ping
 
-        # Bearings spread symmetrically across the horizontal FOV.
+        # Bearings spread symmetrically across the horizontal FOV. Encode each
+        # beam direction with the SAME convention as the real Oculus driver
+        # (oculus_sonar_driver/ping_to_sonar_image.h) and as sonar_image_proc /
+        # sonar_proc expect: azimuth lives in -y, range/forward in +z, elevation
+        # x=0, so that az = atan2(-y, z). Putting the spread in x instead (y=0)
+        # collapses every computed azimuth to 0, which makes draw_sonar build an
+        # empty remap LUT (assertion crash) and sonar_proc emit a degenerate cloud.
         half = math.radians(hori_fov) / 2.0
         bearings = np.linspace(-half, half, n_beams)
         msg.beam_directions = [
-            Vector3(x=float(math.sin(b)), y=0.0, z=float(math.cos(b))) for b in bearings
+            Vector3(x=0.0, y=float(-math.sin(b)), z=float(math.cos(b))) for b in bearings
         ]
 
         msg.ranges = np.linspace(

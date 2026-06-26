@@ -53,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-vision-msgs \
         ros-${ROS_DISTRO}-cv-bridge \
         ros-${ROS_DISTRO}-rmw-zenoh-cpp \
+        ros-${ROS_DISTRO}-marine-acoustic-msgs \
         python3-opencv \
     && rm -rf /var/lib/apt/lists/*
 
