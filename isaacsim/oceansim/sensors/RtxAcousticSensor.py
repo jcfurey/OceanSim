@@ -48,6 +48,8 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+from isaacsim.oceansim.utils import rtx_acoustic_math
+
 
 _GMO_WRITER_NAME = "OceanSimAcousticGmoSink"
 _gmo_writer_registered = False
@@ -262,25 +264,12 @@ class RtxAcousticSensor:
                   f"t_ns=[{t_ns.min():.0f},{t_ns.max():.0f}], "
                   f"|amp|=[{np.abs(amp).min():.4g},{np.abs(amp).max():.4g}]", flush=True)
 
-        rng = self.sound_speed * (t_ns * 1e-9) / 2.0
-        rbin = np.round((rng - self.min_range) / self.range_res).astype(np.int64)
-        n_mounts = max(self._n_elements, int(rx.max()) + 1 if rx.size else self._n_elements)
-        beam = np.round(rx.astype(np.float64) / max(n_mounts - 1, 1) * (self.n_beams - 1)).astype(np.int64)
-
-        valid = ((rbin >= 0) & (rbin < self.n_range)
-                 & (beam >= 0) & (beam < self.n_beams) & np.isfinite(rng))
+        # Fold the GMO samples into the (n_range, n_beams) intensity grid
+        # (rtx_acoustic_math.fold_gmo_to_grid is pure numpy + unit tested).
         self._map_np[:] = 0.0
-        if np.any(valid):
-            # Accumulate per (range, beam) cell. bincount on flattened indices is
-            # far faster than np.add.at (the unbuffered scatter path) for the many
-            # duplicate (rbin, beam) hits a ping produces.
-            flat = rbin[valid] * self.n_beams + beam[valid]
-            acc = np.bincount(flat, weights=np.abs(amp[valid]),
-                              minlength=self.n_range * self.n_beams)
-            self._map_np[:, :, 2] = acc.reshape(self.n_range, self.n_beams)
-            peak = float(self._map_np[:, :, 2].max())
-            if peak > 0.0:
-                self._map_np[:, :, 2] /= peak
+        self._map_np[:, :, 2] = rtx_acoustic_math.fold_gmo_to_grid(
+            rx, amp, t_ns, self.sound_speed, self.min_range, self.range_res,
+            self.n_range, self.n_beams, self._n_elements)
         self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
 
     def close(self):
