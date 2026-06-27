@@ -207,3 +207,39 @@ def make_sonar_image(sonar_data: wp.array(ndim=2, dtype=wp.vec3),
     sonar_image[i,col,1] = sonar_rgb
     sonar_image[i,col,2] = sonar_rgb
     sonar_image[i,col,3] = wp.uint8(255)
+
+
+@wp.kernel
+def compact_in_range(depth: wp.array(ndim=1, dtype=wp.float32),
+                     pcl: wp.array(ndim=2, dtype=wp.float32),
+                     normals: wp.array(ndim=2, dtype=wp.float32),
+                     semantics: wp.array(ndim=1, dtype=wp.uint32),
+                     min_range: wp.float32,
+                     max_range: wp.float32,
+                     counter: wp.array(ndim=1, dtype=wp.int32),
+                     out_pcl: wp.array(ndim=2, dtype=wp.float32),
+                     out_normals: wp.array(ndim=2, dtype=wp.float32),
+                     out_sem: wp.array(ndim=1, dtype=wp.uint32)):
+    """On-device stream compaction of the in-range, finite points -- the GPU
+    equivalent of sonar_scan_math.select_in_range_points, so the per-pixel
+    depth/pointcloud/normals/semantics never round-trip to the CPU. The kept
+    points are appended via an atomic counter (so their order is arbitrary, which
+    is fine: the downstream per-point + atomic-binning kernels are order
+    independent). out_* must be sized >= number of input points; counter[0] holds
+    the kept count after the launch."""
+    tid = wp.tid()
+    d = depth[tid]
+    px = pcl[tid, 0]
+    py = pcl[tid, 1]
+    pz = pcl[tid, 2]
+    if (wp.isfinite(d) and d > min_range and d < max_range
+            and wp.isfinite(px) and wp.isfinite(py) and wp.isfinite(pz)):
+        i = wp.atomic_add(counter, 0, 1)
+        if i < out_pcl.shape[0]:
+            out_pcl[i, 0] = px
+            out_pcl[i, 1] = py
+            out_pcl[i, 2] = pz
+            out_normals[i, 0] = normals[tid, 0]
+            out_normals[i, 1] = normals[tid, 1]
+            out_normals[i, 2] = normals[tid, 2]
+            out_sem[i] = semantics[tid]

@@ -5,6 +5,7 @@ import numpy as np
 from omni.replicator.core.scripts.functional import write_np
 import warp as wp
 from isaacsim.oceansim.utils.ImagingSonar_kernels import *
+from isaacsim.oceansim.utils import sonar_scan_math
 
 
 # Future TODO
@@ -176,6 +177,37 @@ class ImagingSonarSensor(Camera):
         self.id = 0
         self._scan_logged = False  # one-shot shape diagnostic in scan()
 
+        # Optional on-device point compaction (compact_in_range kernel). Default
+        # OFF: the kernel is unit tested against the numpy reference
+        # (tests/test_imaging_sonar_kernels.py), but whether get_pointcloud /
+        # the AOV annotators actually return Warp arrays resident on
+        # self._device can only be confirmed on hardware. So it self-heals --
+        # if the outputs are not on-device Warp arrays (or anything throws) it
+        # disables itself and falls back to the proven numpy path. Enable with
+        # `sensor.gpu_point_filter = True` after sonar_initialize().
+        self.gpu_point_filter = False
+        self._gpu_out_pcl = None
+        self._gpu_out_normals = None
+        self._gpu_out_sem = None
+        self._gpu_counter = None
+
+        # Reusable per-point work buffers for make_sonar_data. The valid-point
+        # count varies frame to frame, so these grow on demand to the running
+        # high-water mark (kernels launch over [:num_points] views) instead of
+        # allocating three fresh device arrays every frame.
+        self._wp_intensity = None
+        self._wp_pcl_local = None
+        self._wp_pcl_spher = None
+        # Cached reflectivity lookup (semantic id -> reflectivity) keyed on the
+        # (idToLabels, query_prop) it was built from, so the GPU upload is only
+        # redone when the labelled-mesh set in the FOV changes.
+        self._refl_cache_key = None
+        self._refl_cache_arr = None
+        # Fixed-shape normalization-max buffers, preallocated and re-zeroed each
+        # frame (global max -> shape (1,), per-range max -> shape (n_range,)).
+        self._max_all = wp.zeros(shape=(1,), dtype=wp.float32, device=self._device)
+        self._max_range = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32, device=self._device)
+
         # Initialize the camera (creates the render product) HERE -- post
         # world.reset() (deferred from __init__ for the Isaac Sim 6.0.1 port; see
         # __init__). UW_Camera does the same via its scenario-driven initialize().
@@ -247,10 +279,10 @@ class ImagingSonarSensor(Camera):
     def scan(self):
 
         """Capture a single sonar scan frame and store the raw data.
-    
+
         Returns:
             bool: True if scan was successful (valid data received), False otherwise
-    
+
         Note:
             - Stores pointcloud, normals, semantics, and camera transform in scan_data dict
             - First few frames may be empty due to CUDA initialization
@@ -266,6 +298,144 @@ class ImagingSonarSensor(Camera):
         if len(id_to_labels) == 0:
             return False
 
+        # Optional on-device fast path: compact the in-range points with the
+        # compact_in_range kernel so the per-pixel depth/pcl/normals/semantics
+        # never round-trip device->host->device. Returns True/False on success,
+        # or None if it cannot run on-device (in which case it disables itself
+        # and we drop through to the numpy path). See sonar_initialize().
+        if self.gpu_point_filter:
+            result = self._scan_gpu_compact(id_to_labels)
+            if result is not None:
+                return result
+            self.gpu_point_filter = False
+            print(f"[{self._name}] gpu_point_filter unavailable (annotator outputs "
+                  f"not Warp arrays on '{self._device}'); using numpy scan path.",
+                  flush=True)
+
+        return self._scan_numpy(sem_data, id_to_labels)
+
+    def _scan_gpu_compact(self, id_to_labels):
+        """On-device point selection via the compact_in_range kernel.
+
+        Keeps the depth / point-cloud / normals / semantics AOVs on
+        ``self._device`` and appends the in-range, finite points into reusable
+        output buffers with an atomic counter -- the GPU equivalent of
+        ``sonar_scan_math.select_in_range_points`` (and proven equal to it in
+        tests/test_imaging_sonar_kernels.py).
+
+        Returns:
+            True  - in-range points stored in scan_data.
+            False - valid frame but no in-range points (skip, same as numpy path).
+            None  - the AOV outputs are not on-device Warp arrays (or something
+                    threw); caller should fall back to the numpy path.
+        """
+        try:
+            depth = self._custom_annotators["distance_to_image_plane"].get_data(device=self._device)
+            pcl = self.get_pointcloud(device=self._device, world_frame=True)
+            normals = self._custom_annotators["normals"].get_data(device=self._device)
+            sem_dict = self._custom_annotators["semantic_segmentation"].get_data(device=self._device)
+            sem = self._annot_get(sem_dict, ('data',), 'semantic_segmentation')
+
+            # The fast path only engages when every AOV is genuinely a Warp array
+            # resident on self._device with the dtype the kernel expects. Any
+            # mismatch -> None -> numpy fallback (no silent host round-trip).
+            depth = self._require_warp(depth, wp.float32)
+            pcl = self._require_warp(pcl, wp.float32)
+            normals = self._require_warp(normals, wp.float32)
+            sem = self._require_warp(sem, wp.uint32)
+            if depth is None or pcl is None or normals is None or sem is None:
+                return None
+
+            n_px = depth.size
+            depth_f = depth.reshape((-1,))                       # (N,)
+            pcl_f = pcl.reshape((-1, 3))                         # (N,3)
+            nm_f = normals.reshape((-1, normals.shape[-1]))[:, :3]  # (N,3) view
+            sem_f = sem.reshape((-1,))                           # (N,)
+            if (pcl_f.shape[0] != n_px or nm_f.shape[0] != n_px
+                    or sem_f.shape[0] != n_px):
+                return None
+
+            # Reusable, device-resident output buffers sized to the full pixel
+            # count (the worst case all-in-range). Allocated once, kept across
+            # frames; only the counter is re-zeroed each scan.
+            if self._gpu_out_pcl is None or self._gpu_out_pcl.shape[0] != n_px:
+                self._gpu_out_pcl = wp.zeros((n_px, 3), dtype=wp.float32, device=self._device)
+                self._gpu_out_normals = wp.zeros((n_px, 3), dtype=wp.float32, device=self._device)
+                self._gpu_out_sem = wp.zeros(n_px, dtype=wp.uint32, device=self._device)
+                self._gpu_counter = wp.zeros(1, dtype=wp.int32, device=self._device)
+            self._gpu_counter.zero_()
+
+            wp.launch(kernel=compact_in_range,
+                      dim=n_px,
+                      inputs=[depth_f, pcl_f, nm_f, sem_f,
+                              wp.float32(self.min_range), wp.float32(self.max_range),
+                              self._gpu_counter, self._gpu_out_pcl,
+                              self._gpu_out_normals, self._gpu_out_sem],
+                      device=self._device)
+            wp.synchronize()
+            n_valid = int(self._gpu_counter.numpy()[0])
+
+            if not self._scan_logged:
+                self._scan_logged = True
+                print(f"[{self._name}] scan(gpu): N={n_px} valid={n_valid} "
+                      f"idToLabels={id_to_labels}", flush=True)
+            if n_valid == 0:
+                return False
+
+            cam_data = self.cameraParams_annot.get_data()
+            view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
+            # Contiguous prefix views into the reusable buffers. They stay valid
+            # through make_sonar_data's kernels (all run before the next scan()).
+            self.scan_data['pcl'] = self._gpu_out_pcl[:n_valid]          # (N,3)
+            self.scan_data['normals'] = self._gpu_out_normals[:n_valid]  # (N,3)
+            self.scan_data['semantics'] = self._gpu_out_sem[:n_valid]    # (N,)
+            self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T
+            self.scan_data['idToLabels'] = id_to_labels
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self._name}] gpu_point_filter error ({exc!r}); "
+                  f"falling back to numpy scan path.", flush=True)
+            return None
+
+    def _require_warp(self, arr, dtype):
+        """Return ``arr`` only if it is a Warp array of ``dtype`` already
+        resident on ``self._device``; otherwise None (so the caller falls back
+        rather than silently copying through the host)."""
+        if not isinstance(arr, wp.array):
+            return None
+        if str(arr.device) != self._device:
+            return None
+        if arr.dtype != dtype:
+            return None
+        return arr
+
+    def _ensure_point_buffers(self, num_points):
+        """Grow the reusable per-point work buffers so they hold at least
+        ``num_points`` entries. Only reallocates when a frame needs more points
+        than any previous frame; steady state reuses the same device arrays."""
+        cap = 0 if self._wp_intensity is None else self._wp_intensity.shape[0]
+        if cap < num_points:
+            self._wp_intensity = wp.empty(shape=(num_points,), dtype=wp.float32, device=self._device)
+            self._wp_pcl_local = wp.empty(shape=(num_points,), dtype=wp.vec3, device=self._device)
+            self._wp_pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3, device=self._device)
+
+    def _get_indexToRefl(self, id_to_labels, query_prop):
+        """Return the device reflectivity-lookup array for ``id_to_labels`` /
+        ``query_prop``, rebuilding + re-uploading only when those inputs change
+        (the common case is identical labels frame to frame)."""
+        key = (query_prop, tuple(sorted(
+            (k, tuple(sorted(v.items())) if isinstance(v, dict) else v)
+            for k, v in id_to_labels.items())))
+        if key != self._refl_cache_key:
+            arr = sonar_scan_math.make_indexToProp_array(id_to_labels, query_prop)
+            self._refl_cache_arr = wp.array(arr, dtype=wp.float32, device=self._device)
+            self._refl_cache_key = key
+        return self._refl_cache_arr
+
+    def _scan_numpy(self, sem_data, id_to_labels):
+        """Reference scan path: pull the AOVs to the host and select in-range
+        points with the (unit-tested) pure-numpy sonar_scan_math. This is the
+        default and the fallback for the optional GPU path."""
         # Isaac Sim 6.0.1: reconstruct the point cloud from the depth AOV instead of
         # the (crashing) pointcloud annotator. Camera.get_pointcloud() falls back to
         # a perspective projection of distance_to_image_plane when no pointcloud
@@ -292,32 +462,31 @@ class ImagingSonarSensor(Camera):
             return False
 
         # Keep only pixels with a finite hit inside the sonar range window.
+        # (sonar_scan_math.select_in_range_points is pure numpy + unit tested; it
+        # masks the depth window cheaply over all pixels, then does the per-point
+        # finiteness check and the gathers only on the depth-passing subset.)
         depth_flat = depth_np.reshape(-1)
-        valid = (np.isfinite(depth_flat)
-                 & (depth_flat > self.min_range)
-                 & (depth_flat < self.max_range)
-                 & np.isfinite(pcl_np).all(axis=1))
+        pcl_v, normals_v, sem_v = sonar_scan_math.select_in_range_points(
+            depth_flat, pcl_np, normals_flat, sem_flat, self.min_range, self.max_range)
+        n_valid = pcl_v.shape[0]
         if not getattr(self, "_scan_logged", False):
             self._scan_logged = True
-            uniq_sem = np.unique(sem_flat[valid]) if np.any(valid) else np.array([])
+            uniq_sem = np.unique(sem_v) if n_valid else np.array([])
             print(f"[{self._name}] scan: depth{tuple(depth_np.shape)} pcl{tuple(pcl_np.shape)} "
                   f"normals{tuple(normals_img.shape)} sem{tuple(sem_img.shape)} "
-                  f"valid={int(valid.sum())}/{n_px}", flush=True)
+                  f"valid={n_valid}/{n_px}", flush=True)
             # Material-reflectivity check: idToLabels should carry the 'reflectivity'
             # values, and the in-FOV pixels should span >1 semantic id (contrast).
             print(f"[{self._name}] reflectivity: idToLabels={id_to_labels} "
                   f"unique_sem_in_fov={uniq_sem.tolist()[:12]}", flush=True)
-        if not np.any(valid):
+        if n_valid == 0:
             return False
 
-        self.scan_data['pcl'] = wp.array(
-            np.ascontiguousarray(pcl_np[valid], dtype=np.float32), dtype=wp.float32)        # (N,3)
-        self.scan_data['normals'] = wp.array(
-            np.ascontiguousarray(normals_flat[valid], dtype=np.float32), dtype=wp.float32)  # (N,3)
-        self.scan_data['semantics'] = wp.array(
-            np.ascontiguousarray(sem_flat[valid]), dtype=wp.uint32)                         # (N,)
-        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T              # 4x4 extrinsic
-        self.scan_data['idToLabels'] = id_to_labels                                       # dict
+        self.scan_data['pcl'] = wp.array(pcl_v, dtype=wp.float32)              # (N,3)
+        self.scan_data['normals'] = wp.array(normals_v, dtype=wp.float32)      # (N,3)
+        self.scan_data['semantics'] = wp.array(sem_v, dtype=wp.uint32)         # (N,)
+        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T  # 4x4 extrinsic
+        self.scan_data['idToLabels'] = id_to_labels                           # dict
         return True
 
     @staticmethod
@@ -405,36 +574,14 @@ class ImagingSonarSensor(Camera):
 
 
 
-        def make_indexToProp_array(idToLabels: dict, query_property: str):
-            # A utility function helps to convert idToLabels into indexToProp array
-            # This manipulation facilitates warp computation framework
-            # indexToProp is an 1-dim array where the values associated with the query property 
-            # are placed at the index corresponding to the key
-            # First two entry are always zero because {'0': {'class': 'BACKGROUND'}, '1': {'class': 'UNLABELLED'}}
-            # eg: indexToProp = [0, 0, 0.1, 1 .....] 
-            # idToLabels keys are strings ('0', '1', ...); compare them numerically
-            # so an id >= 10 does not lexicographically undersize the array.
-            max_id = max((int(k) for k in idToLabels.keys()), default=-1)
-            indexToProp_array = np.ones((max_id + 1,))
-            for id in idToLabels.keys():
-                for property in idToLabels.get(id):
-                    if property == query_property:
-                        # Reflectivity labels are strings ('1.0', '2.0'); cast to
-                        # float. Non-numeric entries (e.g. a 'reflectivity':
-                        # 'BACKGROUND'/'UNLABELLED' fallback) keep the default 1.0
-                        # instead of raising ValueError mid-scan.
-                        try:
-                            indexToProp_array[int(id)] = float(idToLabels.get(id).get(property))
-                        except (TypeError, ValueError):
-                            pass
-            return indexToProp_array
-
         if self.scan():
             num_points = self.scan_data['pcl'].shape[0]
-            # Load these small numpy arrays to cuda
-            indexToRefl = wp.array(make_indexToProp_array(idToLabels=self.scan_data['idToLabels'],
-                                                         query_property=query_prop),
-                                                         dtype=wp.float32)
+            # Reflectivity lookup (semantic id -> reflectivity). The mapping is a
+            # pure function of (idToLabels, query_prop), which only changes when
+            # the set of labelled meshes in the FOV changes -- so cache the GPU
+            # upload and rebuild only when the inputs differ, instead of building
+            # a numpy array and uploading it every frame.
+            indexToRefl = self._get_indexToRefl(self.scan_data['idToLabels'], query_prop)
             viewTransform=wp.mat44(self.scan_data['viewTransform'])
             # directly use warp array loaded on cuda
             pcl = self.scan_data['pcl']
@@ -443,8 +590,11 @@ class ImagingSonarSensor(Camera):
         else:
             return
 
-        # Compute intensity for each ray query     
-        intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+        # Compute intensity for each ray query. Reuse the grow-on-demand work
+        # buffers (views over [:num_points]) instead of allocating three fresh
+        # device arrays every frame.
+        self._ensure_point_buffers(num_points)
+        intensity = self._wp_intensity[:num_points]
         wp.launch(kernel=compute_intensity,
                   dim=num_points,
                   inputs=[
@@ -461,8 +611,8 @@ class ImagingSonarSensor(Camera):
                 )
                 
         # Transform pointcloud from world cooridates to sonar local
-        pcl_local =wp.empty(shape=(num_points,), dtype=wp.vec3)
-        pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3)
+        pcl_local = self._wp_pcl_local[:num_points]
+        pcl_spher = self._wp_pcl_spher[:num_points]
         wp.launch(kernel=world2local,
                   dim=num_points,
                   inputs=[
@@ -560,7 +710,8 @@ class ImagingSonarSensor(Camera):
         # Normalizing intensity at each bin either by global maximum or rangewise maximum
         # Compute global maximum
         if normalizing_method == "all":
-            maximum = wp.zeros(shape=(1,), dtype=wp.float32)
+            maximum = self._max_all       # reused (1,) buffer, re-zeroed each frame
+            maximum.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=all_max,
@@ -593,7 +744,8 @@ class ImagingSonarSensor(Camera):
             
         if normalizing_method == "range":
             # Compute rangewise maximum
-            maximum = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32)
+            maximum = self._max_range     # reused (n_range,) buffer, re-zeroed each frame
+            maximum.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=range_max,

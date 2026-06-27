@@ -28,6 +28,7 @@ import time
 import cv2
 
 from isaacsim.oceansim.utils import ros2_context
+from isaacsim.oceansim.utils import camera_math
 
 class UW_Camera(Camera):
 
@@ -84,7 +85,8 @@ class UW_Camera(Camera):
                    camera_frame_id="camera",
                    image_raw_topic="/oceansim/robot/image_raw",
                    depth_topic="/oceansim/robot/depth",
-                   camera_info_topic="/oceansim/robot/camera_info"):
+                   camera_info_topic="/oceansim/robot/camera_info",
+                   publish_image_raw=True, publish_depth=True):
         
         """Configure underwater rendering properties and initialize pipelines.
     
@@ -105,6 +107,7 @@ class UW_Camera(Camera):
     
         """
         self._id = 0
+        self._uw_image_buf = None  # reused output buffer for UW_render (resolution is fixed)
         self._viewport = viewport
         self._device = wp.get_preferred_device()
         super().initialize(physics_sim_view)
@@ -148,6 +151,11 @@ class UW_Camera(Camera):
         self._depth_topic = depth_topic
         self._camera_info_topic = camera_info_topic
         self._camera_frame_id = camera_frame_id
+        # Raw (rgb8, ~6 MB/frame) and depth (32FC1, ~8 MB/frame) are heavy over
+        # the wire (esp. Zenoh); let deployments drop them and keep the compressed
+        # stream. CompressedImage + CameraInfo are always published.
+        self._publish_image_raw = publish_image_raw
+        self._publish_depth = publish_depth
         self._last_publish_time = 0.0
         self._ros2_pub_frequency = ros2_pub_frequency     # publish frequency, hz
         self._ros2_pub_jpeg_quality = ros2_pub_jpeg_quality
@@ -171,18 +179,15 @@ class UW_Camera(Camera):
         info = CameraInfo()
         try:
             width, height = (int(v) for v in self.get_resolution())
-            focal = float(self.get_focal_length())
-            h_aper = float(self.get_horizontal_aperture())
-            v_aper = float(self.get_vertical_aperture())
-            fx = (width * focal / h_aper) if h_aper else float(width)
-            fy = (height * focal / v_aper) if v_aper else fx
-            cx, cy = width / 2.0, height / 2.0
-            info.width, info.height = width, height
-            info.distortion_model = "plumb_bob"
-            info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
-            info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
-            info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-            info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+            intr = camera_math.pinhole_intrinsics(
+                width, height, float(self.get_focal_length()),
+                float(self.get_horizontal_aperture()), float(self.get_vertical_aperture()))
+            info.width, info.height = intr["width"], intr["height"]
+            info.distortion_model = intr["distortion_model"]
+            info.d = intr["d"]
+            info.k = intr["k"]
+            info.r = intr["r"]
+            info.p = intr["p"]
         except Exception as e:
             print(f'[{self._name}] camera_info build failed (intrinsics unavailable): {e}')
         return info
@@ -203,11 +208,7 @@ class UW_Camera(Camera):
         factor = self._depth_radial_to_planar
         if factor is None or factor.shape != d.shape:
             h, w = d.shape
-            cx, cy = k[2], k[5]
-            u = (np.arange(w, dtype=np.float32) - cx) / fx
-            v = (np.arange(h, dtype=np.float32) - cy) / fy
-            uu, vv = np.meshgrid(u, v)
-            factor = 1.0 / np.sqrt(uu * uu + vv * vv + 1.0).astype(np.float32)
+            factor = camera_math.radial_to_planar_factor(h, w, fx, fy, k[2], k[5])
             self._depth_radial_to_planar = factor
         return d * factor
 
@@ -228,10 +229,12 @@ class UW_Camera(Camera):
                 node_name, parameter_overrides=[Parameter('use_sim_time', value=True)])
             self._uw_img_pub = self._ros2_uw_img_node.create_publisher(
                 CompressedImage, self._uw_img_topic, 10)
-            self._image_raw_pub = self._ros2_uw_img_node.create_publisher(
-                Image, self._image_raw_topic, 10)
-            self._depth_pub = self._ros2_uw_img_node.create_publisher(
-                Image, self._depth_topic, 10)
+            if self._publish_image_raw:
+                self._image_raw_pub = self._ros2_uw_img_node.create_publisher(
+                    Image, self._image_raw_topic, 10)
+            if self._publish_depth:
+                self._depth_pub = self._ros2_uw_img_node.create_publisher(
+                    Image, self._depth_topic, 10)
             self._camera_info_pub = self._ros2_uw_img_node.create_publisher(
                 CameraInfo, self._camera_info_topic, 10)
 
@@ -259,8 +262,6 @@ class UW_Camera(Camera):
             uw_image_cpu = uw_img.numpy()
             if uw_image_cpu.dtype != np.uint8:
                 uw_image_cpu = uw_image_cpu.astype(np.uint8)   # UW_render returns 'rgba'
-            rgb = np.ascontiguousarray(uw_image_cpu[:, :, :3])  # drop alpha
-            h, w = rgb.shape[0], rgb.shape[1]
 
             # compressed (jpeg)
             bgr = cv2.cvtColor(uw_image_cpu, cv2.COLOR_RGBA2BGR)
@@ -274,16 +275,19 @@ class UW_Camera(Camera):
                 cmsg.data = jpg.tobytes()
                 self._uw_img_pub.publish(cmsg)
 
-            # raw rgb8
-            imsg = Image()
-            imsg.header.stamp = stamp
-            imsg.header.frame_id = frame
-            imsg.height, imsg.width = h, w
-            imsg.encoding = 'rgb8'
-            imsg.is_bigendian = 0
-            imsg.step = w * 3
-            imsg.data = rgb.tobytes()
-            self._image_raw_pub.publish(imsg)
+            # raw rgb8 (optional; the rgb copy + tobytes() are ~6 MB each/frame)
+            if self._image_raw_pub is not None:
+                rgb = np.ascontiguousarray(uw_image_cpu[:, :, :3])  # drop alpha
+                h, w = rgb.shape[0], rgb.shape[1]
+                imsg = Image()
+                imsg.header.stamp = stamp
+                imsg.header.frame_id = frame
+                imsg.height, imsg.width = h, w
+                imsg.encoding = 'rgb8'
+                imsg.is_bigendian = 0
+                imsg.step = w * 3
+                imsg.data = rgb.tobytes()
+                self._image_raw_pub.publish(imsg)
 
             # depth 32FC1 (planar z-depth, metres) — convert from the radial
             # distance_to_camera the UW kernel uses to ROS's planar convention.
@@ -322,7 +326,13 @@ class UW_Camera(Camera):
         raw_rgba = self._rgba_annot.get_data()
         depth = self._depth_annot.get_data()
         if raw_rgba.size !=0:
-            uw_image = wp.zeros_like(raw_rgba)
+            # Reuse the output buffer across frames; UW_render writes every pixel
+            # (all 4 channels), so no need to zero/realloc ~8 MB each render.
+            if (self._uw_image_buf is None
+                    or self._uw_image_buf.shape != raw_rgba.shape
+                    or self._uw_image_buf.dtype != raw_rgba.dtype):
+                self._uw_image_buf = wp.empty_like(raw_rgba)
+            uw_image = self._uw_image_buf
             wp.launch(
                 dim=np.flip(self.get_resolution()),
                 kernel=UW_render,

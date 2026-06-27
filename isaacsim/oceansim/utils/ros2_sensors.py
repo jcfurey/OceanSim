@@ -49,6 +49,10 @@ import rclpy
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from isaacsim.oceansim.utils import ros2_context
+from isaacsim.oceansim.utils import ros2_math
+# Pure (numpy-only) math lives in ros2_math so it can be unit tested without ROS.
+_quat_wxyz_to_xyzw = ros2_math.quat_wxyz_to_xyzw
+_RateGate = ros2_math.RateGate
 
 try:
     from isaacsim.core.utils.rotations import quat_to_rot_matrix
@@ -72,29 +76,6 @@ def _clock_qos() -> QoSProfile:
         depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
-
-
-def _quat_wxyz_to_xyzw(q):
-    """Isaac uses scalar-first (w, x, y, z); ROS uses scalar-last (x, y, z, w)."""
-    return (float(q[1]), float(q[2]), float(q[3]), float(q[0]))
-
-
-class _RateGate:
-    """Returns True at most every ``1/hz`` seconds of sim time (hz<=0 => always)."""
-
-    def __init__(self, hz: float):
-        self._period = (1.0 / hz) if hz and hz > 0 else 0.0
-        self._last = None
-
-    def ready(self, now: float) -> bool:
-        if self._period <= 0.0:
-            return True
-        # Reset if sim time jumped backward (e.g. a world reset) so publishing
-        # resumes immediately instead of stalling until `now` catches back up.
-        if self._last is None or now < self._last or (now - self._last) >= self._period:
-            self._last = now
-            return True
-        return False
 
 
 class OceanSimSensorPublisher:
@@ -133,6 +114,12 @@ class OceanSimSensorPublisher:
         "sonar_rate": 5.0,
         # toggles
         "publish_clock": True,
+        # Static TF base_link->{sensor} from the mount poses. OFF by default so it
+        # never conflicts with a robot-stack URDF / robot_state_publisher that
+        # already owns those transforms; enable for standalone runs (RViz /
+        # sonar_image_proc need the sensor frames in the TF tree). The transforms
+        # themselves are supplied by the runner via "static_transforms".
+        "publish_static_tf": False,
         # sonar acoustic params (used to fill ProjectedSonarImage.ping_info)
         "sound_speed": 1500.0,
         # gravity magnitude (m/s^2) used to build the IMU specific force
@@ -152,6 +139,7 @@ class OceanSimSensorPublisher:
         self._node = None
         self._ros2_acquired = False
         self._rigid_prim = None
+        self._static_tf_broadcaster = None  # kept alive so /tf_static stays latched
 
         # publishers (created lazily in initialize, may be None if msg pkg missing)
         self._odom_pub = None
@@ -171,6 +159,12 @@ class OceanSimSensorPublisher:
         # IMU finite-difference state (world-frame velocity, for specific force)
         self._last_world_lin_vel = None
         self._last_imu_time = None
+
+        # Cached ProjectedSonarImage geometry (beam directions / ranges /
+        # beamwidths). These depend only on the fixed sonar config (FOV, beam &
+        # range counts), so they are built once and reused every publish instead
+        # of being reconstructed -- the per-publish work then is just the image.
+        self._sonar_geom = None
 
     # ------------------------------------------------------------------ setup
     def initialize(self):
@@ -221,7 +215,53 @@ class OceanSimSensorPublisher:
                 self._node.get_logger().warn(
                     f"sonar publisher disabled (marine_acoustic_msgs missing?): {e}")
 
+        self._setup_static_tf()
         self._node.get_logger().info("OceanSimSensorPublisher initialized")
+
+    def _setup_static_tf(self):
+        """Broadcast base_link->{sensor} static transforms (latched /tf_static).
+
+        Opt-in (config publish_static_tf): each entry of static_transforms is
+        {child_frame_id, translation:[x,y,z], rotation_wxyz:[w,x,y,z]} expressed
+        in the robot base frame (the sensors are children of the robot prim, so
+        their local mount pose is exactly base_link->sensor)."""
+        transforms = self._cfg.get("static_transforms", [])
+        if not self._cfg.get("publish_static_tf") or not transforms:
+            return
+        try:
+            from tf2_ros import StaticTransformBroadcaster
+            from geometry_msgs.msg import TransformStamped
+        except Exception as e:  # pragma: no cover - tf2_ros not installed
+            self._node.get_logger().warn(f"static TF disabled (tf2_ros unavailable): {e}")
+            return
+
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self._node)
+        base = self._cfg["base_frame_id"]
+        stamp = self._node.get_clock().now().to_msg()
+        msgs = []
+        for t in transforms:
+            child = t.get("child_frame_id")
+            if not child or child == base:
+                continue  # skip identity / unnamed (e.g. sensors reported in base_link)
+            ts = TransformStamped()
+            ts.header.stamp = stamp
+            ts.header.frame_id = base
+            ts.child_frame_id = child
+            tr = t.get("translation", [0.0, 0.0, 0.0])
+            ts.transform.translation.x = float(tr[0])
+            ts.transform.translation.y = float(tr[1])
+            ts.transform.translation.z = float(tr[2])
+            qx, qy, qz, qw = _quat_wxyz_to_xyzw(t.get("rotation_wxyz", [1.0, 0.0, 0.0, 0.0]))
+            ts.transform.rotation.x = qx
+            ts.transform.rotation.y = qy
+            ts.transform.rotation.z = qz
+            ts.transform.rotation.w = qw
+            msgs.append(ts)
+        if msgs:
+            self._static_tf_broadcaster.sendTransform(msgs)
+            self._node.get_logger().info(
+                f"published {len(msgs)} static transform(s) from {base}: "
+                f"{[m.child_frame_id for m in msgs]}")
 
     # --------------------------------------------------------------- per-step
     def publish(self, sim_time: float):
@@ -255,11 +295,7 @@ class OceanSimSensorPublisher:
     # --------------------------------------------------------------- builders
     def _stamp(self, sim_time: float):
         from builtin_interfaces.msg import Time
-        sec = int(sim_time)
-        nanosec = int(round((sim_time - sec) * 1e9))
-        if nanosec >= 1_000_000_000:
-            sec += 1
-            nanosec -= 1_000_000_000
+        sec, nanosec = ros2_math.sim_time_to_sec_nanosec(sim_time)
         return Time(sec=sec, nanosec=nanosec)
 
     def _publish_clock(self, sim_time: float):
@@ -343,8 +379,7 @@ class OceanSimSensorPublisher:
             dt = sim_time - self._last_imu_time
             if dt > 1e-6:
                 a_world = (lin_vel_w - self._last_world_lin_vel) / dt
-        f_world = a_world - np.array([0.0, 0.0, -g])  # subtract gravity vector
-        f_body = rt @ f_world
+        f_body = ros2_math.specific_force_body(rot, a_world, g)
         msg.linear_acceleration.x = float(f_body[0])
         msg.linear_acceleration.y = float(f_body[1])
         msg.linear_acceleration.z = float(f_body[2])
@@ -396,7 +431,6 @@ class OceanSimSensorPublisher:
         """
         from marine_acoustic_msgs.msg import (
             ProjectedSonarImage, PingInfo, SonarImageData)
-        from geometry_msgs.msg import Vector3
 
         sonar_map = getattr(self._sonar, "sonar_map", None)
         if sonar_map is None:
@@ -411,54 +445,73 @@ class OceanSimSensorPublisher:
         # (oculus_sonar_driver/ping_to_sonar_image.h, which pushes r outer / b
         # inner). The grid is already (n_range, n_azimuth), so use it directly --
         # transposing to beam-major scrambles the image for every consumer.
-        intensity = np.ascontiguousarray(grid[:, :, 2])
-        n_range, n_beams = intensity.shape
+        # Range-major uint8 image (see ros2_math.sonar_intensity_uint8).
+        img8, n_range, n_beams = ros2_math.sonar_intensity_uint8(grid)
 
         min_range, max_range = self._sonar.get_range()
         hori_fov, vert_fov = self._sonar.get_fov()  # degrees
+        geom = self._sonar_geometry(n_range, n_beams, min_range, max_range,
+                                    hori_fov, vert_fov)
 
         msg = ProjectedSonarImage()
         msg.header.stamp = stamp
         msg.header.frame_id = self._cfg["sonar_frame_id"]
 
         ping = PingInfo()
-        ping.frequency = float(getattr(self._sonar, "frequency", 1.2e6))
+        # ImagingSonarSensor is a Camera and may expose frequency=None; guard so
+        # float(None) doesn't throw (and fall back to a nominal acoustic freq).
+        _sonar_freq = getattr(self._sonar, "frequency", None)
+        ping.frequency = float(_sonar_freq) if _sonar_freq else 1.2e6
         ping.sound_speed = float(self._cfg["sound_speed"])
-        # Match the real Oculus driver / marine_acoustic_msgs convention: BOTH
-        # arrays are per-beam (length n_beams). rx_beamwidths is the azimuth
-        # (horizontal) beamwidth of each receive beam; tx_beamwidths is the
-        # elevation (vertical) beamwidth of the transmit swath. sonar_proc indexes
-        # both per beam (tx -> vertical uncertainty, rx -> horizontal uncertainty),
-        # so a length-1 tx array reads out of bounds.
-        ping.tx_beamwidths = [math.radians(vert_fov)] * n_beams
-        ping.rx_beamwidths = [math.radians(hori_fov / max(n_beams, 1))] * n_beams
+        ping.tx_beamwidths = geom["tx_beamwidths"]
+        ping.rx_beamwidths = geom["rx_beamwidths"]
         msg.ping_info = ping
 
-        # Bearings spread symmetrically across the horizontal FOV. Encode each
-        # beam direction with the SAME convention as the real Oculus driver
-        # (oculus_sonar_driver/ping_to_sonar_image.h) and as sonar_image_proc /
-        # sonar_proc expect: azimuth lives in -y, range/forward in +z, elevation
-        # x=0, so that az = atan2(-y, z). Putting the spread in x instead (y=0)
-        # collapses every computed azimuth to 0, which makes draw_sonar build an
-        # empty remap LUT (assertion crash) and sonar_proc emit a degenerate cloud.
-        half = math.radians(hori_fov) / 2.0
-        bearings = np.linspace(-half, half, n_beams)
-        msg.beam_directions = [
-            Vector3(x=0.0, y=float(-math.sin(b)), z=float(math.cos(b))) for b in bearings
-        ]
-
-        msg.ranges = np.linspace(
-            float(min_range), float(max_range), n_range).astype(np.float32).tolist()
+        msg.beam_directions = geom["beam_directions"]
+        msg.ranges = geom["ranges"]
 
         data = SonarImageData()
         data.is_bigendian = False
         data.dtype = SonarImageData.DTYPE_UINT8
         data.beam_count = int(n_beams)
-        # Intensity is normalised to [0, 1]; scale to the full uint8 range.
-        img8 = np.clip(intensity * 255.0, 0.0, 255.0).astype(np.uint8)
         data.data = img8.reshape(-1).tobytes()
         msg.image = data
         self._sonar_pub.publish(msg)
+
+    def _sonar_geometry(self, n_range, n_beams, min_range, max_range, hori_fov, vert_fov):
+        """Cached ProjectedSonarImage geometry, rebuilt only if the sonar grid
+        shape / FOV changes (it does not, frame to frame).
+
+        * beam_directions: bearings spread symmetrically across the horizontal
+          FOV, encoded with the SAME convention as the real Oculus driver
+          (oculus_sonar_driver/ping_to_sonar_image.h) and as sonar_image_proc /
+          sonar_proc expect: azimuth in -y, range/forward in +z, elevation x=0,
+          so az = atan2(-y, z). Putting the spread in x instead (y=0) collapses
+          every azimuth to 0 -> draw_sonar builds an empty remap LUT (assertion
+          crash) and sonar_proc emits a degenerate cloud.
+        * tx/rx_beamwidths: BOTH per-beam (length n_beams), per the Oculus driver
+          / marine_acoustic_msgs convention. rx is the azimuth (horizontal)
+          beamwidth of each receive beam; tx is the elevation (vertical)
+          beamwidth of the transmit swath. sonar_proc indexes both per beam, so a
+          length-1 tx array reads out of bounds.
+        """
+        key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov)
+        cache = self._sonar_geom
+        if cache is not None and cache["key"] == key:
+            return cache
+        from geometry_msgs.msg import Vector3
+        geom = {
+            "key": key,
+            "beam_directions": [
+                Vector3(x=x, y=y, z=z)
+                for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams)
+            ],
+            "ranges": ros2_math.sonar_ranges(min_range, max_range, n_range),
+            "tx_beamwidths": [math.radians(vert_fov)] * n_beams,
+            "rx_beamwidths": [math.radians(hori_fov / max(n_beams, 1))] * n_beams,
+        }
+        self._sonar_geom = geom
+        return geom
 
     # ----------------------------------------------------------------- helpers
     def _to_body(self, quat_wxyz, lin_vel_w, ang_vel_w):
@@ -472,23 +525,15 @@ class OceanSimSensorPublisher:
 
     @staticmethod
     def _rot_from_quat(q):
-        w, x, y, z = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
-        return np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ])
+        return ros2_math.rot_from_quat_wxyz(q)
 
     @staticmethod
     def _diag3(a, b, c):
-        return [a, 0.0, 0.0, 0.0, b, 0.0, 0.0, 0.0, c]
+        return ros2_math.diag3(a, b, c)
 
     @staticmethod
     def _diag6(*vals):
-        m = [0.0] * 36
-        for i, v in enumerate(vals):
-            m[i * 6 + i] = v
-        return m
+        return ros2_math.diag6(*vals)
 
     # ------------------------------------------------------------------ close
     def close(self):

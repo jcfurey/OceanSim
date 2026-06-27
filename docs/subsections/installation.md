@@ -50,6 +50,19 @@ The [`docker/run.sh`](../../docker/run.sh) helper handles display passthrough fo
 
 When you are done, you can revoke the X server grant with `xhost -local:root`.
 
+### ROS 2 middleware (Zenoh)
+The container defaults to `RMW_IMPLEMENTATION=rmw_zenoh_cpp` so the sim joins the same Zenoh graph as the rest of the robot stack. With Zenoh, multicast discovery is **off** by default — nodes discover each other via a **Zenoh router**, which must be running before any ROS 2 node (the OceanSim publishers, RViz, `robot_localization`, `sonar_image_proc`, …) can see each other.
+
+- In a real deployment the router belongs to the robot stack; its endpoint config (`ROS_DOMAIN_ID`, peer/router endpoints) is sourced at runtime from the workspace's `bashrc.d/99-zenoh_configs.bashrc`, not baked into the image.
+- To run OceanSim **standalone** (a dev box / smoke test) where no stack router exists, start one in a separate terminal:
+  ```bash
+  ./scripts/start_zenoh_router.sh   # ros2 run rmw_zenoh_cpp rmw_zenohd
+  ```
+
+Sensor topics publish with `BEST_EFFORT` reliability (Zenoh-friendly for high-rate data); `/clock` is `RELIABLE`. The underwater camera's raw (`rgb8`) and depth (`32FC1`) image streams are large — disable them with `publish_image_raw=False` / `publish_depth=False` if only the compressed stream is needed over the wire.
+
+**TF for standalone runs.** In a robot-stack deployment the URDF / `robot_state_publisher` owns the sensor frames, so the sim publishes no TF by default. To run OceanSim by itself (so RViz / `sonar_image_proc` can place the sonar and camera data), pass `--publish-static-tf` to the runner (or `"publish_static_tf": true` in the config) — it broadcasts latched `base_link → {sonar0/optical_frame, camera}` from the sensor mount poses. (DVL/barometer/IMU already report in `base_link`.)
+
 ## Launching OceanSim
 There is no separate building process needed for OceanSim, as it is an extension. To load OceanSim: 
 - IsaacSim, follow `Window -> Extensions`

@@ -17,13 +17,12 @@ Data delivery (the hard-won part):
   So we create the runtime with ``annotators=[]`` and attach a custom Writer that
   captures GenericModelOutput (Isaac's create_acoustic_basic.py pattern).
 * Replicator writers only fire when the orchestrator evaluates the SDG pipeline.
-  Isaac's examples get that for free from ``simulation_app.update()`` +
-  capture-on-play, but the OceanSim runner drives the sim with
-  ``world.step(render=True)``, under which the writer never fires.  So each
-  ``make_sonar_data()`` we pump ``rep.orchestrator.step(delta_time=0.0,
-  pause_timeline=False)`` -- the documented way to step Replicator against an
-  externally-controlled timeline -- which makes the writer produce a frame we
-  then read.
+  We enable ``rep.orchestrator.set_capture_on_play(True)`` in ``sonar_initialize``
+  so the writer captures on the renderer advances the OceanSim runner already
+  drives via ``world.step(render=True)``.  ``make_sonar_data()`` then just reads
+  the writer's latest stashed frame -- it does NOT call
+  ``rep.orchestrator.step()`` itself, because an explicit pump conflicts with
+  ``world.step``'s render control ("renderer failed to advance").
 
 Acoustic GMO field semantics (per create_acoustic_basic.py):
 
@@ -48,6 +47,8 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
+
+from isaacsim.oceansim.utils import rtx_acoustic_math
 
 
 _GMO_WRITER_NAME = "OceanSimAcousticGmoSink"
@@ -140,6 +141,9 @@ class RtxAcousticSensor:
         self.vert_fov = float(vert_fov)
         self.angular_res = float(angular_res)
         self.center_frequency = float(center_frequency)
+        # Alias so OceanSimSensorPublisher's `getattr(sonar, "frequency", ...)`
+        # reports the real acoustic frequency in ProjectedSonarImage.ping_info.
+        self.frequency = self.center_frequency
         self.sound_speed = float(sound_speed)
         self.tick_rate = float(tick_rate)
         self._n_elements = int(n_elements)
@@ -154,7 +158,7 @@ class RtxAcousticSensor:
         self._frame_i = 0
         self._logged_valid = False
         self._map_np = np.zeros((self.n_range, self.n_beams, 3), dtype=np.float32)
-        self.sonar_map = wp.array(self._map_np, dtype=wp.vec3)
+        self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
 
     # -- interface parity with ImagingSonarSensor -------------------------------
     def get_range(self):
@@ -221,15 +225,18 @@ class RtxAcousticSensor:
         self._writer = self._sensor.attach_writer(writer_name)
 
         self._map_np[:] = 0.0
-        self.sonar_map = wp.array(self._map_np, dtype=wp.vec3)
+        self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
         print(f"[{self._name}] native RTX acoustic sensor ready @ {self._prim_path}: "
               f"{self._n_elements} receiver mounts, tick_rate={self.tick_rate} Hz, "
               f"grid {self.n_beams} beams x {self.n_range} range (writer={writer_name})",
               flush=True)
 
     def make_sonar_data(self, *args, **kwargs):
-        """Pump the orchestrator so the writer captures a frame, then fold the
-        latest acoustic GMO into ``sonar_map``."""
+        """Fold the writer's latest captured acoustic GMO frame into ``sonar_map``.
+
+        The frame is captured by the GMO writer via replicator capture-on-play as
+        ``world.step(render=True)`` advances the renderer (see ``sonar_initialize``);
+        this method only reads the stashed result, it does not step Replicator."""
         if self._writer is None:
             return
         self._frame_i += 1
@@ -257,20 +264,13 @@ class RtxAcousticSensor:
                   f"t_ns=[{t_ns.min():.0f},{t_ns.max():.0f}], "
                   f"|amp|=[{np.abs(amp).min():.4g},{np.abs(amp).max():.4g}]", flush=True)
 
-        rng = self.sound_speed * (t_ns * 1e-9) / 2.0
-        rbin = np.round((rng - self.min_range) / self.range_res).astype(np.int64)
-        n_mounts = max(self._n_elements, int(rx.max()) + 1 if rx.size else self._n_elements)
-        beam = np.round(rx.astype(np.float64) / max(n_mounts - 1, 1) * (self.n_beams - 1)).astype(np.int64)
-
-        valid = ((rbin >= 0) & (rbin < self.n_range)
-                 & (beam >= 0) & (beam < self.n_beams) & np.isfinite(rng))
+        # Fold the GMO samples into the (n_range, n_beams) intensity grid
+        # (rtx_acoustic_math.fold_gmo_to_grid is pure numpy + unit tested).
         self._map_np[:] = 0.0
-        if np.any(valid):
-            np.add.at(self._map_np[:, :, 2], (rbin[valid], beam[valid]), np.abs(amp[valid]))
-            peak = float(self._map_np[:, :, 2].max())
-            if peak > 0.0:
-                self._map_np[:, :, 2] /= peak
-        self.sonar_map = wp.array(self._map_np, dtype=wp.vec3)
+        self._map_np[:, :, 2] = rtx_acoustic_math.fold_gmo_to_grid(
+            rx, amp, t_ns, self.sound_speed, self.min_range, self.range_res,
+            self.n_range, self.n_beams, self._n_elements)
+        self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
 
     def close(self):
         try:
