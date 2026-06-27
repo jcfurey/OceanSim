@@ -49,6 +49,10 @@ import rclpy
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from isaacsim.oceansim.utils import ros2_context
+from isaacsim.oceansim.utils import ros2_math
+# Pure (numpy-only) math lives in ros2_math so it can be unit tested without ROS.
+_quat_wxyz_to_xyzw = ros2_math.quat_wxyz_to_xyzw
+_RateGate = ros2_math.RateGate
 
 try:
     from isaacsim.core.utils.rotations import quat_to_rot_matrix
@@ -72,29 +76,6 @@ def _clock_qos() -> QoSProfile:
         depth=1,
         durability=DurabilityPolicy.VOLATILE,
     )
-
-
-def _quat_wxyz_to_xyzw(q):
-    """Isaac uses scalar-first (w, x, y, z); ROS uses scalar-last (x, y, z, w)."""
-    return (float(q[1]), float(q[2]), float(q[3]), float(q[0]))
-
-
-class _RateGate:
-    """Returns True at most every ``1/hz`` seconds of sim time (hz<=0 => always)."""
-
-    def __init__(self, hz: float):
-        self._period = (1.0 / hz) if hz and hz > 0 else 0.0
-        self._last = None
-
-    def ready(self, now: float) -> bool:
-        if self._period <= 0.0:
-            return True
-        # Reset if sim time jumped backward (e.g. a world reset) so publishing
-        # resumes immediately instead of stalling until `now` catches back up.
-        if self._last is None or now < self._last or (now - self._last) >= self._period:
-            self._last = now
-            return True
-        return False
 
 
 class OceanSimSensorPublisher:
@@ -308,11 +289,7 @@ class OceanSimSensorPublisher:
     # --------------------------------------------------------------- builders
     def _stamp(self, sim_time: float):
         from builtin_interfaces.msg import Time
-        sec = int(sim_time)
-        nanosec = int(round((sim_time - sec) * 1e9))
-        if nanosec >= 1_000_000_000:
-            sec += 1
-            nanosec -= 1_000_000_000
+        sec, nanosec = ros2_math.sim_time_to_sec_nanosec(sim_time)
         return Time(sec=sec, nanosec=nanosec)
 
     def _publish_clock(self, sim_time: float):
@@ -396,8 +373,7 @@ class OceanSimSensorPublisher:
             dt = sim_time - self._last_imu_time
             if dt > 1e-6:
                 a_world = (lin_vel_w - self._last_world_lin_vel) / dt
-        f_world = a_world - np.array([0.0, 0.0, -g])  # subtract gravity vector
-        f_body = rt @ f_world
+        f_body = ros2_math.specific_force_body(rot, a_world, g)
         msg.linear_acceleration.x = float(f_body[0])
         msg.linear_acceleration.y = float(f_body[1])
         msg.linear_acceleration.z = float(f_body[2])
@@ -464,8 +440,8 @@ class OceanSimSensorPublisher:
         # (oculus_sonar_driver/ping_to_sonar_image.h, which pushes r outer / b
         # inner). The grid is already (n_range, n_azimuth), so use it directly --
         # transposing to beam-major scrambles the image for every consumer.
-        intensity = np.ascontiguousarray(grid[:, :, 2])
-        n_range, n_beams = intensity.shape
+        # Range-major uint8 image (see ros2_math.sonar_intensity_uint8).
+        img8, n_range, n_beams = ros2_math.sonar_intensity_uint8(grid)
 
         min_range, max_range = self._sonar.get_range()
         hori_fov, vert_fov = self._sonar.get_fov()  # degrees
@@ -497,21 +473,17 @@ class OceanSimSensorPublisher:
         # x=0, so that az = atan2(-y, z). Putting the spread in x instead (y=0)
         # collapses every computed azimuth to 0, which makes draw_sonar build an
         # empty remap LUT (assertion crash) and sonar_proc emit a degenerate cloud.
-        half = math.radians(hori_fov) / 2.0
-        bearings = np.linspace(-half, half, n_beams)
         msg.beam_directions = [
-            Vector3(x=0.0, y=float(-math.sin(b)), z=float(math.cos(b))) for b in bearings
+            Vector3(x=x, y=y, z=z)
+            for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams)
         ]
 
-        msg.ranges = np.linspace(
-            float(min_range), float(max_range), n_range).astype(np.float32).tolist()
+        msg.ranges = ros2_math.sonar_ranges(min_range, max_range, n_range)
 
         data = SonarImageData()
         data.is_bigendian = False
         data.dtype = SonarImageData.DTYPE_UINT8
         data.beam_count = int(n_beams)
-        # Intensity is normalised to [0, 1]; scale to the full uint8 range.
-        img8 = np.clip(intensity * 255.0, 0.0, 255.0).astype(np.uint8)
         data.data = img8.reshape(-1).tobytes()
         msg.image = data
         self._sonar_pub.publish(msg)
@@ -528,23 +500,15 @@ class OceanSimSensorPublisher:
 
     @staticmethod
     def _rot_from_quat(q):
-        w, x, y, z = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
-        return np.array([
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-        ])
+        return ros2_math.rot_from_quat_wxyz(q)
 
     @staticmethod
     def _diag3(a, b, c):
-        return [a, 0.0, 0.0, 0.0, b, 0.0, 0.0, 0.0, c]
+        return ros2_math.diag3(a, b, c)
 
     @staticmethod
     def _diag6(*vals):
-        m = [0.0] * 36
-        for i, v in enumerate(vals):
-            m[i * 6 + i] = v
-        return m
+        return ros2_math.diag6(*vals)
 
     # ------------------------------------------------------------------ close
     def close(self):

@@ -28,6 +28,7 @@ import time
 import cv2
 
 from isaacsim.oceansim.utils import ros2_context
+from isaacsim.oceansim.utils import camera_math
 
 class UW_Camera(Camera):
 
@@ -178,18 +179,15 @@ class UW_Camera(Camera):
         info = CameraInfo()
         try:
             width, height = (int(v) for v in self.get_resolution())
-            focal = float(self.get_focal_length())
-            h_aper = float(self.get_horizontal_aperture())
-            v_aper = float(self.get_vertical_aperture())
-            fx = (width * focal / h_aper) if h_aper else float(width)
-            fy = (height * focal / v_aper) if v_aper else fx
-            cx, cy = width / 2.0, height / 2.0
-            info.width, info.height = width, height
-            info.distortion_model = "plumb_bob"
-            info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
-            info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
-            info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-            info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+            intr = camera_math.pinhole_intrinsics(
+                width, height, float(self.get_focal_length()),
+                float(self.get_horizontal_aperture()), float(self.get_vertical_aperture()))
+            info.width, info.height = intr["width"], intr["height"]
+            info.distortion_model = intr["distortion_model"]
+            info.d = intr["d"]
+            info.k = intr["k"]
+            info.r = intr["r"]
+            info.p = intr["p"]
         except Exception as e:
             print(f'[{self._name}] camera_info build failed (intrinsics unavailable): {e}')
         return info
@@ -210,11 +208,7 @@ class UW_Camera(Camera):
         factor = self._depth_radial_to_planar
         if factor is None or factor.shape != d.shape:
             h, w = d.shape
-            cx, cy = k[2], k[5]
-            u = (np.arange(w, dtype=np.float32) - cx) / fx
-            v = (np.arange(h, dtype=np.float32) - cy) / fy
-            uu, vv = np.meshgrid(u, v)
-            factor = 1.0 / np.sqrt(uu * uu + vv * vv + 1.0).astype(np.float32)
+            factor = camera_math.radial_to_planar_factor(h, w, fx, fy, k[2], k[5])
             self._depth_radial_to_planar = factor
         return d * factor
 
