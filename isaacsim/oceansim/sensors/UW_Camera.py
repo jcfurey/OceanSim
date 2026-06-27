@@ -106,6 +106,7 @@ class UW_Camera(Camera):
     
         """
         self._id = 0
+        self._uw_image_buf = None  # reused output buffer for UW_render (resolution is fixed)
         self._viewport = viewport
         self._device = wp.get_preferred_device()
         super().initialize(physics_sim_view)
@@ -331,7 +332,13 @@ class UW_Camera(Camera):
         raw_rgba = self._rgba_annot.get_data()
         depth = self._depth_annot.get_data()
         if raw_rgba.size !=0:
-            uw_image = wp.zeros_like(raw_rgba)
+            # Reuse the output buffer across frames; UW_render writes every pixel
+            # (all 4 channels), so no need to zero/realloc ~8 MB each render.
+            if (self._uw_image_buf is None
+                    or self._uw_image_buf.shape != raw_rgba.shape
+                    or self._uw_image_buf.dtype != raw_rgba.dtype):
+                self._uw_image_buf = wp.empty_like(raw_rgba)
+            uw_image = self._uw_image_buf
             wp.launch(
                 dim=np.flip(self.get_resolution()),
                 kernel=UW_render,
