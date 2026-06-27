@@ -5,6 +5,7 @@ import numpy as np
 from omni.replicator.core.scripts.functional import write_np
 import warp as wp
 from isaacsim.oceansim.utils.ImagingSonar_kernels import *
+from isaacsim.oceansim.utils import sonar_scan_math
 
 
 # Future TODO
@@ -292,32 +293,31 @@ class ImagingSonarSensor(Camera):
             return False
 
         # Keep only pixels with a finite hit inside the sonar range window.
+        # (sonar_scan_math.select_in_range_points is pure numpy + unit tested; it
+        # masks the depth window cheaply over all pixels, then does the per-point
+        # finiteness check and the gathers only on the depth-passing subset.)
         depth_flat = depth_np.reshape(-1)
-        valid = (np.isfinite(depth_flat)
-                 & (depth_flat > self.min_range)
-                 & (depth_flat < self.max_range)
-                 & np.isfinite(pcl_np).all(axis=1))
+        pcl_v, normals_v, sem_v = sonar_scan_math.select_in_range_points(
+            depth_flat, pcl_np, normals_flat, sem_flat, self.min_range, self.max_range)
+        n_valid = pcl_v.shape[0]
         if not getattr(self, "_scan_logged", False):
             self._scan_logged = True
-            uniq_sem = np.unique(sem_flat[valid]) if np.any(valid) else np.array([])
+            uniq_sem = np.unique(sem_v) if n_valid else np.array([])
             print(f"[{self._name}] scan: depth{tuple(depth_np.shape)} pcl{tuple(pcl_np.shape)} "
                   f"normals{tuple(normals_img.shape)} sem{tuple(sem_img.shape)} "
-                  f"valid={int(valid.sum())}/{n_px}", flush=True)
+                  f"valid={n_valid}/{n_px}", flush=True)
             # Material-reflectivity check: idToLabels should carry the 'reflectivity'
             # values, and the in-FOV pixels should span >1 semantic id (contrast).
             print(f"[{self._name}] reflectivity: idToLabels={id_to_labels} "
                   f"unique_sem_in_fov={uniq_sem.tolist()[:12]}", flush=True)
-        if not np.any(valid):
+        if n_valid == 0:
             return False
 
-        self.scan_data['pcl'] = wp.array(
-            np.ascontiguousarray(pcl_np[valid], dtype=np.float32), dtype=wp.float32)        # (N,3)
-        self.scan_data['normals'] = wp.array(
-            np.ascontiguousarray(normals_flat[valid], dtype=np.float32), dtype=wp.float32)  # (N,3)
-        self.scan_data['semantics'] = wp.array(
-            np.ascontiguousarray(sem_flat[valid]), dtype=wp.uint32)                         # (N,)
-        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T              # 4x4 extrinsic
-        self.scan_data['idToLabels'] = id_to_labels                                       # dict
+        self.scan_data['pcl'] = wp.array(pcl_v, dtype=wp.float32)              # (N,3)
+        self.scan_data['normals'] = wp.array(normals_v, dtype=wp.float32)      # (N,3)
+        self.scan_data['semantics'] = wp.array(sem_v, dtype=wp.uint32)         # (N,)
+        self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T  # 4x4 extrinsic
+        self.scan_data['idToLabels'] = id_to_labels                           # dict
         return True
 
     @staticmethod
