@@ -70,6 +70,10 @@ def parse_args(argv):
                    help="Sonar implementation: 'oceansim' (custom imaging sonar, "
                         "default) or 'rtx_acoustic' (Isaac native RTX acoustic, "
                         "experimental).")
+    p.add_argument("--publish-static-tf", dest="publish_static_tf",
+                   action="store_true", default=None,
+                   help="Broadcast base_link->{sonar,camera} static TF from the "
+                        "sensor mounts (for standalone runs without a stack URDF).")
     p.add_argument("--no-camera", dest="camera", action="store_false", default=None)
     p.add_argument("--no-dvl", dest="dvl", action="store_false", default=None)
     p.add_argument("--no-baro", dest="baro", action="store_false", default=None)
@@ -93,6 +97,11 @@ def load_config(args):
         # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
         "sonar_backend": "oceansim",
         "publisher": {},
+        # Publish base_link->{sonar,camera} static TF from the sensor mounts.
+        # OFF by default: in a robot-stack deployment the URDF / robot_state_publisher
+        # owns those frames. Turn ON for standalone runs so RViz / sonar_image_proc
+        # have the sensor frames in the TF tree.
+        "publish_static_tf": False,
         "water_surface_z": 1.43389,
     }
     if args.config:
@@ -111,6 +120,8 @@ def load_config(args):
         cfg["control_mode"] = args.control_mode
     if args.sonar_backend is not None:
         cfg["sonar_backend"] = args.sonar_backend
+    if args.publish_static_tf is not None:
+        cfg["publish_static_tf"] = args.publish_static_tf
     for key, val in (("sonar", args.sonar), ("camera", args.camera),
                      ("dvl", args.dvl), ("baro", args.baro)):
         if val is not None:
@@ -271,8 +282,9 @@ def main(argv):
                 range_res=0.005, angular_res=0.25, hori_res=4000, **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
+        _cam_translation = np.array([0.3, 0.0, 0.1])
         cam = UW_Camera(prim_path=robot_path + "/UW_camera",
-                        resolution=[1920, 1080], translation=np.array([0.3, 0.0, 0.1]))
+                        resolution=[1920, 1080], translation=_cam_translation)
         cam.set_focal_length(0.1 * 21)
         cam.set_clipping_range(0.1, 100)
     if sensors.get("dvl"):
@@ -289,9 +301,27 @@ def main(argv):
     scenario = MHL_Sensor_Example_Scenario()
     scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"])
 
+    pub_cfg = dict(cfg.get("publisher", {}))
+    if cfg.get("publish_static_tf"):
+        # The sensors are children of the robot prim, so their local mount pose
+        # IS base_link->sensor. DVL/baro/IMU report in base_link, so no TF needed.
+        static_tfs = []
+        if sonar is not None:
+            static_tfs.append({
+                "child_frame_id": pub_cfg.get("sonar_frame_id", "sonar0/optical_frame"),
+                "translation": [float(x) for x in _sonar_xform["translation"]],
+                "rotation_wxyz": [float(x) for x in _sonar_xform["orientation"]],
+            })
+        if cam is not None:
+            static_tfs.append({
+                "child_frame_id": pub_cfg.get("camera_frame_id", "camera"),
+                "translation": [float(x) for x in _cam_translation],
+                "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+            })
+        pub_cfg["publish_static_tf"] = True
+        pub_cfg["static_transforms"] = static_tfs
     publisher = OceanSimSensorPublisher(
-        robot_prim=robot_prim, sonar=sonar, dvl=dvl, baro=baro,
-        config=cfg.get("publisher", {}))
+        robot_prim=robot_prim, sonar=sonar, dvl=dvl, baro=baro, config=pub_cfg)
     publisher.initialize()
 
     # ---- run loop ---------------------------------------------------------

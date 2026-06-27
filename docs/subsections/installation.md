@@ -61,6 +61,8 @@ The container defaults to `RMW_IMPLEMENTATION=rmw_zenoh_cpp` so the sim joins th
 
 Sensor topics publish with `BEST_EFFORT` reliability (Zenoh-friendly for high-rate data); `/clock` is `RELIABLE`. The underwater camera's raw (`rgb8`) and depth (`32FC1`) image streams are large — disable them with `publish_image_raw=False` / `publish_depth=False` if only the compressed stream is needed over the wire.
 
+**TF for standalone runs.** In a robot-stack deployment the URDF / `robot_state_publisher` owns the sensor frames, so the sim publishes no TF by default. To run OceanSim by itself (so RViz / `sonar_image_proc` can place the sonar and camera data), pass `--publish-static-tf` to the runner (or `"publish_static_tf": true` in the config) — it broadcasts latched `base_link → {sonar0/optical_frame, camera}` from the sensor mount poses. (DVL/barometer/IMU already report in `base_link`.)
+
 ## Launching OceanSim
 There is no separate building process needed for OceanSim, as it is an extension. To load OceanSim: 
 - IsaacSim, follow `Window -> Extensions`

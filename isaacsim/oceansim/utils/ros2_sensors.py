@@ -133,6 +133,12 @@ class OceanSimSensorPublisher:
         "sonar_rate": 5.0,
         # toggles
         "publish_clock": True,
+        # Static TF base_link->{sensor} from the mount poses. OFF by default so it
+        # never conflicts with a robot-stack URDF / robot_state_publisher that
+        # already owns those transforms; enable for standalone runs (RViz /
+        # sonar_image_proc need the sensor frames in the TF tree). The transforms
+        # themselves are supplied by the runner via "static_transforms".
+        "publish_static_tf": False,
         # sonar acoustic params (used to fill ProjectedSonarImage.ping_info)
         "sound_speed": 1500.0,
         # gravity magnitude (m/s^2) used to build the IMU specific force
@@ -152,6 +158,7 @@ class OceanSimSensorPublisher:
         self._node = None
         self._ros2_acquired = False
         self._rigid_prim = None
+        self._static_tf_broadcaster = None  # kept alive so /tf_static stays latched
 
         # publishers (created lazily in initialize, may be None if msg pkg missing)
         self._odom_pub = None
@@ -221,7 +228,53 @@ class OceanSimSensorPublisher:
                 self._node.get_logger().warn(
                     f"sonar publisher disabled (marine_acoustic_msgs missing?): {e}")
 
+        self._setup_static_tf()
         self._node.get_logger().info("OceanSimSensorPublisher initialized")
+
+    def _setup_static_tf(self):
+        """Broadcast base_link->{sensor} static transforms (latched /tf_static).
+
+        Opt-in (config publish_static_tf): each entry of static_transforms is
+        {child_frame_id, translation:[x,y,z], rotation_wxyz:[w,x,y,z]} expressed
+        in the robot base frame (the sensors are children of the robot prim, so
+        their local mount pose is exactly base_link->sensor)."""
+        transforms = self._cfg.get("static_transforms", [])
+        if not self._cfg.get("publish_static_tf") or not transforms:
+            return
+        try:
+            from tf2_ros import StaticTransformBroadcaster
+            from geometry_msgs.msg import TransformStamped
+        except Exception as e:  # pragma: no cover - tf2_ros not installed
+            self._node.get_logger().warn(f"static TF disabled (tf2_ros unavailable): {e}")
+            return
+
+        self._static_tf_broadcaster = StaticTransformBroadcaster(self._node)
+        base = self._cfg["base_frame_id"]
+        stamp = self._node.get_clock().now().to_msg()
+        msgs = []
+        for t in transforms:
+            child = t.get("child_frame_id")
+            if not child or child == base:
+                continue  # skip identity / unnamed (e.g. sensors reported in base_link)
+            ts = TransformStamped()
+            ts.header.stamp = stamp
+            ts.header.frame_id = base
+            ts.child_frame_id = child
+            tr = t.get("translation", [0.0, 0.0, 0.0])
+            ts.transform.translation.x = float(tr[0])
+            ts.transform.translation.y = float(tr[1])
+            ts.transform.translation.z = float(tr[2])
+            qx, qy, qz, qw = _quat_wxyz_to_xyzw(t.get("rotation_wxyz", [1.0, 0.0, 0.0, 0.0]))
+            ts.transform.rotation.x = qx
+            ts.transform.rotation.y = qy
+            ts.transform.rotation.z = qz
+            ts.transform.rotation.w = qw
+            msgs.append(ts)
+        if msgs:
+            self._static_tf_broadcaster.sendTransform(msgs)
+            self._node.get_logger().info(
+                f"published {len(msgs)} static transform(s) from {base}: "
+                f"{[m.child_frame_id for m in msgs]}")
 
     # --------------------------------------------------------------- per-step
     def publish(self, sim_time: float):
