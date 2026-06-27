@@ -198,6 +198,11 @@ class ImagingSonarSensor(Camera):
         self._wp_intensity = None
         self._wp_pcl_local = None
         self._wp_pcl_spher = None
+        # Cached reflectivity lookup (semantic id -> reflectivity) keyed on the
+        # (idToLabels, query_prop) it was built from, so the GPU upload is only
+        # redone when the labelled-mesh set in the FOV changes.
+        self._refl_cache_key = None
+        self._refl_cache_arr = None
         # Fixed-shape normalization-max buffers, preallocated and re-zeroed each
         # frame (global max -> shape (1,), per-range max -> shape (n_range,)).
         self._max_all = wp.zeros(shape=(1,), dtype=wp.float32, device=self._device)
@@ -414,6 +419,19 @@ class ImagingSonarSensor(Camera):
             self._wp_pcl_local = wp.empty(shape=(num_points,), dtype=wp.vec3, device=self._device)
             self._wp_pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3, device=self._device)
 
+    def _get_indexToRefl(self, id_to_labels, query_prop):
+        """Return the device reflectivity-lookup array for ``id_to_labels`` /
+        ``query_prop``, rebuilding + re-uploading only when those inputs change
+        (the common case is identical labels frame to frame)."""
+        key = (query_prop, tuple(sorted(
+            (k, tuple(sorted(v.items())) if isinstance(v, dict) else v)
+            for k, v in id_to_labels.items())))
+        if key != self._refl_cache_key:
+            arr = sonar_scan_math.make_indexToProp_array(id_to_labels, query_prop)
+            self._refl_cache_arr = wp.array(arr, dtype=wp.float32, device=self._device)
+            self._refl_cache_key = key
+        return self._refl_cache_arr
+
     def _scan_numpy(self, sem_data, id_to_labels):
         """Reference scan path: pull the AOVs to the host and select in-range
         points with the (unit-tested) pure-numpy sonar_scan_math. This is the
@@ -556,36 +574,14 @@ class ImagingSonarSensor(Camera):
 
 
 
-        def make_indexToProp_array(idToLabels: dict, query_property: str):
-            # A utility function helps to convert idToLabels into indexToProp array
-            # This manipulation facilitates warp computation framework
-            # indexToProp is an 1-dim array where the values associated with the query property 
-            # are placed at the index corresponding to the key
-            # First two entry are always zero because {'0': {'class': 'BACKGROUND'}, '1': {'class': 'UNLABELLED'}}
-            # eg: indexToProp = [0, 0, 0.1, 1 .....] 
-            # idToLabels keys are strings ('0', '1', ...); compare them numerically
-            # so an id >= 10 does not lexicographically undersize the array.
-            max_id = max((int(k) for k in idToLabels.keys()), default=-1)
-            indexToProp_array = np.ones((max_id + 1,))
-            for id in idToLabels.keys():
-                for property in idToLabels.get(id):
-                    if property == query_property:
-                        # Reflectivity labels are strings ('1.0', '2.0'); cast to
-                        # float. Non-numeric entries (e.g. a 'reflectivity':
-                        # 'BACKGROUND'/'UNLABELLED' fallback) keep the default 1.0
-                        # instead of raising ValueError mid-scan.
-                        try:
-                            indexToProp_array[int(id)] = float(idToLabels.get(id).get(property))
-                        except (TypeError, ValueError):
-                            pass
-            return indexToProp_array
-
         if self.scan():
             num_points = self.scan_data['pcl'].shape[0]
-            # Load these small numpy arrays to cuda
-            indexToRefl = wp.array(make_indexToProp_array(idToLabels=self.scan_data['idToLabels'],
-                                                         query_property=query_prop),
-                                                         dtype=wp.float32)
+            # Reflectivity lookup (semantic id -> reflectivity). The mapping is a
+            # pure function of (idToLabels, query_prop), which only changes when
+            # the set of labelled meshes in the FOV changes -- so cache the GPU
+            # upload and rebuild only when the inputs differ, instead of building
+            # a numpy array and uploading it every frame.
+            indexToRefl = self._get_indexToRefl(self.scan_data['idToLabels'], query_prop)
             viewTransform=wp.mat44(self.scan_data['viewTransform'])
             # directly use warp array loaded on cuda
             pcl = self.scan_data['pcl']

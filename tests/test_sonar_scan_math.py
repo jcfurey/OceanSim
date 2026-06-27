@@ -74,3 +74,48 @@ def test_optimised_equals_reference_mask(s, seed):
     assert np.array_equal(pcl_v, np.ascontiguousarray(pcl[mask], dtype=np.float32))
     assert np.array_equal(n_v, np.ascontiguousarray(normals[mask], dtype=np.float32))
     assert np.array_equal(s_v, sem[mask].astype(np.uint32))
+
+
+# --- make_indexToProp_array (reflectivity lookup) --------------------------
+
+def test_indexToProp_basic_mapping(s):
+    # Typical OceanSim labels: 0/1 are BACKGROUND/UNLABELLED (no reflectivity ->
+    # default 1.0); 2 and 3 carry reflectivity strings.
+    idToLabels = {
+        '0': {'class': 'BACKGROUND'},
+        '1': {'class': 'UNLABELLED'},
+        '2': {'reflectivity': '0.5'},
+        '3': {'reflectivity': '2.0'},
+    }
+    arr = s.make_indexToProp_array(idToLabels, 'reflectivity')
+    assert arr.shape == (4,)
+    assert arr[0] == 1.0 and arr[1] == 1.0   # default for missing property
+    assert arr[2] == 0.5 and arr[3] == 2.0
+
+
+def test_indexToProp_numeric_key_ordering(s):
+    # Id 10 must size the array to length 11 (numeric, not lexicographic, max).
+    idToLabels = {'2': {'reflectivity': '0.3'}, '10': {'reflectivity': '0.9'}}
+    arr = s.make_indexToProp_array(idToLabels, 'reflectivity')
+    assert arr.shape == (11,)
+    assert arr[10] == 0.9 and arr[2] == 0.3
+    assert arr[5] == 1.0          # unlabelled gap keeps default
+
+
+def test_indexToProp_non_numeric_value_keeps_default(s):
+    # A non-numeric reflectivity (fallback label) must not raise -> stays 1.0.
+    idToLabels = {'2': {'reflectivity': 'BACKGROUND'}, '3': {'reflectivity': '4.0'}}
+    arr = s.make_indexToProp_array(idToLabels, 'reflectivity')
+    assert arr[2] == 1.0 and arr[3] == 4.0
+
+
+def test_indexToProp_empty(s):
+    arr = s.make_indexToProp_array({}, 'reflectivity')
+    assert arr.shape == (0,)
+
+
+def test_indexToProp_query_other_property(s):
+    # Querying a property no id carries -> all default.
+    idToLabels = {'2': {'reflectivity': '0.5'}}
+    arr = s.make_indexToProp_array(idToLabels, 'class')
+    assert np.all(arr == 1.0)
