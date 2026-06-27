@@ -125,3 +125,48 @@ def test_make_sonar_image_column_flip_and_bounds(kern):
         assert img[0, col, 3] == 255            # alpha written
     # Every column got an alpha (nothing left unwritten, no OOB skip of col 0).
     assert np.all(img[:, :, 3] == 255)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_compact_in_range_matches_numpy_reference(kern, seed):
+    """The GPU compaction kernel keeps exactly the same point set as the numpy
+    reference selection (sonar_scan_math), modulo order (atomic append)."""
+    n = 4000
+    rng = np.random.default_rng(seed)
+    depth = rng.uniform(-1.0, 6.0, n).astype(np.float32)
+    depth[rng.random(n) < 0.05] = np.inf
+    pcl = rng.uniform(-5, 5, (n, 3)).astype(np.float32)
+    pcl[rng.random(n) < 0.05] = np.nan
+    normals = rng.uniform(-1, 1, (n, 3)).astype(np.float32)
+    sem = rng.integers(0, 100, n).astype(np.uint32)
+    mn, mx = 0.2, 3.0
+
+    # numpy reference
+    valid = (np.isfinite(depth) & (depth > mn) & (depth < mx)
+             & np.isfinite(pcl).all(axis=1))
+    ref_pcl, ref_n, ref_sem = pcl[valid], normals[valid], sem[valid]
+
+    d = wp.array(depth, dtype=wp.float32, device=DEV)
+    p = wp.array(pcl, dtype=wp.float32, device=DEV)
+    nm = wp.array(normals, dtype=wp.float32, device=DEV)
+    s = wp.array(sem, dtype=wp.uint32, device=DEV)
+    counter = wp.zeros(1, dtype=wp.int32, device=DEV)
+    out_p = wp.zeros((n, 3), dtype=wp.float32, device=DEV)
+    out_n = wp.zeros((n, 3), dtype=wp.float32, device=DEV)
+    out_s = wp.zeros(n, dtype=wp.uint32, device=DEV)
+
+    wp.launch(kern.compact_in_range, dim=n,
+              inputs=[d, p, nm, s, wp.float32(mn), wp.float32(mx),
+                      counter, out_p, out_n, out_s], device=DEV)
+    wp.synchronize()
+
+    m = int(counter.numpy()[0])
+    assert m == int(valid.sum())
+    got_p, got_n, got_s = out_p.numpy()[:m], out_n.numpy()[:m], out_s.numpy()[:m]
+
+    def _key(pc, se):  # lexicographic order so set comparison ignores append order
+        return np.lexsort((pc[:, 2], pc[:, 1], pc[:, 0], se))
+    go, ro = _key(got_p, got_s), _key(ref_p := ref_pcl, ref_sem)
+    assert np.array_equal(got_s[go], ref_sem[ro])
+    assert np.allclose(got_p[go], ref_pcl[ro])
+    assert np.allclose(got_n[go], ref_n[ro])
