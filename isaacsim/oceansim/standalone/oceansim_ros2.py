@@ -74,6 +74,10 @@ def parse_args(argv):
                    action="store_true", default=None,
                    help="Broadcast base_link->{sonar,camera} static TF from the "
                         "sensor mounts (for standalone runs without a stack URDF).")
+    p.add_argument("--sensor-compute-rate", dest="sensor_compute_rate",
+                   type=float, default=None,
+                   help="Hz cap on heavy sensor compute (sonar/camera); 0 = every "
+                        "physics step. Default 15.")
     p.add_argument("--no-camera", dest="camera", action="store_false", default=None)
     p.add_argument("--no-dvl", dest="dvl", action="store_false", default=None)
     p.add_argument("--no-baro", dest="baro", action="store_false", default=None)
@@ -96,6 +100,12 @@ def load_config(args):
         # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
         # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
         "sonar_backend": "oceansim",
+        # Hz cap on the heavy per-step sensor compute (sonar scan + camera
+        # UW_render). They run in update_scenario every physics step (~60 Hz) but
+        # are published ~5 Hz, so the rest is wasted. 15 Hz keeps published frames
+        # fresh while cutting that compute ~4x; raise it if you raise the publish
+        # rates, or set 0 to compute every physics step.
+        "sensor_compute_rate": 15.0,
         "publisher": {},
         # Publish base_link->{sonar,camera} static TF from the sensor mounts.
         # OFF by default: in a robot-stack deployment the URDF / robot_state_publisher
@@ -122,6 +132,8 @@ def load_config(args):
         cfg["sonar_backend"] = args.sonar_backend
     if args.publish_static_tf is not None:
         cfg["publish_static_tf"] = args.publish_static_tf
+    if args.sensor_compute_rate is not None:
+        cfg["sensor_compute_rate"] = args.sensor_compute_rate
     for key, val in (("sonar", args.sonar), ("camera", args.camera),
                      ("dvl", args.dvl), ("baro", args.baro)):
         if val is not None:
@@ -300,6 +312,9 @@ def main(argv):
     world.reset()
     scenario = MHL_Sensor_Example_Scenario()
     scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"])
+    # Throttle the heavy sensor compute to sensor_compute_rate (0 = every step).
+    _scr = float(cfg.get("sensor_compute_rate", 0.0) or 0.0)
+    scenario._sensor_update_period = (1.0 / _scr) if _scr > 0 else 0.0
 
     pub_cfg = dict(cfg.get("publisher", {}))
     if cfg.get("publish_static_tf"):

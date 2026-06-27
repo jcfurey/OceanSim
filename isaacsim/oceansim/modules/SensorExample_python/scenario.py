@@ -29,6 +29,15 @@ class MHL_Sensor_Example_Scenario():
         self._running_scenario = False
         self._time = 0.0
 
+        # Sensor compute throttle. The sonar scan + camera UW_render run here every
+        # physics step (e.g. 60 Hz), but their output is typically consumed far
+        # slower (ROS publish ~5 Hz / viewport). _sensor_update_period > 0 limits
+        # the heavy per-frame sensor compute to 1/period Hz; 0 = every step
+        # (default, so the GUI extension is unaffected). Control still runs every
+        # step. Set via the runner's sensor_compute_rate.
+        self._sensor_update_period = 0.0
+        self._sensor_accum = 0.0
+
         # ROS2 Control
         self._ros2_control_receiver = None
         self._enable_ros2_control = True
@@ -180,15 +189,22 @@ class MHL_Sensor_Example_Scenario():
             return
         
         self._time += step
-        
-        if self._sonar is not None:
-            self._sonar.make_sonar_data()
-        if self._cam is not None:
-            self._cam.render()
-        if self._DVL is not None:
-            self._DVL_reading = self._DVL.get_linear_vel()
-        if self._baro is not None:
-            self._baro_reading = self._baro.get_pressure()
+
+        # Throttle the heavy sensor compute (sonar scan + camera UW_render) to
+        # _sensor_update_period; 0 means every step. Control below is unaffected.
+        self._sensor_accum += step
+        do_sensors = (self._sensor_update_period <= 0.0
+                      or self._sensor_accum >= self._sensor_update_period)
+        if do_sensors:
+            self._sensor_accum = 0.0
+            if self._sonar is not None:
+                self._sonar.make_sonar_data()
+            if self._cam is not None:
+                self._cam.render()
+            if self._DVL is not None:
+                self._DVL_reading = self._DVL.get_linear_vel()
+            if self._baro is not None:
+                self._baro_reading = self._baro.get_pressure()
 
         if self._ctrl_mode=="Manual control":
             force_cmd = Gf.Vec3f(*self._force_cmd._base_command)

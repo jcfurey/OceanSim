@@ -271,7 +271,13 @@ class RtxAcousticSensor:
                  & (beam >= 0) & (beam < self.n_beams) & np.isfinite(rng))
         self._map_np[:] = 0.0
         if np.any(valid):
-            np.add.at(self._map_np[:, :, 2], (rbin[valid], beam[valid]), np.abs(amp[valid]))
+            # Accumulate per (range, beam) cell. bincount on flattened indices is
+            # far faster than np.add.at (the unbuffered scatter path) for the many
+            # duplicate (rbin, beam) hits a ping produces.
+            flat = rbin[valid] * self.n_beams + beam[valid]
+            acc = np.bincount(flat, weights=np.abs(amp[valid]),
+                              minlength=self.n_range * self.n_beams)
+            self._map_np[:, :, 2] = acc.reshape(self.n_range, self.n_beams)
             peak = float(self._map_np[:, :, 2].max())
             if peak > 0.0:
                 self._map_np[:, :, 2] /= peak
