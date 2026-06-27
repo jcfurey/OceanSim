@@ -177,6 +177,20 @@ class ImagingSonarSensor(Camera):
         self.id = 0
         self._scan_logged = False  # one-shot shape diagnostic in scan()
 
+        # Optional on-device point compaction (compact_in_range kernel). Default
+        # OFF: the kernel is unit tested against the numpy reference
+        # (tests/test_imaging_sonar_kernels.py), but whether get_pointcloud /
+        # the AOV annotators actually return Warp arrays resident on
+        # self._device can only be confirmed on hardware. So it self-heals --
+        # if the outputs are not on-device Warp arrays (or anything throws) it
+        # disables itself and falls back to the proven numpy path. Enable with
+        # `sensor.gpu_point_filter = True` after sonar_initialize().
+        self.gpu_point_filter = False
+        self._gpu_out_pcl = None
+        self._gpu_out_normals = None
+        self._gpu_out_sem = None
+        self._gpu_counter = None
+
         # Initialize the camera (creates the render product) HERE -- post
         # world.reset() (deferred from __init__ for the Isaac Sim 6.0.1 port; see
         # __init__). UW_Camera does the same via its scenario-driven initialize().
@@ -248,10 +262,10 @@ class ImagingSonarSensor(Camera):
     def scan(self):
 
         """Capture a single sonar scan frame and store the raw data.
-    
+
         Returns:
             bool: True if scan was successful (valid data received), False otherwise
-    
+
         Note:
             - Stores pointcloud, normals, semantics, and camera transform in scan_data dict
             - First few frames may be empty due to CUDA initialization
@@ -267,6 +281,121 @@ class ImagingSonarSensor(Camera):
         if len(id_to_labels) == 0:
             return False
 
+        # Optional on-device fast path: compact the in-range points with the
+        # compact_in_range kernel so the per-pixel depth/pcl/normals/semantics
+        # never round-trip device->host->device. Returns True/False on success,
+        # or None if it cannot run on-device (in which case it disables itself
+        # and we drop through to the numpy path). See sonar_initialize().
+        if self.gpu_point_filter:
+            result = self._scan_gpu_compact(id_to_labels)
+            if result is not None:
+                return result
+            self.gpu_point_filter = False
+            print(f"[{self._name}] gpu_point_filter unavailable (annotator outputs "
+                  f"not Warp arrays on '{self._device}'); using numpy scan path.",
+                  flush=True)
+
+        return self._scan_numpy(sem_data, id_to_labels)
+
+    def _scan_gpu_compact(self, id_to_labels):
+        """On-device point selection via the compact_in_range kernel.
+
+        Keeps the depth / point-cloud / normals / semantics AOVs on
+        ``self._device`` and appends the in-range, finite points into reusable
+        output buffers with an atomic counter -- the GPU equivalent of
+        ``sonar_scan_math.select_in_range_points`` (and proven equal to it in
+        tests/test_imaging_sonar_kernels.py).
+
+        Returns:
+            True  - in-range points stored in scan_data.
+            False - valid frame but no in-range points (skip, same as numpy path).
+            None  - the AOV outputs are not on-device Warp arrays (or something
+                    threw); caller should fall back to the numpy path.
+        """
+        try:
+            depth = self._custom_annotators["distance_to_image_plane"].get_data(device=self._device)
+            pcl = self.get_pointcloud(device=self._device, world_frame=True)
+            normals = self._custom_annotators["normals"].get_data(device=self._device)
+            sem_dict = self._custom_annotators["semantic_segmentation"].get_data(device=self._device)
+            sem = self._annot_get(sem_dict, ('data',), 'semantic_segmentation')
+
+            # The fast path only engages when every AOV is genuinely a Warp array
+            # resident on self._device with the dtype the kernel expects. Any
+            # mismatch -> None -> numpy fallback (no silent host round-trip).
+            depth = self._require_warp(depth, wp.float32)
+            pcl = self._require_warp(pcl, wp.float32)
+            normals = self._require_warp(normals, wp.float32)
+            sem = self._require_warp(sem, wp.uint32)
+            if depth is None or pcl is None or normals is None or sem is None:
+                return None
+
+            n_px = depth.size
+            depth_f = depth.reshape((-1,))                       # (N,)
+            pcl_f = pcl.reshape((-1, 3))                         # (N,3)
+            nm_f = normals.reshape((-1, normals.shape[-1]))[:, :3]  # (N,3) view
+            sem_f = sem.reshape((-1,))                           # (N,)
+            if (pcl_f.shape[0] != n_px or nm_f.shape[0] != n_px
+                    or sem_f.shape[0] != n_px):
+                return None
+
+            # Reusable, device-resident output buffers sized to the full pixel
+            # count (the worst case all-in-range). Allocated once, kept across
+            # frames; only the counter is re-zeroed each scan.
+            if self._gpu_out_pcl is None or self._gpu_out_pcl.shape[0] != n_px:
+                self._gpu_out_pcl = wp.zeros((n_px, 3), dtype=wp.float32, device=self._device)
+                self._gpu_out_normals = wp.zeros((n_px, 3), dtype=wp.float32, device=self._device)
+                self._gpu_out_sem = wp.zeros(n_px, dtype=wp.uint32, device=self._device)
+                self._gpu_counter = wp.zeros(1, dtype=wp.int32, device=self._device)
+            self._gpu_counter.zero_()
+
+            wp.launch(kernel=compact_in_range,
+                      dim=n_px,
+                      inputs=[depth_f, pcl_f, nm_f, sem_f,
+                              wp.float32(self.min_range), wp.float32(self.max_range),
+                              self._gpu_counter, self._gpu_out_pcl,
+                              self._gpu_out_normals, self._gpu_out_sem],
+                      device=self._device)
+            wp.synchronize()
+            n_valid = int(self._gpu_counter.numpy()[0])
+
+            if not self._scan_logged:
+                self._scan_logged = True
+                print(f"[{self._name}] scan(gpu): N={n_px} valid={n_valid} "
+                      f"idToLabels={id_to_labels}", flush=True)
+            if n_valid == 0:
+                return False
+
+            cam_data = self.cameraParams_annot.get_data()
+            view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
+            # Contiguous prefix views into the reusable buffers. They stay valid
+            # through make_sonar_data's kernels (all run before the next scan()).
+            self.scan_data['pcl'] = self._gpu_out_pcl[:n_valid]          # (N,3)
+            self.scan_data['normals'] = self._gpu_out_normals[:n_valid]  # (N,3)
+            self.scan_data['semantics'] = self._gpu_out_sem[:n_valid]    # (N,)
+            self.scan_data['viewTransform'] = np.asarray(view_tf).reshape(4, 4).T
+            self.scan_data['idToLabels'] = id_to_labels
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self._name}] gpu_point_filter error ({exc!r}); "
+                  f"falling back to numpy scan path.", flush=True)
+            return None
+
+    def _require_warp(self, arr, dtype):
+        """Return ``arr`` only if it is a Warp array of ``dtype`` already
+        resident on ``self._device``; otherwise None (so the caller falls back
+        rather than silently copying through the host)."""
+        if not isinstance(arr, wp.array):
+            return None
+        if str(arr.device) != self._device:
+            return None
+        if arr.dtype != dtype:
+            return None
+        return arr
+
+    def _scan_numpy(self, sem_data, id_to_labels):
+        """Reference scan path: pull the AOVs to the host and select in-range
+        points with the (unit-tested) pure-numpy sonar_scan_math. This is the
+        default and the fallback for the optional GPU path."""
         # Isaac Sim 6.0.1: reconstruct the point cloud from the depth AOV instead of
         # the (crashing) pointcloud annotator. Camera.get_pointcloud() falls back to
         # a perspective projection of distance_to_image_plane when no pointcloud

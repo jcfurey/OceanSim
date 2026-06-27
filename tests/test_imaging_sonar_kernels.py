@@ -170,3 +170,72 @@ def test_compact_in_range_matches_numpy_reference(kern, seed):
     assert np.array_equal(got_s[go], ref_sem[ro])
     assert np.allclose(got_p[go], ref_pcl[ro])
     assert np.allclose(got_n[go], ref_n[ro])
+
+
+def _load_scan_math():
+    path = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim",
+                        "utils", "sonar_scan_math.py")
+    spec = importlib.util.spec_from_file_location("sonar_scan_math", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_compact_in_range_wiring_matches_numpy_path(kern, seed):
+    """Reproduce the exact array glue that ImagingSonarSensor._scan_gpu_compact
+    performs around the kernel -- 2D (H,W) depth reshape, 4-channel normals
+    sliced to [:, :3], reusable output buffers re-used across two frames, and the
+    [:n_valid] prefix views -- and prove the prefix views equal the numpy
+    reference scan path (sonar_scan_math.select_in_range_points). This covers the
+    integration, not just the bare kernel."""
+    scan_math = _load_scan_math()
+    H, W = 48, 64
+    n_px = H * W
+    rng = np.random.default_rng(100 + seed)
+    mn, mx = 0.2, 3.0
+
+    # Reusable device buffers, allocated once (as the sensor does), used twice.
+    out_p = wp.zeros((n_px, 3), dtype=wp.float32, device=DEV)
+    out_n = wp.zeros((n_px, 3), dtype=wp.float32, device=DEV)
+    out_s = wp.zeros(n_px, dtype=wp.uint32, device=DEV)
+    counter = wp.zeros(1, dtype=wp.int32, device=DEV)
+
+    for _ in range(2):  # second pass exercises buffer reuse / counter re-zero
+        depth_img = rng.uniform(-1.0, 6.0, (H, W)).astype(np.float32)
+        depth_img[rng.random((H, W)) < 0.05] = np.inf
+        pcl = rng.uniform(-5, 5, (n_px, 3)).astype(np.float32)
+        pcl[rng.random(n_px) < 0.05] = np.nan
+        normals_img = rng.uniform(-1, 1, (H, W, 4)).astype(np.float32)  # 4-channel AOV
+        sem_img = rng.integers(0, 100, (H, W)).astype(np.uint32)
+
+        # numpy reference path (what _scan_numpy feeds to sonar_scan_math).
+        normals_flat = normals_img.reshape(-1, 4)[:, :3]
+        sem_flat = sem_img.reshape(-1).astype(np.uint32)
+        ref_p, ref_n, ref_s = scan_math.select_in_range_points(
+            depth_img.reshape(-1), pcl, normals_flat, sem_flat, mn, mx)
+
+        # GPU wiring path: same reshape/slice as _scan_gpu_compact.
+        d = wp.array(depth_img, dtype=wp.float32, device=DEV).reshape((-1,))
+        p = wp.array(pcl, dtype=wp.float32, device=DEV).reshape((-1, 3))
+        nm = wp.array(normals_img, dtype=wp.float32, device=DEV).reshape((-1, 4))[:, :3]
+        s = wp.array(sem_img, dtype=wp.uint32, device=DEV).reshape((-1,))
+
+        counter.zero_()
+        wp.launch(kern.compact_in_range, dim=n_px,
+                  inputs=[d, p, nm, s, wp.float32(mn), wp.float32(mx),
+                          counter, out_p, out_n, out_s], device=DEV)
+        wp.synchronize()
+
+        m = int(counter.numpy()[0])
+        assert m == ref_p.shape[0]
+        got_p = out_p[:m].numpy()        # prefix views, as stored in scan_data
+        got_n = out_n[:m].numpy()
+        got_s = out_s[:m].numpy()
+
+        def _key(pc, se):
+            return np.lexsort((pc[:, 2], pc[:, 1], pc[:, 0], se))
+        go, ro = _key(got_p, got_s), _key(ref_p, ref_s)
+        assert np.array_equal(got_s[go], ref_s[ro])
+        assert np.allclose(got_p[go], ref_p[ro])
+        assert np.allclose(got_n[go], ref_n[ro])
