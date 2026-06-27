@@ -1,0 +1,44 @@
+name: tests
+
+# Runs the OceanSim pure-computation unit tests (the parts that validate without
+# launching Isaac Sim). They need only numpy + warp-lang + pytest and run the
+# Warp kernels on the CPU device, so they work on a stock GitHub runner.
+# The Isaac-runtime seams (annotator schema, get_pointcloud, RTX GMO delivery,
+# ROS publishing) still need an on-hardware smoke test -- see tests/README.md.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Pinned-major deps used by the tests (see tests/README.md). Warp runs
+          # on the CPU device here, so no CUDA/GPU is required on the runner.
+          pip install "numpy>=1.24" "warp-lang>=1.0" "pytest>=7.0"
+
+      - name: Show versions
+        run: python -c "import numpy, warp, pytest; print('numpy', numpy.__version__); print('warp', warp.__version__); print('pytest', pytest.__version__)"
+
+      - name: Run unit tests
+        run: pytest tests/ -v
