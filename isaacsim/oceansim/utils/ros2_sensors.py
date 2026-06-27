@@ -160,6 +160,12 @@ class OceanSimSensorPublisher:
         self._last_world_lin_vel = None
         self._last_imu_time = None
 
+        # Cached ProjectedSonarImage geometry (beam directions / ranges /
+        # beamwidths). These depend only on the fixed sonar config (FOV, beam &
+        # range counts), so they are built once and reused every publish instead
+        # of being reconstructed -- the per-publish work then is just the image.
+        self._sonar_geom = None
+
     # ------------------------------------------------------------------ setup
     def initialize(self):
         """Create the rclpy node and publishers for the active sensors."""
@@ -425,7 +431,6 @@ class OceanSimSensorPublisher:
         """
         from marine_acoustic_msgs.msg import (
             ProjectedSonarImage, PingInfo, SonarImageData)
-        from geometry_msgs.msg import Vector3
 
         sonar_map = getattr(self._sonar, "sonar_map", None)
         if sonar_map is None:
@@ -445,6 +450,8 @@ class OceanSimSensorPublisher:
 
         min_range, max_range = self._sonar.get_range()
         hori_fov, vert_fov = self._sonar.get_fov()  # degrees
+        geom = self._sonar_geometry(n_range, n_beams, min_range, max_range,
+                                    hori_fov, vert_fov)
 
         msg = ProjectedSonarImage()
         msg.header.stamp = stamp
@@ -456,29 +463,12 @@ class OceanSimSensorPublisher:
         _sonar_freq = getattr(self._sonar, "frequency", None)
         ping.frequency = float(_sonar_freq) if _sonar_freq else 1.2e6
         ping.sound_speed = float(self._cfg["sound_speed"])
-        # Match the real Oculus driver / marine_acoustic_msgs convention: BOTH
-        # arrays are per-beam (length n_beams). rx_beamwidths is the azimuth
-        # (horizontal) beamwidth of each receive beam; tx_beamwidths is the
-        # elevation (vertical) beamwidth of the transmit swath. sonar_proc indexes
-        # both per beam (tx -> vertical uncertainty, rx -> horizontal uncertainty),
-        # so a length-1 tx array reads out of bounds.
-        ping.tx_beamwidths = [math.radians(vert_fov)] * n_beams
-        ping.rx_beamwidths = [math.radians(hori_fov / max(n_beams, 1))] * n_beams
+        ping.tx_beamwidths = geom["tx_beamwidths"]
+        ping.rx_beamwidths = geom["rx_beamwidths"]
         msg.ping_info = ping
 
-        # Bearings spread symmetrically across the horizontal FOV. Encode each
-        # beam direction with the SAME convention as the real Oculus driver
-        # (oculus_sonar_driver/ping_to_sonar_image.h) and as sonar_image_proc /
-        # sonar_proc expect: azimuth lives in -y, range/forward in +z, elevation
-        # x=0, so that az = atan2(-y, z). Putting the spread in x instead (y=0)
-        # collapses every computed azimuth to 0, which makes draw_sonar build an
-        # empty remap LUT (assertion crash) and sonar_proc emit a degenerate cloud.
-        msg.beam_directions = [
-            Vector3(x=x, y=y, z=z)
-            for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams)
-        ]
-
-        msg.ranges = ros2_math.sonar_ranges(min_range, max_range, n_range)
+        msg.beam_directions = geom["beam_directions"]
+        msg.ranges = geom["ranges"]
 
         data = SonarImageData()
         data.is_bigendian = False
@@ -487,6 +477,41 @@ class OceanSimSensorPublisher:
         data.data = img8.reshape(-1).tobytes()
         msg.image = data
         self._sonar_pub.publish(msg)
+
+    def _sonar_geometry(self, n_range, n_beams, min_range, max_range, hori_fov, vert_fov):
+        """Cached ProjectedSonarImage geometry, rebuilt only if the sonar grid
+        shape / FOV changes (it does not, frame to frame).
+
+        * beam_directions: bearings spread symmetrically across the horizontal
+          FOV, encoded with the SAME convention as the real Oculus driver
+          (oculus_sonar_driver/ping_to_sonar_image.h) and as sonar_image_proc /
+          sonar_proc expect: azimuth in -y, range/forward in +z, elevation x=0,
+          so az = atan2(-y, z). Putting the spread in x instead (y=0) collapses
+          every azimuth to 0 -> draw_sonar builds an empty remap LUT (assertion
+          crash) and sonar_proc emits a degenerate cloud.
+        * tx/rx_beamwidths: BOTH per-beam (length n_beams), per the Oculus driver
+          / marine_acoustic_msgs convention. rx is the azimuth (horizontal)
+          beamwidth of each receive beam; tx is the elevation (vertical)
+          beamwidth of the transmit swath. sonar_proc indexes both per beam, so a
+          length-1 tx array reads out of bounds.
+        """
+        key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov)
+        cache = self._sonar_geom
+        if cache is not None and cache["key"] == key:
+            return cache
+        from geometry_msgs.msg import Vector3
+        geom = {
+            "key": key,
+            "beam_directions": [
+                Vector3(x=x, y=y, z=z)
+                for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams)
+            ],
+            "ranges": ros2_math.sonar_ranges(min_range, max_range, n_range),
+            "tx_beamwidths": [math.radians(vert_fov)] * n_beams,
+            "rx_beamwidths": [math.radians(hori_fov / max(n_beams, 1))] * n_beams,
+        }
+        self._sonar_geom = geom
+        return geom
 
     # ----------------------------------------------------------------- helpers
     def _to_body(self, quat_wxyz, lin_vel_w, ang_vel_w):
