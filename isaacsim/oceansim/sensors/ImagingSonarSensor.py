@@ -191,6 +191,18 @@ class ImagingSonarSensor(Camera):
         self._gpu_out_sem = None
         self._gpu_counter = None
 
+        # Reusable per-point work buffers for make_sonar_data. The valid-point
+        # count varies frame to frame, so these grow on demand to the running
+        # high-water mark (kernels launch over [:num_points] views) instead of
+        # allocating three fresh device arrays every frame.
+        self._wp_intensity = None
+        self._wp_pcl_local = None
+        self._wp_pcl_spher = None
+        # Fixed-shape normalization-max buffers, preallocated and re-zeroed each
+        # frame (global max -> shape (1,), per-range max -> shape (n_range,)).
+        self._max_all = wp.zeros(shape=(1,), dtype=wp.float32, device=self._device)
+        self._max_range = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32, device=self._device)
+
         # Initialize the camera (creates the render product) HERE -- post
         # world.reset() (deferred from __init__ for the Isaac Sim 6.0.1 port; see
         # __init__). UW_Camera does the same via its scenario-driven initialize().
@@ -392,6 +404,16 @@ class ImagingSonarSensor(Camera):
             return None
         return arr
 
+    def _ensure_point_buffers(self, num_points):
+        """Grow the reusable per-point work buffers so they hold at least
+        ``num_points`` entries. Only reallocates when a frame needs more points
+        than any previous frame; steady state reuses the same device arrays."""
+        cap = 0 if self._wp_intensity is None else self._wp_intensity.shape[0]
+        if cap < num_points:
+            self._wp_intensity = wp.empty(shape=(num_points,), dtype=wp.float32, device=self._device)
+            self._wp_pcl_local = wp.empty(shape=(num_points,), dtype=wp.vec3, device=self._device)
+            self._wp_pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3, device=self._device)
+
     def _scan_numpy(self, sem_data, id_to_labels):
         """Reference scan path: pull the AOVs to the host and select in-range
         points with the (unit-tested) pure-numpy sonar_scan_math. This is the
@@ -572,8 +594,11 @@ class ImagingSonarSensor(Camera):
         else:
             return
 
-        # Compute intensity for each ray query     
-        intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+        # Compute intensity for each ray query. Reuse the grow-on-demand work
+        # buffers (views over [:num_points]) instead of allocating three fresh
+        # device arrays every frame.
+        self._ensure_point_buffers(num_points)
+        intensity = self._wp_intensity[:num_points]
         wp.launch(kernel=compute_intensity,
                   dim=num_points,
                   inputs=[
@@ -590,8 +615,8 @@ class ImagingSonarSensor(Camera):
                 )
                 
         # Transform pointcloud from world cooridates to sonar local
-        pcl_local =wp.empty(shape=(num_points,), dtype=wp.vec3)
-        pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3)
+        pcl_local = self._wp_pcl_local[:num_points]
+        pcl_spher = self._wp_pcl_spher[:num_points]
         wp.launch(kernel=world2local,
                   dim=num_points,
                   inputs=[
@@ -689,7 +714,8 @@ class ImagingSonarSensor(Camera):
         # Normalizing intensity at each bin either by global maximum or rangewise maximum
         # Compute global maximum
         if normalizing_method == "all":
-            maximum = wp.zeros(shape=(1,), dtype=wp.float32)
+            maximum = self._max_all       # reused (1,) buffer, re-zeroed each frame
+            maximum.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=all_max,
@@ -722,7 +748,8 @@ class ImagingSonarSensor(Camera):
             
         if normalizing_method == "range":
             # Compute rangewise maximum
-            maximum = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32)
+            maximum = self._max_range     # reused (n_range,) buffer, re-zeroed each frame
+            maximum.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=range_max,

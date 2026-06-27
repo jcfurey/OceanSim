@@ -239,3 +239,86 @@ def test_compact_in_range_wiring_matches_numpy_path(kern, seed):
         assert np.array_equal(got_s[go], ref_s[ro])
         assert np.allclose(got_p[go], ref_p[ro])
         assert np.allclose(got_n[go], ref_n[ro])
+
+
+# --- make_sonar_data work-buffer reuse -------------------------------------
+# ImagingSonarSensor.make_sonar_data reuses grow-on-demand work buffers
+# (intensity / pcl_local / pcl_spher) sliced to [:num_points] instead of
+# allocating fresh arrays each frame, and re-zeroes a kept normalization-max
+# buffer. The risk is stale data leaking when a later frame has fewer points
+# than the buffer's high-water capacity. These run the real pipeline kernels and
+# assert the reused-buffer path is bit-identical to fresh allocation across a
+# grow-then-shrink-then-grow frame sequence.
+
+def _pipeline_bins(kern, pcl, normals, sem, refl, vt, n_range, n_beams,
+                   x_off, y_off, x_res, y_res, bufs):
+    """Run compute_intensity -> world2local -> bin_intensity for one frame and
+    return (bin_sum, bin_count) as numpy. ``bufs`` supplies the intensity /
+    pcl_local / pcl_spher arrays (fresh or reused-and-sliced)."""
+    n = pcl.shape[0]
+    intensity, pcl_local, pcl_spher = bufs(n)
+    p = wp.array(pcl, dtype=wp.float32, device=DEV)
+    nm = wp.array(normals, dtype=wp.float32, device=DEV)
+    s = wp.array(sem, dtype=wp.uint32, device=DEV)
+    ir = wp.array(refl, dtype=wp.float32, device=DEV)
+    wp.launch(kern.compute_intensity, dim=n,
+              inputs=[p, nm, wp.mat44(vt), s, ir, wp.float32(0.1)],
+              outputs=[intensity], device=DEV)
+    wp.launch(kern.world2local, dim=n,
+              inputs=[wp.mat44(vt), p], outputs=[pcl_local, pcl_spher], device=DEV)
+    bin_sum = wp.zeros((n_range, n_beams), dtype=wp.float32, device=DEV)
+    bin_count = wp.zeros((n_range, n_beams), dtype=wp.int32, device=DEV)
+    wp.launch(kern.bin_intensity, dim=n,
+              inputs=[pcl_spher, intensity, wp.float32(x_off), wp.float32(y_off),
+                      wp.float32(x_res), wp.float32(y_res), bin_sum, bin_count],
+              device=DEV)
+    wp.synchronize()
+    return bin_sum.numpy(), bin_count.numpy()
+
+
+def _frame_inputs(seed, n):
+    rng = np.random.default_rng(seed)
+    # Points in front of the sensor so they fall within the binning grid.
+    pcl = np.stack([rng.uniform(-0.6, 0.6, n),
+                    rng.uniform(-0.6, 0.6, n),
+                    rng.uniform(0.3, 1.2, n)], axis=1).astype(np.float32)
+    normals = rng.uniform(-1, 1, (n, 3)).astype(np.float32)
+    sem = rng.integers(0, 4, n).astype(np.uint32)
+    return pcl, normals, sem
+
+
+def test_make_sonar_data_buffer_reuse_matches_fresh(kern):
+    n_range, n_beams = 32, 48
+    min_range, min_azi = 0.2, np.deg2rad(90 - 130 / 2)
+    range_res, azi_res = 0.03, np.deg2rad(130 / n_beams)
+    refl = np.array([0.0, 0.0, 0.5, 1.0], dtype=np.float32)  # indexToProp
+    # identity rotation, no translation -> sensor at origin (a valid extrinsic).
+    vt = np.eye(4, dtype=np.float32).reshape(-1)
+
+    # grow-on-demand reusable buffers, mirroring _ensure_point_buffers / the
+    # [:num_points] views; capacity only ever grows.
+    state = {"cap": 0, "i": None, "l": None, "s": None}
+
+    def reused(n):
+        if state["cap"] < n:
+            state["cap"] = n
+            state["i"] = wp.empty(n, dtype=wp.float32, device=DEV)
+            state["l"] = wp.empty(n, dtype=wp.vec3, device=DEV)
+            state["s"] = wp.empty(n, dtype=wp.vec3, device=DEV)
+        return state["i"][:n], state["l"][:n], state["s"][:n]
+
+    def fresh(n):
+        return (wp.empty(n, dtype=wp.float32, device=DEV),
+                wp.empty(n, dtype=wp.vec3, device=DEV),
+                wp.empty(n, dtype=wp.vec3, device=DEV))
+
+    # grow (4000) -> shrink (700, exercises stale residue) -> grow again (5000).
+    for seed, n in [(1, 4000), (2, 700), (3, 5000), (4, 700)]:
+        pcl, normals, sem = _frame_inputs(seed, n)
+        args = (kern, pcl, normals, sem, refl, vt, n_range, n_beams,
+                min_range, min_azi, range_res, azi_res)
+        s_fresh, c_fresh = _pipeline_bins(*args, bufs=fresh)
+        s_reuse, c_reuse = _pipeline_bins(*args, bufs=reused)
+        assert np.array_equal(c_fresh, c_reuse), f"bin_count differs at n={n}"
+        # bit-identical: same kernels, same inputs, only allocation differs.
+        assert np.array_equal(s_fresh, s_reuse), f"bin_sum differs at n={n}"
