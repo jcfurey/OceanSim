@@ -22,6 +22,7 @@ from isaacsim.core.utils.extensions import get_extension_path
 from .scenario import MHL_Sensor_Example_Scenario
 from .global_variables import EXTENSION_DESCRIPTION, EXTENSION_TITLE, EXTENSION_LINK
 from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
+from isaacsim.oceansim.utils import platforms
 
 class UIBuilder():
     def __init__(self):
@@ -179,6 +180,23 @@ class UIBuilder():
                     on_clicked_fn=self._on_ctrl_mode_dropdown_clicked
                 )
 
+                # Vehicle platform picker (utils.platforms). Items are the
+                # registry's platforms, so adding a vehicle there adds it here.
+                self._platform_keys = platforms.available_platforms()
+                self._platform_labels = [
+                    platforms.get_platform(k).description.split('(')[0].strip() or k
+                    for k in self._platform_keys
+                ]
+                _default_platform_idx = (self._platform_keys.index(self._platform)
+                                         if self._platform in self._platform_keys else 0)
+                self._platform_dropdown_model = dropdown_builder(
+                    label='Vehicle Platform',
+                    default_val=_default_platform_idx,
+                    items=self._platform_labels,
+                    tooltip='Vehicle spawned on Load (e.g. BlueROV2 or DeepTrekker Revolution).',
+                    on_clicked_fn=self._on_platform_dropdown_clicked
+                )
+
                 self._load_btn = LoadButton(
                     "Load Button", "LOAD", setup_scene_fn=self._setup_scene, setup_post_load_fn=self._setup_scenario
                 )
@@ -222,19 +240,17 @@ class UIBuilder():
 
     def _on_init(self):
 
-        # Robot parameters
-        self._rob_mass = 5.0 # kg
-        self._rob_angular_damping = 10.0
-        self._rob_linear_damping = 10.0
+        # Vehicle platform (utils.platforms): which vehicle the Load button
+        # spawns, chosen via the "Vehicle Platform" dropdown. The selected
+        # platform's spec supplies the USD, mass/damping, collision, spawn pose
+        # and the sensor mount poses below.
+        self._platform = platforms.DEFAULT_PLATFORM
 
         # Sensor
         self._sonar = None
-        self._sonar_trans = np.array([0.3,0.0, 0.3])
         self._cam = None
-        self._cam_trans = np.array([0.3,0.0, 0.1])
         self._cam_focal_length = 21
         self._DVL = None
-        self._DVL_trans = np.array([0,0,-0.1])
         self._baro = None
         self._water_surface = 1.43389 # Arbitrary
         
@@ -283,52 +299,56 @@ class UIBuilder():
                                             orientation=euler_angles_to_quat(np.array([0.0,0.0,90]), degrees=True), 
                                             )
             
-        # add bluerov robot as reference
+        # add the selected vehicle platform as a reference (utils.platforms).
+        # The spec supplies the USD, dynamics, collision, spawn pose and sensor
+        # mounts -- chosen via the "Vehicle Platform" dropdown.
+        spec = platforms.get_platform(self._platform)
+        print(f"[OceanSim] platform: {spec.name} -- {spec.description}")
         robot_prim_path = "/World/rob"
-        robot_usd_path = get_oceansim_assets_path() + "/Bluerov/BROV_low.usd"
+        robot_usd_path = spec.usd_path(get_oceansim_assets_path())
         self._rob = add_reference_to_stage(usd_path=robot_usd_path, prim_path=robot_prim_path)
         # Toggle rigid body and collider preset for robot, and set zero gravity to mimic underwater environment
         rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
         rob_rigidBody_API.CreateDisableGravityAttr(True)
         # Set damping of the robot
-        rob_rigidBody_API.GetLinearDampingAttr().Set(self._rob_linear_damping)
-        rob_rigidBody_API.GetAngularDampingAttr().Set(self._rob_angular_damping)
+        rob_rigidBody_API.GetLinearDampingAttr().Set(spec.linear_damping)
+        rob_rigidBody_API.GetAngularDampingAttr().Set(spec.angular_damping)
         # Set the mass for the robot to suppress a warning from inertia autocomputation
         rob_collider_prim = SingleGeometryPrim(prim_path=robot_prim_path,
                                                collision=True)
-        rob_collider_prim.set_collision_approximation('boundingCube')
+        rob_collider_prim.set_collision_approximation(spec.collision_approximation)
         SingleRigidPrim(prim_path=robot_prim_path,
-                        mass=self._rob_mass,
-                        translation=np.array([-2.0, 0.0, -0.8]))
+                        mass=spec.mass,
+                        translation=np.array(spec.spawn_translation, dtype=float))
 
         set_camera_view(eye=np.array([5,0.6,0.4]), target=rob_collider_prim.get_world_pose()[0])
-        
+
 
         if self._use_sonar:
             from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
             self._sonar = ImagingSonarSensor(prim_path=robot_prim_path + '/sonar',
-                                            translation=self._sonar_trans,
-                                            orientation=euler_angles_to_quat(np.array([0.0, 45, 0.0]),  degrees=True),
+                                            translation=np.array(spec.sonar_mount.translation, dtype=float),
+                                            orientation=euler_angles_to_quat(np.array(spec.sonar_mount.rpy_deg, dtype=float),  degrees=True),
                                             range_res=0.005,
                                             angular_res=0.25,
                                             hori_res=4000
                                             )
-            
+
         if self._use_camera:
             from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
 
             self._cam = UW_Camera(prim_path=robot_prim_path + '/UW_camera',
                                     resolution=[1920,1080],
-                                    translation=self._cam_trans)
+                                    translation=np.array(spec.camera_mount.translation, dtype=float))
             self._cam.set_focal_length(0.1 * self._cam_focal_length)
             self._cam.set_clipping_range(0.1, 100)
-            
+
         if self._use_DVL:
             from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
 
             self._DVL = DVLsensor(max_range=10)
             self._DVL.attachDVL(rigid_body_path=robot_prim_path,
-                                translation=self._DVL_trans)
+                                translation=np.array(spec.dvl_mount.translation, dtype=float))
             self._DVL.add_debug_lines()
             
         if self._use_baro:
@@ -444,6 +464,15 @@ class UIBuilder():
     def _on_ctrl_mode_dropdown_clicked(self, model):
         self._ctrl_mode = model
         print(f'Ctrl mode: {model}. Reload the scene for changes to take effect.')
+
+    def _on_platform_dropdown_clicked(self, label):
+        """Map the selected dropdown label back to its canonical platform key
+        (utils.platforms). The vehicle is spawned on the next Load."""
+        try:
+            self._platform = self._platform_keys[self._platform_labels.index(label)]
+        except (ValueError, AttributeError):
+            self._platform = label  # fall back to treating the label as a key
+        print(f'Vehicle platform: {self._platform}. Reload the scene for changes to take effect.')
 
    
     def _add_extra_ui(self):
