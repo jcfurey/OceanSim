@@ -87,3 +87,41 @@ def test_uniform_bounds_and_exponential_mean(MVU):
     u.rng = np.random.default_rng(1)
     e = np.array([u.sample_exponential() for _ in range(200000)])
     assert e.mean() == pytest.approx(2.0, rel=0.05)
+
+
+# --- zero-covariance "certain" fast path -----------------------------------
+# init_sigma / init_cov should only mark the sensor "uncertain" when the
+# covariance is actually nonzero. A zero covariance (the default for every
+# OceanSim sensor) yields zero noise, so flagging it "certain" skips a wasted
+# per-step RNG draw + matrix multiply with an identical (zero) result.
+
+def test_zero_cov_is_not_uncertain(MVN):
+    for setter in ("init_cov", "init_sigma"):
+        m = MVN(4)
+        getattr(m, setter)(0)
+        assert not m.is_uncertain(), f"{setter}(0) should be certain"
+        assert np.array_equal(m.sample_array(), np.zeros(4))
+
+
+def test_zero_matrix_cov_is_not_uncertain(MVN):
+    m = MVN(3)
+    m.init_cov(np.zeros((3, 3)))
+    assert not m.is_uncertain()
+    assert np.array_equal(m.sample_array(), np.zeros(3))
+
+
+def test_nonzero_cov_is_uncertain(MVN):
+    for setter, val in (("init_cov", 0.25), ("init_sigma", 0.5),
+                        ("init_cov", [1.0, 0.0, 2.0])):
+        m = MVN(3)
+        getattr(m, setter)(val)
+        assert m.is_uncertain(), f"{setter}({val}) should be uncertain"
+
+
+def test_zero_cov_matches_old_zero_output(MVN):
+    # Behaviour preservation: the result is zeros whether we skip sampling
+    # (new) or sample from an all-zero sqrt_cov (old). Drawing is just avoided.
+    m = MVN(4)
+    m.init_cov(0.0)
+    assert np.array_equal(m.sample_array(), np.zeros(4))
+    assert np.array_equal(m.sample_list(), [0.0, 0.0, 0.0, 0.0])

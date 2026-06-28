@@ -322,3 +322,111 @@ def test_make_sonar_data_buffer_reuse_matches_fresh(kern):
         assert np.array_equal(c_fresh, c_reuse), f"bin_count differs at n={n}"
         # bit-identical: same kernels, same inputs, only allocation differs.
         assert np.array_equal(s_fresh, s_reuse), f"bin_sum differs at n={n}"
+
+
+# --- kernel hardening: NaN guards + uint8 clamp ----------------------------
+
+def _rotz(deg):
+    a = np.deg2rad(deg)
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
+def test_compute_intensity_matches_numpy_reference(kern):
+    """The dist-reuse refactor of compute_intensity must equal the closed-form
+    intensity = reflectivity * cos_theta * exp(-att*dist) on non-degenerate
+    inputs (sensor_loc = -(R^T T))."""
+    n = 3000
+    rng = np.random.default_rng(7)
+    R = _rotz(30.0)
+    T = np.array([1.0, -2.0, 0.5])
+    vt = np.eye(4, dtype=np.float64)
+    vt[:3, :3] = R
+    vt[:3, 3] = T
+    sensor_loc = -(R.T @ T)
+
+    pcl = rng.uniform(-5, 5, (n, 3)).astype(np.float32)
+    normals = rng.uniform(-1, 1, (n, 3)).astype(np.float32)
+    K = 6
+    sem = rng.integers(0, K, n).astype(np.uint32)
+    refl = rng.uniform(0.1, 2.0, K).astype(np.float32)
+    att = 0.1
+
+    incidence = pcl.astype(np.float64) - sensor_loc
+    dist = np.linalg.norm(incidence, axis=1)
+    unit = incidence / dist[:, None]
+    cos_theta = np.sum(-unit * normals.astype(np.float64), axis=1)
+    ref = refl[sem].astype(np.float64) * cos_theta * np.exp(-att * dist)
+
+    out = wp.zeros(n, dtype=wp.float32, device=DEV)
+    wp.launch(kern.compute_intensity, dim=n,
+              inputs=[wp.array(pcl, dtype=wp.float32, device=DEV),
+                      wp.array(normals, dtype=wp.float32, device=DEV),
+                      wp.mat44(vt.reshape(-1)),
+                      wp.array(sem, dtype=wp.uint32, device=DEV),
+                      wp.array(refl, dtype=wp.float32, device=DEV),
+                      wp.float32(att)],
+              outputs=[out], device=DEV)
+    wp.synchronize()
+    assert np.allclose(out.numpy(), ref, rtol=1e-3, atol=1e-4)
+
+
+def test_compute_intensity_coincident_point_is_finite(kern):
+    """A point exactly at the sensor location (dist == 0) must not divide by
+    zero -> finite 0 intensity, not NaN (which would poison the bin sum)."""
+    R = _rotz(15.0)
+    T = np.array([0.3, 0.4, -0.5])
+    vt = np.eye(4, dtype=np.float64)
+    vt[:3, :3] = R
+    vt[:3, 3] = T
+    sensor_loc = -(R.T @ T)
+
+    pcl = np.array([sensor_loc, [1.0, 1.0, 1.0]], dtype=np.float32)  # row 0 coincident
+    normals = np.array([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    sem = np.array([1, 1], dtype=np.uint32)
+    refl = np.array([0.0, 1.0], dtype=np.float32)
+
+    out = wp.zeros(2, dtype=wp.float32, device=DEV)
+    wp.launch(kern.compute_intensity, dim=2,
+              inputs=[wp.array(pcl, dtype=wp.float32, device=DEV),
+                      wp.array(normals, dtype=wp.float32, device=DEV),
+                      wp.mat44(vt.reshape(-1)),
+                      wp.array(sem, dtype=wp.uint32, device=DEV),
+                      wp.array(refl, dtype=wp.float32, device=DEV),
+                      wp.float32(0.1)],
+              outputs=[out], device=DEV)
+    wp.synchronize()
+    o = out.numpy()
+    assert np.all(np.isfinite(o))
+    assert o[0] == 0.0   # coincident point -> zero direction -> zero intensity
+
+
+def test_cartesian_to_spherical_origin_is_finite(kern):
+    """world2local feeds cartesian_to_spherical; a point mapping to the local
+    origin (r == 0) must yield a finite elevation, not acos(nan)."""
+    pcl = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32)  # row 0 -> origin
+    vt = np.eye(4, dtype=np.float64).reshape(-1)
+    local = wp.zeros(2, dtype=wp.vec3, device=DEV)
+    spher = wp.zeros(2, dtype=wp.vec3, device=DEV)
+    wp.launch(kern.world2local, dim=2,
+              inputs=[wp.mat44(vt), wp.array(pcl, dtype=wp.float32, device=DEV)],
+              outputs=[local, spher], device=DEV)
+    wp.synchronize()
+    assert np.all(np.isfinite(spher.numpy())), "origin produced NaN/inf in spherical coords"
+
+
+def test_make_sonar_image_clamps_overflow(kern):
+    """An intensity > 1 must saturate to 255, not wrap modulo 256."""
+    n_range, width = 1, 3
+    grid = np.zeros((n_range, width, 3), dtype=np.float32)
+    grid[0, :, 2] = [0.5, 1.0, 1.5]            # last column overflows pre-clamp
+    sonar_data = wp.array(grid, dtype=wp.vec3, device=DEV)
+    sonar_image = wp.zeros((n_range, width, 4), dtype=wp.uint8, device=DEV)
+    wp.launch(kern.make_sonar_image, dim=(n_range, width),
+              inputs=[sonar_data, sonar_image], device=DEV)
+    wp.synchronize()
+    img = sonar_image.numpy()
+    # column j -> width-1-j; intensity 1.5 is column 2 -> output column 0.
+    assert img[0, 0, 0] == 255          # saturated, NOT 382 % 256 == 126
+    assert img[0, 1, 0] == 255          # intensity 1.0 -> 255
+    assert img[0, 2, 0] == 127          # intensity 0.5 -> 127 (unchanged)

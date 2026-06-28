@@ -27,7 +27,12 @@ class MultivariateNormal:
         elif isinstance(sigma, (list, np.ndarray)):
             assert len(sigma) == self.N, f"Sigma has size {len(sigma)} and should be {self.N}"
             np.fill_diagonal(self.sqrt_cov, sigma)
-        self.uncertain = True
+        # Only flag the sensor "uncertain" when the covariance is actually
+        # nonzero. A zero covariance (the default for every OceanSim sensor)
+        # makes sample_array() return zeros, so treating it as "certain" skips a
+        # wasted RNG draw + matrix multiply every physics step with an identical
+        # result.
+        self.uncertain = bool(np.any(self.sqrt_cov))
 
     def init_cov(self, cov):
         """Initialize covariance."""
@@ -45,7 +50,8 @@ class MultivariateNormal:
                     print("Warning: MVN encountered a non-positive definite covariance")
             else:
                 raise ValueError("Invalid covariance input")
-        self.uncertain = True
+        # See init_sigma: skip the per-step noise sampling when cov == 0.
+        self.uncertain = bool(np.any(self.sqrt_cov))
 
     def sample_array(self):
         """Generate a sample from the multivariate normal distribution."""
