@@ -237,8 +237,13 @@ class DVLsensor:
             depth.append(self._DVL_interface.get_linear_depth_data(beam_path)[0])
             if_hit.append(self._DVL_interface.get_beam_hit_data(beam_path)[0])
         if (self._mvn_dep.is_uncertain()):
+            # Draw the 4-vector once and add it elementwise (matching the
+            # single-draw pattern in get_linear_vel). The old code drew a fresh
+            # 4-vector per beam and kept only one component -- 4x the RNG work,
+            # and for a non-diagonal covariance it would also destroy the
+            # intended cross-beam correlation.
+            sample = self._mvn_dep.sample_array()
             for i in range(4):
-                sample = self._mvn_dep.sample_array()
                 depth[i] += sample[i]
         # check if the sensor is in dropout state
         if if_hit.count(False) >= self._num_beams_out_range_threshold:
@@ -329,10 +334,14 @@ class DVLsensor:
         Returns:
             Union[np.ndarray, float]: Velocity vector if update is due, otherwise NaN.
         """
-        if self.get_dt() < physics_dt:
+        # Evaluate the (possibly adaptive) period once: in adaptive mode get_dt()
+        # runs a full get_depth() sweep of physics-view queries, so calling it
+        # twice per step doubled that cost.
+        sensor_dt = self.get_dt()
+        if sensor_dt < physics_dt:
             carb.log_warn(f'[{self._name}] Simulation physics_dt is larger than sensor_dt. Reduced to get_linear_vel().')
         self._elapsed_time_vel += physics_dt
-        if self._elapsed_time_vel >= self.get_dt():
+        if self._elapsed_time_vel >= sensor_dt:
             self._elapsed_time_vel = 0.0
             return self.get_linear_vel()
         else:
@@ -347,10 +356,12 @@ class DVLsensor:
         Returns:
             Union[list[float], float]: Depth measurements if update is due, otherwise NaN.
         """
-        if self.get_dt() < physics_dt:
+        # Evaluate the (possibly adaptive) period once -- see get_linear_vel_fd.
+        sensor_dt = self.get_dt()
+        if sensor_dt < physics_dt:
             carb.log_warn(f'[{self._name}] Simulation physics_dt is larger than sensor_dt. Reduced to get_depth().')
         self._elapsed_time_depth += physics_dt
-        if self._elapsed_time_depth >= self.get_dt():
+        if self._elapsed_time_depth >= sensor_dt:
             self._elapsed_time_depth = 0.0
             return self.get_depth()
         else:
