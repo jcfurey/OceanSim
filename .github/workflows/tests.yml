@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs: a new push to a branch, or the push+PR pair on the
+# same ref, won't pile up redundant concurrent runs.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
