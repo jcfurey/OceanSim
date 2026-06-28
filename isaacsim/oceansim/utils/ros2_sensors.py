@@ -122,6 +122,10 @@ class OceanSimSensorPublisher:
         "publish_static_tf": False,
         # sonar acoustic params (used to fill ProjectedSonarImage.ping_info)
         "sound_speed": 1500.0,
+        # Explicit override (Hz) for the sonar acoustic carrier reported in
+        # ping_info.frequency. None -> use the sensor's own modelled value
+        # (ImagingSonarSensor.acoustic_frequency / RtxAcousticSensor.center_frequency).
+        "sonar_acoustic_freq": None,
         # gravity magnitude (m/s^2) used to build the IMU specific force
         "gravity": 9.81,
     }
@@ -458,10 +462,17 @@ class OceanSimSensorPublisher:
         msg.header.frame_id = self._cfg["sonar_frame_id"]
 
         ping = PingInfo()
-        # ImagingSonarSensor is a Camera and may expose frequency=None; guard so
-        # float(None) doesn't throw (and fall back to a nominal acoustic freq).
-        _sonar_freq = getattr(self._sonar, "frequency", None)
-        ping.frequency = float(_sonar_freq) if _sonar_freq else 1.2e6
+        # Acoustic carrier frequency for ping_info. Prefer an explicit config
+        # override, then the sensor's own MODELLED acoustic frequency
+        # (ImagingSonarSensor.acoustic_frequency = 375 kHz for the Oculus M370s;
+        # RtxAcousticSensor.center_frequency for the RTX backend). Do NOT use the
+        # Camera `frequency` attribute -- on the imaging sonar that is the render
+        # frame rate (e.g. 5-60 Hz), not the acoustic carrier, which would publish
+        # a wildly wrong ping frequency to sonar_image_proc / sonar_proc.
+        _sonar_freq = (self._cfg.get("sonar_acoustic_freq")
+                       or getattr(self._sonar, "acoustic_frequency", None)
+                       or getattr(self._sonar, "center_frequency", None))
+        ping.frequency = float(_sonar_freq) if _sonar_freq else 375e3
         ping.sound_speed = float(self._cfg["sound_speed"])
         ping.tx_beamwidths = geom["tx_beamwidths"]
         ping.rx_beamwidths = geom["rx_beamwidths"]

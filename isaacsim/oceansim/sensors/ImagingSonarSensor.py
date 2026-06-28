@@ -83,6 +83,12 @@ class ImagingSonarSensor(Camera):
         self.vert_fov = vert_fov # degree (vert_fov is 20 degrees in datasheet)
         self.angular_res = angular_res # degree (datasheet is 2 deg)
         self.hori_res= hori_res
+        # Acoustic carrier frequency of the modelled sonar (Hz). The Oculus M370s
+        # is a 375 kHz single-frequency unit (Blueprint Subsea datasheet). This is
+        # the value reported in ProjectedSonarImage.ping_info.frequency -- kept
+        # SEPARATE from the inherited Camera `frequency` attribute, which is the
+        # render frame rate, not the acoustic carrier.
+        self.acoustic_frequency = 375e3  # Hz (Oculus M370s)
 
         # self.beam_separation = 0.5 # degree (Not USED FOR NOW)!!
         # self.num_beams = 256 # (max number of beams) (NOT USED FOR NOW)!!
