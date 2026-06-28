@@ -37,10 +37,18 @@ flags win.  Example config::
       "control_mode": "ROS control",
       "scene_usd": "",
       "asset_path": "/path/to/oceansim/assets",
-      "robot": {"translation": [-2.0, 0.0, -0.8], "mass": 5.0},
+      "platform": "bluerov2",
+      "robot": {"mass": 5.0, "urdf_path": "/path/to/robot.urdf"},
       "sensors": {"sonar": true, "camera": true, "dvl": true, "baro": true},
       "publisher": {"sonar_frame_id": "sonar0/optical_frame"}
     }
+
+``platform`` selects a vehicle from ``utils.platforms`` (``bluerov2`` or
+``deeptrekker_revolution``); its spec supplies the USD, dynamics, sensor mounts
+and default URDF, each overridable via ``robot``. The platform URDF is latched on
+``/robot_description`` and the articulation's joints are published on
+``/joint_states`` (and driven from ``/oceansim/robot/joint_command``) so
+robot_state_publisher / RViz get a fully articulated model.
 """
 
 import argparse
@@ -58,6 +66,12 @@ def parse_args(argv):
                    help="USD scene to load instead of the default MHL scene.")
     p.add_argument("--asset-path", default=None,
                    help="OceanSim assets directory (registers asset_path.json).")
+    p.add_argument("--platform", default=None,
+                   help="Vehicle platform to import (e.g. 'bluerov2', "
+                        "'deeptrekker_revolution'). See utils.platforms.")
+    p.add_argument("--robot-description", dest="robot_description", default=None,
+                   help="Path to a URDF to latch on /robot_description, "
+                        "overriding the platform's default robot description.")
     p.add_argument("--control-mode", default=None,
                    choices=["No control", "Straight line", "Waypoints",
                             "Manual control", "ROS control"],
@@ -93,8 +107,12 @@ def load_config(args):
         "control_mode": "ROS control",
         "scene_usd": "",
         "asset_path": "",
-        "robot": {"translation": [-2.0, 0.0, -0.8], "mass": 5.0,
-                  "linear_damping": 10.0, "angular_damping": 10.0},
+        # Vehicle platform (utils.platforms). Its spec provides the USD, mass,
+        # damping, collision, spawn pose, sensor mounts, and default URDF. The
+        # optional "robot" dict overrides individual fields (e.g. mass,
+        # translation, usd_path, urdf_path, robot_description).
+        "platform": "bluerov2",
+        "robot": {},
         "sensors": {"sonar": True, "camera": True, "dvl": True, "baro": True},
         # Sonar backend: "oceansim" = custom imaging sonar (Camera + pointcloud
         # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
@@ -126,6 +144,10 @@ def load_config(args):
         cfg["scene_usd"] = args.scene_usd
     if args.asset_path is not None:
         cfg["asset_path"] = args.asset_path
+    if args.platform is not None:
+        cfg["platform"] = args.platform
+    if args.robot_description is not None:
+        cfg.setdefault("robot", {})["urdf_path"] = args.robot_description
     if args.control_mode is not None:
         cfg["control_mode"] = args.control_mode
     if args.sonar_backend is not None:
@@ -256,30 +278,47 @@ def main(argv):
                         orientation=euler_angles_to_quat(np.array([0.0, 0.0, 90]),
                                                          degrees=True))
 
-    # ---- robot ------------------------------------------------------------
+    # ---- robot (selected platform from utils.platforms) -------------------
     from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
+    from isaacsim.oceansim.utils import platforms
+    assets = get_oceansim_assets_path()
+    spec = platforms.get_platform(cfg.get("platform", platforms.DEFAULT_PLATFORM))
+    rob_cfg = cfg.get("robot", {})
+    print(f"[oceansim_ros2] platform: {spec.name} -- {spec.description}")
+
     robot_path = "/World/rob"
-    rob_cfg = cfg["robot"]
-    add_reference_to_stage(usd_path=get_oceansim_assets_path() + "/Bluerov/BROV_low.usd",
-                           prim_path=robot_path)
+    # Each field falls back to the platform spec unless explicitly overridden in
+    # cfg["robot"]. (For bluerov2 the spec values equal the old hardcoded ones,
+    # so this is behaviour-preserving.)
+    usd_path = rob_cfg.get("usd_path") or spec.usd_path(assets)
+    mass = float(rob_cfg.get("mass", spec.mass))
+    lin_d = float(rob_cfg.get("linear_damping", spec.linear_damping))
+    ang_d = float(rob_cfg.get("angular_damping", spec.angular_damping))
+    collision = rob_cfg.get("collision_approximation", spec.collision_approximation)
+    spawn = np.array(rob_cfg.get("translation", spec.spawn_translation), dtype=float)
+
+    add_reference_to_stage(usd_path=usd_path, prim_path=robot_path)
     rob_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_path))
     rob_rb.CreateDisableGravityAttr(True)
-    rob_rb.GetLinearDampingAttr().Set(float(rob_cfg["linear_damping"]))
-    rob_rb.GetAngularDampingAttr().Set(float(rob_cfg["angular_damping"]))
+    rob_rb.GetLinearDampingAttr().Set(lin_d)
+    rob_rb.GetAngularDampingAttr().Set(ang_d)
     rob_collider = SingleGeometryPrim(prim_path=robot_path, collision=True)
-    rob_collider.set_collision_approximation("boundingCube")
-    SingleRigidPrim(prim_path=robot_path, mass=float(rob_cfg["mass"]),
-                    translation=np.array(rob_cfg["translation"], dtype=float))
+    rob_collider.set_collision_approximation(collision)
+    SingleRigidPrim(prim_path=robot_path, mass=mass, translation=spawn)
     robot_prim = get_prim_at_path(robot_path)
 
-    # ---- sensors (same placements as the example) -------------------------
+    def _mount_quat(mount):
+        return euler_angles_to_quat(np.array(mount.rpy_deg, dtype=float), degrees=True)
+
+    # ---- sensors (mount poses come from the platform spec) ----------------
     sensors = cfg["sensors"]
     sonar = cam = dvl = baro = None
     if sensors.get("sonar"):
         sonar_backend = cfg.get("sonar_backend", "oceansim")
         _sonar_xform = dict(
-            prim_path=robot_path + "/sonar", translation=np.array([0.3, 0.0, 0.3]),
-            orientation=euler_angles_to_quat(np.array([0.0, 45, 0.0]), degrees=True))
+            prim_path=robot_path + "/sonar",
+            translation=np.array(spec.sonar_mount.translation, dtype=float),
+            orientation=_mount_quat(spec.sonar_mount))
         if sonar_backend == "rtx_acoustic":
             # Isaac native RTX acoustic sensor (experimental). Avoids the 6.0.1
             # pointcloud-annotator SIGSEGV; output mapping is a scaffold (see class).
@@ -294,7 +333,7 @@ def main(argv):
                 range_res=0.005, angular_res=0.25, hori_res=4000, **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
-        _cam_translation = np.array([0.3, 0.0, 0.1])
+        _cam_translation = np.array(spec.camera_mount.translation, dtype=float)
         cam = UW_Camera(prim_path=robot_path + "/UW_camera",
                         resolution=[1920, 1080], translation=_cam_translation)
         cam.set_focal_length(0.1 * 21)
@@ -302,7 +341,8 @@ def main(argv):
     if sensors.get("dvl"):
         from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
         dvl = DVLsensor(max_range=10)
-        dvl.attachDVL(rigid_body_path=robot_path, translation=np.array([0, 0, -0.1]))
+        dvl.attachDVL(rigid_body_path=robot_path,
+                      translation=np.array(spec.dvl_mount.translation, dtype=float))
     if sensors.get("baro"):
         from isaacsim.oceansim.sensors.BarometerSensor import BarometerSensor
         baro = BarometerSensor(prim_path=robot_path + "/Baro",
@@ -317,6 +357,24 @@ def main(argv):
     scenario._sensor_update_period = (1.0 / _scr) if _scr > 0 else 0.0
 
     pub_cfg = dict(cfg.get("publisher", {}))
+
+    # Robot description for ROS: latch the platform URDF on /robot_description so
+    # robot_state_publisher / RViz can articulate the model from the published
+    # /joint_states. Precedence: inline string > explicit path (--robot-description
+    # / robot.urdf_path) > the platform's registered URDF under the asset root.
+    if "robot_description" not in pub_cfg:
+        urdf_text, src = platforms.resolve_robot_description(
+            asset_root=assets, platform=spec,
+            inline=rob_cfg.get("robot_description"),
+            path=rob_cfg.get("urdf_path"))
+        if urdf_text:
+            pub_cfg["robot_description"] = urdf_text
+            print(f"[oceansim_ros2] robot_description from {src} "
+                  f"({len(urdf_text)} chars) -> /robot_description")
+        else:
+            print(f"[oceansim_ros2] no robot_description ({src}); "
+                  f"robot_state_publisher/RViz will need one from elsewhere.")
+
     if cfg.get("publish_static_tf"):
         # The sensors are children of the robot prim, so their local mount pose
         # IS base_link->sensor. DVL/baro/IMU report in base_link, so no TF needed.
