@@ -114,6 +114,40 @@ Calibration gaps (all in `RtxAcousticSensor._build_acoustic_attributes` +
    binning -- it is probably the faster route to a working fast sonar, with
    rtx_acoustic as a later physical-fidelity track once its capture is solved.
 
+   UPDATE (isolated-example test, 2026-06-29): Isaac's own create_acoustic_basic.py
+   run in THIS image (oceansim:6.0.1) produces data immediately -- "First data
+   received at frame 0, numElements=640" -- with NO tickRate/Hydra-Engine warnings.
+   So the sensor WORKS in 6.0.1; OceanSim's integration is the bug. The hydra-engine
+   warnings appear ONLY in OceanSim, where the acoustic render product is created
+   alongside the UW-camera + main-viewport render products -> a render-product /
+   hydra-engine CONFLICT (the acoustic render product can't get its engine thread,
+   so it never renders, so the writer never fires). NOT primarily the world.step
+   loop driver. Likely fixes: create the acoustic render product so it doesn't
+   fight the existing ones (creation order, a compatible engine config, matching
+   tickRate/deviceMask), or run rtx_acoustic without the UW camera. NB Isaac's test
+   needs ~180 frames before first data; the example drives via simulation_app.
+   update(), so the loop may still need an explicit SDG pump once the conflict is
+   resolved. The `isaac-sim-remote` skill (port 8226) can inspect the live
+   render-product/engine state interactively.
+
+   CONCLUSION (2026-06-29, debugged to ground): the render-product/engine conflict
+   is FATAL and is with `World`/`SimulationContext` itself, not the camera or the
+   loop driver. Tested and ruled out: GUI vs headless (same), camera ON vs OFF
+   (same -- 2131 warnings, no data either way), and adding `simulation_app.update()`
+   after `world.step` to drive the full SDG (same -- 2226 warnings, no data). The
+   acoustic sensor's render product cannot create its hydra engine thread while
+   `World` owns the rendering (deviceMask/tickRate mismatch in the warning). The
+   isolated example works ONLY because it never creates a `World` (raw
+   `SimulationApp` + `omni.timeline` + `simulation_app.update()`). So fixing
+   rtx_acoustic needs a SUBSTANTIAL effort: either restructure the runner to drive
+   physics + the acoustic sensor without `World` (breaks the rest of OceanSim, which
+   is built on SimulationContext tensor views for control/odom/IMU), or an
+   Isaac-side fix so the experimental acoustic render product coexists with `World`.
+   NOT a quick integration fix. => `rtx_lidar` via the STANDARD `isaacsim.sensors.
+   rtx` API (designed to run under `World` with annotators + `world.step`) is the
+   recommended path to a working fast sonar; revisit rtx_acoustic if/when the
+   World-coexistence issue is resolved upstream.
+
 1. **Receiver array** — currently 8 placeholder elements at 2 cm spacing across the
    FOV. Replace with the real Oculus receiver geometry (element count + spacing);
    this sets the achievable azimuth resolution.
