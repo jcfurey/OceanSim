@@ -57,6 +57,9 @@ Set up your ROS2 workspace with Isaac Sim by following the official [Isaac Sim R
 
 Before the OceanSim extension is activated, the `isaacsim.ros2.bridge` extension must be activated, otherwise `rclpy` will fail to load. We suggest setting `isaacsim.ros2.bridge` to **AUTOLOADED** in *Window → Extensions*.
 
+### Platform bringup (description, joints & sensors)
+To publish a vehicle to ROS2 as a fully articulated robot — its URDF on `/robot_description`, joints on `/joint_states` (driven from `/oceansim/robot/joint_command`), and sensors placed at the URDF's sensor frames — see [ROS2 Platform Bringup](subsections/ros2_platform_bringup.md). It covers selecting a platform (`bluerov2` / `deeptrekker_revolution`), importing from a URDF, the full topic/QoS table, and a `robot_state_publisher` + RViz launch (`scripts/oceansim_bringup.launch.py`).
+
 ### ROS2 control
 We provide an example util at `isaacsim/oceansim/utils/ros2_control.py` to consult and develop on. It extends the control mode to **ROS control** in the **sensor_example** extension.
 

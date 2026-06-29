@@ -120,3 +120,15 @@ def test_sensor_mount_or_none_urdf_is_fallback(u):
 
 def test_malformed_urdf_returns_none(u):
     assert u.sensor_mount("<robot><broken", "sonar") is None
+
+
+def test_root_link_inferred(u):
+    assert u.root_link(URDF) == "base_link"
+    assert u.root_link("<robot><broken") is None
+
+
+def test_sensor_link_lookup(u):
+    assert u.sensor_link(URDF, "sonar") == "sonar_link"
+    assert u.sensor_link(URDF, "camera") == "camera_link"
+    assert u.sensor_link(URDF, "baro") is None          # not in this URDF
+    assert u.sensor_link("<robot><broken", "sonar") is None

@@ -83,6 +83,24 @@ def test_joint_states_reliable_for_robot_state_publisher(q):
     assert not q.is_compatible(q.SENSOR_DATA, c.peer_qos)
 
 
+def test_no_topic_contract_drift(q):
+    """Guard: every OceanSim topic literal in the ROS source must have a verified
+    QoS contract, and every contract must still correspond to a real topic. So a
+    topic added (or removed) without updating ros2_qos.TOPIC_CONTRACTS fails CI."""
+    import re
+    utils = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim", "utils")
+    pat = re.compile(r'"(/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*)"')
+    src_topics = set()
+    for fname in ("ros2_sensors.py", "ros2_control.py"):
+        with open(os.path.join(utils, fname)) as f:
+            src_topics |= set(pat.findall(f.read()))
+    contract_topics = {c.topic for c in q.TOPIC_CONTRACTS}
+    assert src_topics - contract_topics == set(), \
+        f"topics used in source but missing a QoS contract: {src_topics - contract_topics}"
+    assert contract_topics - src_topics == set(), \
+        f"QoS contracts for topics not found in source (stale?): {contract_topics - src_topics}"
+
+
 def test_sensor_topics_require_best_effort_consumers(q):
     # Document the contract: sensor streams are BEST_EFFORT, so a RELIABLE-only
     # consumer would drop them. (Verified compatible against BEST_EFFORT peers.)

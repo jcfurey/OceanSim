@@ -418,29 +418,48 @@ def main(argv):
     # /joint_states. Precedence: inline string > explicit path (--robot-description
     # / robot.urdf_path) > the platform's registered URDF under the asset root.
     if "robot_description" not in pub_cfg:
-        urdf_text, src = platforms.resolve_robot_description(
+        desc_text, desc_src = platforms.resolve_robot_description(
             asset_root=assets, platform=spec,
             inline=rob_cfg.get("robot_description"),
             path=rob_cfg.get("robot_description_path") or rob_cfg.get("urdf_path"))
-        if urdf_text:
-            pub_cfg["robot_description"] = urdf_text
-            print(f"[oceansim_ros2] robot_description from {src} "
-                  f"({len(urdf_text)} chars) -> /robot_description")
+        if desc_text:
+            pub_cfg["robot_description"] = desc_text
+            print(f"[oceansim_ros2] robot_description from {desc_src} "
+                  f"({len(desc_text)} chars) -> /robot_description")
         else:
-            print(f"[oceansim_ros2] no robot_description ({src}); "
+            print(f"[oceansim_ros2] no robot_description ({desc_src}); "
                   f"robot_state_publisher/RViz will need one from elsewhere.")
+
+    # When the robot was imported from a URDF, align the published frame_ids with
+    # the URDF tree so robot_state_publisher's TF and OceanSim's message stamps
+    # agree: base frame = the URDF root link; sonar/camera frames = their URDF
+    # sensor-link names (each only if the user hasn't overridden it).
+    _urdf_frames = {}   # sensor kind -> URDF link (frames robot_state_publisher owns)
+    if urdf_text is not None:
+        _base = urdf_parse.root_link(urdf_text)
+        if _base:
+            for key in ("base_frame_id", "imu_frame_id", "dvl_frame_id", "baro_frame_id"):
+                pub_cfg.setdefault(key, _base)
+            print(f"[oceansim_ros2] base frame from URDF root link -> {_base}")
+        for kind, fid in (("sonar", "sonar_frame_id"), ("camera", "camera_frame_id")):
+            link = urdf_parse.sensor_link(urdf_text, kind)
+            if link:
+                _urdf_frames[kind] = link
+                pub_cfg.setdefault(fid, link)
 
     if cfg.get("publish_static_tf"):
         # The sensors are children of the robot prim, so their local mount pose
-        # IS base_link->sensor. DVL/baro/IMU report in base_link, so no TF needed.
+        # IS base->sensor. DVL/baro/IMU report in the base frame, so no TF needed.
+        # Skip any sensor whose frame the URDF already defines -- robot_state_publisher
+        # publishes base->that link from the URDF, so OceanSim must not duplicate it.
         static_tfs = []
-        if sonar is not None:
+        if sonar is not None and "sonar" not in _urdf_frames:
             static_tfs.append({
                 "child_frame_id": pub_cfg.get("sonar_frame_id", "sonar0/optical_frame"),
                 "translation": [float(x) for x in _sonar_xform["translation"]],
                 "rotation_wxyz": [float(x) for x in _sonar_xform["orientation"]],
             })
-        if cam is not None:
+        if cam is not None and "camera" not in _urdf_frames:
             static_tfs.append({
                 "child_frame_id": pub_cfg.get("camera_frame_id", "camera"),
                 "translation": [float(x) for x in _cam_translation],

@@ -127,6 +127,27 @@ def link_pose_in_base(urdf_text, link_name, base_link=None):
     return translation, rpy_deg
 
 
+def root_link(urdf_text):
+    """Name of the kinematic root (base) link -- the link that is never a joint
+    child. None if the URDF can't be parsed. Used as the ROS base frame so the
+    odom / sensor frames line up with robot_state_publisher's TF tree."""
+    try:
+        joints_by_child, links = _parse(urdf_text)
+    except (ET.ParseError, ValueError):
+        return None
+    return _root_link(joints_by_child, links)
+
+
+def sensor_link(urdf_text, kind, candidates=None):
+    """The URDF link name OceanSim would mount sensor ``kind`` to (the matched
+    conventional link), or None if the URDF defines none / can't be parsed."""
+    try:
+        cands = candidates if candidates is not None else DEFAULT_SENSOR_LINKS.get(kind, [])
+        return find_link(urdf_text, cands)
+    except (ET.ParseError, ValueError):
+        return None
+
+
 def find_link(urdf_text, candidates):
     """First link in ``candidates`` that exists in the URDF (case-insensitive),
     returned with its actual casing; None if none match."""
