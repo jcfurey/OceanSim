@@ -197,6 +197,17 @@ class UIBuilder():
                     on_clicked_fn=self._on_platform_dropdown_clicked
                 )
 
+                # Optional URDF override: if set, the robot is imported from this
+                # URDF (creating the articulation) instead of the platform's USD.
+                # Leave empty to use the platform's own asset.
+                self._urdf_path_field = str_builder(
+                    label='URDF (optional)',
+                    default_val="",
+                    tooltip='Import the robot from this URDF instead of the platform USD',
+                    use_folder_picker=True,
+                    folder_button_title="Select URDF",
+                    folder_dialog_title='Select a robot URDF to import')
+
                 self._load_btn = LoadButton(
                     "Load Button", "LOAD", setup_scene_fn=self._setup_scene, setup_post_load_fn=self._setup_scenario
                 )
@@ -299,29 +310,56 @@ class UIBuilder():
                                             orientation=euler_angles_to_quat(np.array([0.0,0.0,90]), degrees=True), 
                                             )
             
-        # add the selected vehicle platform as a reference (utils.platforms).
-        # The spec supplies the USD, dynamics, collision, spawn pose and sensor
-        # mounts -- chosen via the "Vehicle Platform" dropdown.
+        # Spawn the selected vehicle platform (utils.platforms). Normally the
+        # platform USD is referenced; if the "URDF (optional)" field is set (or
+        # only a URDF exists), import that instead -- it creates the articulation,
+        # so joint manipulation works. The spec supplies dynamics, collision,
+        # spawn pose and sensor mounts.
         spec = platforms.get_platform(self._platform)
         print(f"[OceanSim] platform: {spec.name} -- {spec.description}")
         robot_prim_path = "/World/rob"
-        robot_usd_path = spec.usd_path(get_oceansim_assets_path())
-        self._rob = add_reference_to_stage(usd_path=robot_usd_path, prim_path=robot_prim_path)
-        # Toggle rigid body and collider preset for robot, and set zero gravity to mimic underwater environment
-        rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
-        rob_rigidBody_API.CreateDisableGravityAttr(True)
-        # Set damping of the robot
-        rob_rigidBody_API.GetLinearDampingAttr().Set(spec.linear_damping)
-        rob_rigidBody_API.GetAngularDampingAttr().Set(spec.angular_damping)
-        # Set the mass for the robot to suppress a warning from inertia autocomputation
-        rob_collider_prim = SingleGeometryPrim(prim_path=robot_prim_path,
-                                               collision=True)
-        rob_collider_prim.set_collision_approximation(spec.collision_approximation)
-        SingleRigidPrim(prim_path=robot_prim_path,
-                        mass=spec.mass,
-                        translation=np.array(spec.spawn_translation, dtype=float))
+        _urdf_override = self._urdf_path_field.get_value_as_string().strip()
+        src, why = platforms.resolve_robot_source(
+            asset_root=get_oceansim_assets_path(), platform=spec,
+            urdf_path=_urdf_override or None,
+            prefer="urdf" if _urdf_override else "usd")
+        if src is None:
+            carb.log_error(f"[OceanSim] no robot asset for platform '{spec.name}' ({why}).")
+            return
 
-        set_camera_view(eye=np.array([5,0.6,0.4]), target=rob_collider_prim.get_world_pose()[0])
+        if src.kind == "urdf":
+            # URDF defines inertials/joints/collisions; only apply the underwater
+            # setup (no gravity, damping, spawn) -- don't override mass/collision.
+            from isaacsim.oceansim.utils import urdf_import
+            print(f"[OceanSim] importing URDF -> {src.path}")
+            robot_prim_path = urdf_import.import_urdf_to_stage(src.path, fix_base=False)
+            rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
+            rob_rigidBody_API.CreateDisableGravityAttr(True)
+            try:
+                rob_rigidBody_API.GetLinearDampingAttr().Set(spec.linear_damping)
+                rob_rigidBody_API.GetAngularDampingAttr().Set(spec.angular_damping)
+            except Exception:  # noqa: BLE001 - articulation root may differ
+                pass
+            SingleRigidPrim(prim_path=robot_prim_path,
+                            translation=np.array(spec.spawn_translation, dtype=float))
+        else:
+            print(f"[OceanSim] referencing USD -> {src.path}")
+            self._rob = add_reference_to_stage(usd_path=src.path, prim_path=robot_prim_path)
+            # Toggle rigid body and collider preset for robot, and set zero gravity to mimic underwater environment
+            rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
+            rob_rigidBody_API.CreateDisableGravityAttr(True)
+            rob_rigidBody_API.GetLinearDampingAttr().Set(spec.linear_damping)
+            rob_rigidBody_API.GetAngularDampingAttr().Set(spec.angular_damping)
+            rob_collider_prim = SingleGeometryPrim(prim_path=robot_prim_path,
+                                                   collision=True)
+            rob_collider_prim.set_collision_approximation(spec.collision_approximation)
+            SingleRigidPrim(prim_path=robot_prim_path,
+                            mass=spec.mass,
+                            translation=np.array(spec.spawn_translation, dtype=float))
+        self._rob = get_prim_at_path(robot_prim_path)
+
+        set_camera_view(eye=np.array([5, 0.6, 0.4]),
+                        target=np.array(spec.spawn_translation, dtype=float))
 
 
         if self._use_sonar:
