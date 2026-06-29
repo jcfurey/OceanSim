@@ -234,6 +234,18 @@ def main(argv):
     cfg = load_config(args)
 
     # 1) Boot Isaac Sim FIRST -- nothing from omni/isaacsim is importable before this.
+    # The RTX acoustic sensor needs Motion BVH (/renderer/raytracingMotion) so the
+    # raytracer handles the moving robot/sonar geometry. It MUST be set as a BOOT
+    # setting, not at runtime: the old RtxAcousticSensor.sonar_initialize flipped
+    # /renderer/raytracingMotion/enabled mid-run, which forces a hydra-engine
+    # reconfiguration. With the Kit viewport + sonar render products both live, that
+    # reconfiguration fails to spawn new engine threads (deviceMask 0) -> the viewport
+    # AND the sonar silently stop rendering (thousands of "failed to create Hydra
+    # Engine thread for viewport" warnings + empty GMO frames). Passing it as a kit
+    # arg here boots the renderer with Motion BVH already on, so nothing reconfigures.
+    import sys as _sys
+    if cfg.get("sonar_backend") == "rtx_acoustic":
+        _sys.argv += ["--/renderer/raytracingMotion/enabled=True"]
     from isaacsim import SimulationApp
     sim_app = SimulationApp({
         "headless": bool(cfg["headless"]),

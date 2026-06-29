@@ -193,11 +193,15 @@ class RtxAcousticSensor:
         except Exception as exc:  # noqa: BLE001
             print(f"[{self._name}] could not enable isaacsim.sensors.experimental.rtx: {exc}")
 
-        try:
-            import carb
-            carb.settings.get_settings().set("/renderer/raytracingMotion/enabled", True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[{self._name}] could not enable Motion BVH: {exc}")
+        # NOTE: Motion BVH (/renderer/raytracingMotion/enabled) MUST be enabled as a
+        # BOOT setting -- the standalone runner passes it as a kit arg before
+        # SimulationApp (see oceansim_ros2.py). Do NOT flip it here: changing that
+        # render setting at runtime (this used to do `carb.settings.set(...)`) forces a
+        # hydra-engine reconfiguration that fails to spawn engine threads while the Kit
+        # viewport + sonar render products are live -- the viewport AND the sonar both
+        # silently stop rendering (thousands of "failed to create Hydra Engine thread"
+        # warnings + empty GMO frames). That single mid-run set was the entire reason
+        # the rtx_acoustic backend produced no data.
 
         import omni.replicator.core as rep
         self._rep = rep

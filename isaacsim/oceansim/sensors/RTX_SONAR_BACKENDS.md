@@ -164,6 +164,43 @@ Calibration gaps (all in `RtxAcousticSensor._build_acoustic_attributes` +
    = the example + `World()`); (3) the big runner restructure (drive without
    `World`). Do NOT spend more cycles on Python/carb levers for rtx_acoustic.
 
+   ===========================================================================
+   *** SOLVED (2026-06-29) -- both CONCLUSIONs above were WRONG. ***
+   It was NOT World, NOT a Kit-core conflict, NOT a fork patch. ROOT CAUSE: one
+   line in `RtxAcousticSensor.sonar_initialize` flipped a RENDER SETTING AT
+   RUNTIME -- `carb.settings.set("/renderer/raytracingMotion/enabled", True)`.
+   Changing /renderer/* after the renderer + Kit viewport already exist forces a
+   hydra-engine RECONFIGURATION; with the viewport + sonar render products both
+   live it fails to spawn new engine threads (deviceMask 0) -> the viewport AND
+   the sonar silently stop rendering (the thousands of "failed to create Hydra
+   Engine thread for viewport" warnings + empty GMO frames). The whole
+   "World-incompatible" story was a red herring -- the isolated example worked
+   only because it never sets raytracingMotion at runtime.
+
+   How it was found: built a minimal standalone repro from create_acoustic_basic.py
+   and added OceanSim's factors ONE AT A TIME (World, world.step drive, capture-on-
+   play, RayTracedLighting, ros2.bridge, a 2nd camera render product, tick_rate=30,
+   aux_output_level=BASIC, in-process URDF import, the 49MB MHL scene, robot physics,
+   sonar-under-articulation, SingleArticulation.initialize(), an rclpy/rmw_zenoh
+   node, real 8-mount attrs). ALL passed; the boot kit-args were byte-identical to
+   OceanSim. The ONLY thing left was the mid-run raytracingMotion set -> adding it
+   reproduced the exact failure (33k createViewport failures); moving it to a BOOT
+   kit-arg fixed it (0 warnings, FIRST DATA frame 0).
+
+   THE FIX (committed): the standalone runner (`oceansim_ros2.py`) appends
+   `--/renderer/raytracingMotion/enabled=True` to sys.argv BEFORE `SimulationApp`
+   (only for `sonar_backend == rtx_acoustic`), so the renderer boots with Motion
+   BVH already on -- no mid-run reconfiguration. `RtxAcousticSensor.sonar_initialize`
+   no longer touches that setting. Verified on the real full-scenario sim:
+   `FIRST VALID acoustic frame 1: numElements=2560`, sonar publishing on ROS ~2 Hz,
+   odom ~22 Hz, 0 hydra warnings.
+
+   REMAINING (calibration, separate task): the GMO `timeOffsetNs` come back all 0
+   (`t_ns=[0,0]`) -> every sample maps to range 0, so the folded image collapses.
+   rtx_acoustic now CAPTURES; making the output physically correct (range/timing +
+   the Oculus geometry) is the next step -- see the calibration roadmap below.
+   ===========================================================================
+
 1. **Receiver array** — currently 8 placeholder elements at 2 cm spacing across the
    FOV. Replace with the real Oculus receiver geometry (element count + spacing);
    this sets the achievable azimuth resolution.
