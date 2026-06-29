@@ -460,10 +460,18 @@ def main(argv):
                 "rotation_wxyz": [float(x) for x in _sonar_xform["orientation"]],
             })
         if cam is not None and "camera" not in _urdf_frames:
+            # REP-103/104: Image/depth/CameraInfo are stamped in an OPTICAL frame
+            # (z forward, x right, y down). The camera prim is body-aligned at the
+            # mount (created with translation only), so broadcast
+            # base->camera_optical with the standard optical rotation
+            # (rpy -90,0,-90) rather than identity -- otherwise depth_image_proc /
+            # RViz reproject the planar z-depth along the wrong axis. (The exact
+            # sign is the textbook optical transform; confirm against a real frame.)
+            _cam_opt_quat = euler_angles_to_quat(np.array([-90.0, 0.0, -90.0]), degrees=True)
             static_tfs.append({
-                "child_frame_id": pub_cfg.get("camera_frame_id", "camera"),
+                "child_frame_id": pub_cfg.get("camera_frame_id", "camera_optical_frame"),
                 "translation": [float(x) for x in _cam_translation],
-                "rotation_wxyz": [1.0, 0.0, 0.0, 0.0],
+                "rotation_wxyz": [float(x) for x in _cam_opt_quat],
             })
         pub_cfg["publish_static_tf"] = True
         pub_cfg["static_transforms"] = static_tfs
@@ -489,7 +497,7 @@ def main(argv):
         while sim_app.is_running() and running["flag"]:
             world.step(render=need_render)
             if world.is_playing():
-                scenario.update_scenario(dt)
+                scenario.update_scenario(dt, world.current_time)
                 publisher.publish(world.current_time)
     finally:
         print("[oceansim_ros2] shutting down")

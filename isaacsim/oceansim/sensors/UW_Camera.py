@@ -23,12 +23,28 @@ so, we suggest that make sure the extension isaacsim.ros2.bridge is being setup 
 '''
 import rclpy
 from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import CompressedImage, Image, CameraInfo
 import time
 import cv2
 
 from isaacsim.oceansim.utils import ros2_context
 from isaacsim.oceansim.utils import camera_math
+from isaacsim.oceansim.utils import ros2_math
+from isaacsim.oceansim.utils import ros2_qos
+
+
+def _camera_qos(depth: int = 1) -> QoSProfile:
+    """Best-effort sensor QoS for the camera image/depth/info streams, matching
+    the project's single-source QoS policy (ros2_qos.SENSOR_DATA). Image and
+    depth frames are multi-MB; a RELIABLE KEEP_LAST queue would apply
+    publisher-side backpressure that stalls the render thread and balloons memory
+    under a slow/absent subscriber."""
+    return QoSProfile(
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=depth,
+    )
 
 class UW_Camera(Camera):
 
@@ -82,7 +98,7 @@ class UW_Camera(Camera):
                    UW_yaml_path: str = None,
                    physics_sim_view=None,
                    enable_ros2_pub=True, uw_img_topic="/oceansim/robot/uw_img", ros2_pub_frequency=5, ros2_pub_jpeg_quality=50,
-                   camera_frame_id="camera",
+                   camera_frame_id="camera_optical_frame",
                    image_raw_topic="/oceansim/robot/image_raw",
                    depth_topic="/oceansim/robot/depth",
                    camera_info_topic="/oceansim/robot/camera_info",
@@ -157,6 +173,9 @@ class UW_Camera(Camera):
         self._publish_image_raw = publish_image_raw
         self._publish_depth = publish_depth
         self._last_publish_time = 0.0
+        # Sim-time rate gate (used when render() is given a sim_time, i.e. the
+        # headless runner); falls back to the wall-clock gate above when it is not.
+        self._sim_rate_gate = ros2_math.RateGate(ros2_pub_frequency)
         self._ros2_pub_frequency = ros2_pub_frequency     # publish frequency, hz
         self._ros2_pub_jpeg_quality = ros2_pub_jpeg_quality
         self._ros2_acquired = False
@@ -228,35 +247,46 @@ class UW_Camera(Camera):
             self._ros2_uw_img_node = rclpy.create_node(
                 node_name, parameter_overrides=[Parameter('use_sim_time', value=True)])
             self._uw_img_pub = self._ros2_uw_img_node.create_publisher(
-                CompressedImage, self._uw_img_topic, 10)
+                CompressedImage, self._uw_img_topic, _camera_qos(depth=2))
             if self._publish_image_raw:
                 self._image_raw_pub = self._ros2_uw_img_node.create_publisher(
-                    Image, self._image_raw_topic, 10)
+                    Image, self._image_raw_topic, _camera_qos(depth=1))
             if self._publish_depth:
                 self._depth_pub = self._ros2_uw_img_node.create_publisher(
-                    Image, self._depth_topic, 10)
+                    Image, self._depth_topic, _camera_qos(depth=1))
             self._camera_info_pub = self._ros2_uw_img_node.create_publisher(
-                CameraInfo, self._camera_info_topic, 10)
+                CameraInfo, self._camera_info_topic, _camera_qos(depth=2))
 
         except Exception as e:
             print(f'[{self._name}] ROS2 camera publisher setup failed: {e}')
 
-    def _ros2_publish_camera(self, uw_img, depth):
-        """Publish the underwater-camera frame on a single shared (sim-time) stamp:
+    def _ros2_publish_camera(self, uw_img, depth, sim_time=None):
+        """Publish the underwater-camera frame on a single shared stamp:
         CompressedImage (jpeg) + raw sensor_msgs/Image (rgb8) + depth Image (32FC1,
-        planar z-depth in metres) + CameraInfo. All carry the camera TF frame."""
+        planar z-depth in metres) + CameraInfo. All carry the camera TF frame.
+
+        When ``sim_time`` (seconds) is supplied (headless runner), both the rate
+        gate and the message stamp use it -- the same sim clock the other
+        publishers and /clock use -- so cadence and stamps stay consistent off
+        real-time. Without it (GUI), the wall-clock gate + node clock are used."""
         try:
             if self._uw_img_pub is None:
                 return
 
-            # fps control (one gate for all camera topics)
-            current_time = time.time()
-            if current_time - self._last_publish_time < (1.0 / self._ros2_pub_frequency):
-                return
-            self._last_publish_time = current_time
-
             node = self._ros2_uw_img_node
-            stamp = node.get_clock().now().to_msg()   # sim time (use_sim_time)
+            # fps control (one gate for all camera topics)
+            if sim_time is not None:
+                if not self._sim_rate_gate.ready(sim_time):
+                    return
+                from builtin_interfaces.msg import Time
+                sec, nanosec = ros2_math.sim_time_to_sec_nanosec(sim_time)
+                stamp = Time(sec=sec, nanosec=nanosec)
+            else:
+                current_time = time.time()
+                if current_time - self._last_publish_time < (1.0 / self._ros2_pub_frequency):
+                    return
+                self._last_publish_time = current_time
+                stamp = node.get_clock().now().to_msg()
             frame = self._camera_frame_id
 
             uw_image_cpu = uw_img.numpy()
@@ -316,9 +346,15 @@ class UW_Camera(Camera):
         except Exception as e:
             print(f'[{self._name}] ROS2 camera publish failed: {e}')
 
-    def render(self):
+    def render(self, sim_time=None):
         """Process and display a single frame with underwater effects.
-    
+
+        Args:
+            sim_time (float, optional): current simulation time in seconds. When
+                given (headless runner), the ROS publish is rate-gated and stamped
+                on sim time so it stays consistent with /clock and the other
+                sensors; omitted (GUI) keeps the wall-clock gate.
+
         Note:
             - Updates viewport display if enabled
             - Saves image to disk if writing_dir was specified
@@ -354,7 +390,7 @@ class UW_Camera(Camera):
                 self._writing_backend.schedule(write_image, path=f'UW_image_{self._id}.png', data=uw_image)
                 print(f'[{self._name}] [{self._id}] Rendered image saved to {self._writing_backend.output_dir}')
             if self._enable_ros2_pub:
-                self._ros2_publish_camera(uw_image, depth)
+                self._ros2_publish_camera(uw_image, depth, sim_time)
 
             self._id += 1
 
@@ -390,23 +426,30 @@ class UW_Camera(Camera):
             - Required for proper shutdown when done using the sensor
             - Also closes viewport window if one was created
         """
-        self._rgba_annot.detach(self._render_product_path)
-        self._depth_annot.detach(self._render_product_path)
-
-        rep.AnnotatorCache.clear(self._rgba_annot)
-        rep.AnnotatorCache.clear(self._depth_annot)
-
-        # Tear down ROS2 publisher and release the shared rclpy context
-        if self._ros2_uw_img_node is not None:
-            self._ros2_uw_img_node.destroy_node()
-            self._ros2_uw_img_node = None
-            self._uw_img_pub = None
-        if self._ros2_acquired:
-            ros2_context.release()
-            self._ros2_acquired = False
-
-        if self._viewport:
-            self.ui_destroy()
+        # Detach is best-effort: a detach/clear failure on an invalidated render
+        # product (or a close() before initialize() ever ran -> the annotator
+        # attrs may not exist) must NOT skip the rclpy context release in the
+        # finally, or _ros2_acquired stays True and rclpy never shuts down.
+        try:
+            if getattr(self, "_rgba_annot", None) is not None:
+                self._rgba_annot.detach(self._render_product_path)
+                rep.AnnotatorCache.clear(self._rgba_annot)
+            if getattr(self, "_depth_annot", None) is not None:
+                self._depth_annot.detach(self._render_product_path)
+                rep.AnnotatorCache.clear(self._depth_annot)
+        except Exception as exc:  # noqa: BLE001
+            print(f'[{self._name}] annotator detach warning: {exc}')
+        finally:
+            # Tear down ROS2 publisher and release the shared rclpy context.
+            if getattr(self, "_ros2_uw_img_node", None) is not None:
+                self._ros2_uw_img_node.destroy_node()
+                self._ros2_uw_img_node = None
+                self._uw_img_pub = None
+            if getattr(self, "_ros2_acquired", False):
+                ros2_context.release()
+                self._ros2_acquired = False
+            if getattr(self, "_viewport", False):
+                self.ui_destroy()
 
         print(f'[{self._name}] Annotator detached. AnnotatorCache cleaned.')
     

@@ -182,12 +182,12 @@ class MHL_Sensor_Example_Scenario():
         self._time = 0.0
 
 
-    def update_scenario(self, step: float):
+    def update_scenario(self, step: float, sim_time: float = None):
 
-        
+
         if not self._running_scenario:
             return
-        
+
         self._time += step
 
         # Throttle the heavy sensor compute (sonar scan + camera UW_render) to
@@ -200,7 +200,10 @@ class MHL_Sensor_Example_Scenario():
             if self._sonar is not None:
                 self._sonar.make_sonar_data()
             if self._cam is not None:
-                self._cam.render()
+                # Pass the authoritative sim time (headless runner) so the camera
+                # rate-gates + stamps on the same clock as the other publishers;
+                # None (GUI) keeps the camera's wall-clock gate.
+                self._cam.render(sim_time)
             if self._DVL is not None:
                 self._DVL_reading = self._DVL.get_linear_vel()
             if self._baro is not None:

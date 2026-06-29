@@ -88,11 +88,14 @@ def test_no_topic_contract_drift(q):
     QoS contract, and every contract must still correspond to a real topic. So a
     topic added (or removed) without updating ros2_qos.TOPIC_CONTRACTS fails CI."""
     import re
-    utils = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim", "utils")
+    base = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim")
     pat = re.compile(r'"(/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*)"')
+    sources = [os.path.join(base, "utils", "ros2_sensors.py"),
+               os.path.join(base, "utils", "ros2_control.py"),
+               os.path.join(base, "sensors", "UW_Camera.py")]
     src_topics = set()
-    for fname in ("ros2_sensors.py", "ros2_control.py"):
-        with open(os.path.join(utils, fname)) as f:
+    for path in sources:
+        with open(path) as f:
             src_topics |= set(pat.findall(f.read()))
     contract_topics = {c.topic for c in q.TOPIC_CONTRACTS}
     assert src_topics - contract_topics == set(), \

@@ -66,6 +66,12 @@ TOPIC_CONTRACTS = [
     Contract("/oceansim/robot/joint_command", "sub", SENSOR_DATA, "controller / teleop", DEFAULT_CMD),
     Contract("/oceansim/robot/vel_cmd", "sub", DEFAULT_CMD, "teleop_twist_*", DEFAULT_CMD),
     Contract("/oceansim/robot/force_cmd", "sub", DEFAULT_CMD, "controller", DEFAULT_CMD),
+    # UW_Camera streams (multi-MB images): BEST_EFFORT like every other sensor, so
+    # they don't apply RELIABLE publisher-side backpressure on the render thread.
+    Contract("/oceansim/robot/uw_img", "pub", SENSOR_DATA, "image consumer / RViz", SENSOR_DATA),
+    Contract("/oceansim/robot/image_raw", "pub", SENSOR_DATA, "image_proc / RViz", SENSOR_DATA),
+    Contract("/oceansim/robot/depth", "pub", SENSOR_DATA, "depth_image_proc / RViz", SENSOR_DATA),
+    Contract("/oceansim/robot/camera_info", "pub", SENSOR_DATA, "image_proc / RViz", SENSOR_DATA),
 ]
 
 
