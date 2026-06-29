@@ -164,6 +164,18 @@ class ROS2ControlReceiver:
             
         except Exception as e:
             self._enable_ros2 = False
+            # Destroy any node already created before the failure (e.g. the vel
+            # node when force-node creation raises), or it leaks for the process
+            # lifetime -- close()'s teardown was gated on _enable_ros2, which we
+            # just set False.
+            for _attr in ("_ros2_vel_node", "_ros2_force_node"):
+                _node = getattr(self, _attr, None)
+                if _node is not None:
+                    try:
+                        _node.destroy_node()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    setattr(self, _attr, None)
             print(f'[{self._name}] ROS2 subscriber setup failed: {e}')
 
     def _setup_ros2_control_mode(self, ctrl_mode):
@@ -232,45 +244,41 @@ class ROS2ControlReceiver:
         
         try:
             if self._ros2_control_mode == ROS2_CONTROL_MODE.VEL: # velocity mode
-                self._update_count += 1
+                # Drain the cmd_vel queue every step with a non-blocking spin --
+                # the same pattern the sensor publisher (ros2_sensors) and camera
+                # (UW_Camera) already use, so it cannot "block the scene". The old
+                # `% 10` gate spun (and applied the command) only every 10th step,
+                # adding up to ~10 physics-steps of teleop latency; and because it
+                # re-applies the commanded velocity only intermittently, other
+                # forces (drag/gravity) perturbed the body in between. Spinning and
+                # holding the commanded velocity every step is the standard
+                # velocity-control behaviour.
+                rclpy.spin_once(self._ros2_vel_node, timeout_sec=0.0)
 
-                if self._update_count % 10 == 0: # need delay, otherwise the scene will be blocked
-                    self._update_count = 0
-
-                    rclpy.spin_once(self._ros2_vel_node, timeout_sec=0.0)
-
-                    if self._rigid_prim is None:
-                        self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
-                    self._rigid_prim.set_linear_velocity(np.array([0.0, 0.0, 0.0]))  # reset
-                    self._rigid_prim.set_angular_velocity(np.array([0.0, 0.0, 0.0]))  # reset
-                    # The incoming Twist is a body-frame command (ROS cmd_vel
-                    # convention), but Isaac's set_*_velocity take world-frame
-                    # vectors. Rotate body -> world by the robot's orientation.
-                    lin_w, ang_w = self._body_to_world(self.linear_vel, self.angular_vel)
-                    self._rigid_prim.set_linear_velocity(lin_w)
-                    self._rigid_prim.set_angular_velocity(ang_w)
+                if self._rigid_prim is None:
+                    self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
+                # The incoming Twist is a body-frame command (ROS cmd_vel
+                # convention), but Isaac's set_*_velocity take world-frame
+                # vectors. Rotate body -> world by the robot's orientation.
+                lin_w, ang_w = self._body_to_world(self.linear_vel, self.angular_vel)
+                self._rigid_prim.set_linear_velocity(lin_w)
+                self._rigid_prim.set_angular_velocity(ang_w)
 
             elif self._ros2_control_mode == ROS2_CONTROL_MODE.FORCE: # force mode
                 # using PXR API to control
                 if PXR_AVAILABLE:
-                    
-                    self._update_count += 1
+                    rclpy.spin_once(self._ros2_force_node, timeout_sec=0.0)
 
-                    if self._update_count % 10 == 0: # need delay, otherwise the scene will be blocked
-                        self._update_count = 0
+                    force_gf = Gf.Vec3f(float(self.force_cmd[0]), float(self.force_cmd[1]), float(self.force_cmd[2]))
+                    torque_gf = Gf.Vec3f(float(self.torque_cmd[0]), float(self.torque_cmd[1]), float(self.torque_cmd[2]))
 
-                        rclpy.spin_once(self._ros2_force_node, timeout_sec=0.0)
+                    if self._force_api:
+                        try:
+                            self._force_api.CreateForceAttr().Set(force_gf)
+                            self._force_api.CreateTorqueAttr().Set(torque_gf)
+                        except Exception as e:
+                            print(f'[{self._name}] Force API Update Failed: {e}')
 
-                        force_gf = Gf.Vec3f(float(self.force_cmd[0]), float(self.force_cmd[1]), float(self.force_cmd[2]))
-                        torque_gf = Gf.Vec3f(float(self.torque_cmd[0]), float(self.torque_cmd[1]), float(self.torque_cmd[2]))
-                    
-                        if self._force_api:
-                            try:
-                                self._force_api.CreateForceAttr().Set(force_gf)
-                                self._force_api.CreateTorqueAttr().Set(torque_gf)
-                            except Exception as e:
-                                print(f'[{self._name}] Force API Update Failed: {e}')
-                
         except Exception as e:
             print(f'[{self._name}] Control Update Failed: {e}')
     
@@ -290,14 +298,15 @@ class ROS2ControlReceiver:
 
     def close(self):
         try:
-            # Clean up ROS2 resources
-            if self._enable_ros2:
-                if self._ros2_vel_node:
-                    self._ros2_vel_node.destroy_node()
-                    self._ros2_vel_node = None
-                if self._ros2_force_node:
-                    self._ros2_force_node.destroy_node()
-                    self._ros2_force_node = None
+            # Clean up ROS2 resources. Gate on the node existing, not on
+            # _enable_ros2 (which a failed setup flips to False while a node may
+            # already have been created).
+            if self._ros2_vel_node:
+                self._ros2_vel_node.destroy_node()
+                self._ros2_vel_node = None
+            if self._ros2_force_node:
+                self._ros2_force_node.destroy_node()
+                self._ros2_force_node = None
 
             self._update_count = 0
             self.force_cmd = [0.0, 0.0, 0.0]

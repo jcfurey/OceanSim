@@ -4,9 +4,15 @@ import warp as wp
 @wp.func
 def cartesian_to_spherical(cart: wp.vec3) -> wp.vec3:
     r = wp.sqrt(cart[0]*cart[0] + cart[1]*cart[1] + cart[2]*cart[2])
+    # Guard the inclination: at r == 0 (a point at the sensor origin) cart[2]/r
+    # is inf/nan, and even for ordinary points floating-point rounding can push
+    # cart[2]/r just past +/-1, where acos() returns NaN. Use a floored r and
+    # clamp the argument into acos's valid domain so the elevation is always
+    # finite. (atan2 is already safe at the origin.)
+    cos_incl = cart[2] / wp.max(r, wp.float32(1e-8))
     return wp.vec3(r,
                 wp.atan2(cart[1], cart[0]),
-                wp.acos(cart[2] / r)
+                wp.acos(wp.clamp(cos_incl, wp.float32(-1.0), wp.float32(1.0)))
                 )
                                     
 
@@ -29,8 +35,14 @@ def compute_intensity(pcl: wp.array(ndim=2, dtype=wp.float32),
     sensor_loc = - (wp.transpose(R) @ T)
     incidence = pcl_vec - sensor_loc
     # Will use warp.math.norm_l2() in future release
-    dist = wp.sqrt(incidence[0]*incidence[0] + incidence[1]*incidence[1] + incidence[2]*incidence[2])
-    unit_directs = wp.normalize(pcl_vec - sensor_loc)
+    dist = wp.length(incidence)
+    # Guard the normalization: if the point coincides with the sensor (dist == 0)
+    # wp.normalize divides by zero -> NaN, which then poisons the whole bin sum
+    # via the atomic_add in bin_intensity. Reuse the already-computed dist instead
+    # of recomputing the subtraction + norm inside wp.normalize.
+    unit_directs = wp.vec3(0.0, 0.0, 0.0)
+    if dist > wp.float32(1e-8):
+        unit_directs = incidence / dist
     cos_theta = wp.dot(-unit_directs, normal_vec)
     reflectivity = indexToRefl[semantics[tid]]
     intensity[tid] = reflectivity * cos_theta * wp.exp(-attenuation * dist)
@@ -199,7 +211,12 @@ def make_sonar_image(sonar_data: wp.array(ndim=2, dtype=wp.vec3),
                      sonar_image: wp.array(ndim=3, dtype=wp.uint8)):
     i, j = wp.tid()
     width = sonar_data.shape[1]
-    sonar_rgb = wp.uint8(sonar_data[i,j][2] * wp.float32(255))
+    # Clamp before the narrowing uint8 cast. Warp does not saturate on a
+    # float->uint8 cast, so an intensity > 1 (e.g. if make_sonar_image is fed an
+    # un-normalised grid) would wrap modulo 256 and corrupt the pixel instead of
+    # showing full white. The normal pipeline already clamps intensity to [0,1],
+    # so this is a no-op there and only hardens the standalone use.
+    sonar_rgb = wp.uint8(wp.clamp(sonar_data[i,j][2] * wp.float32(255), wp.float32(0.0), wp.float32(255.0)))
     # Flip columns (mirror the image) while keeping the index in [0, width-1];
     # `width - j` would write index `width` (out of bounds) when j == 0.
     col = width - 1 - j

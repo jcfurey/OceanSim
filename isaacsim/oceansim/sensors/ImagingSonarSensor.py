@@ -83,6 +83,12 @@ class ImagingSonarSensor(Camera):
         self.vert_fov = vert_fov # degree (vert_fov is 20 degrees in datasheet)
         self.angular_res = angular_res # degree (datasheet is 2 deg)
         self.hori_res= hori_res
+        # Acoustic carrier frequency of the modelled sonar (Hz). The Oculus M370s
+        # is a 375 kHz single-frequency unit (Blueprint Subsea datasheet). This is
+        # the value reported in ProjectedSonarImage.ping_info.frequency -- kept
+        # SEPARATE from the inherited Camera `frequency` attribute, which is the
+        # render frame rate, not the acoustic carrier.
+        self.acoustic_frequency = 375e3  # Hz (Oculus M370s)
 
         # self.beam_separation = 0.5 # degree (Not USED FOR NOW)!!
         # self.num_beams = 256 # (max number of beams) (NOT USED FOR NOW)!!
@@ -372,7 +378,9 @@ class ImagingSonarSensor(Camera):
                               self._gpu_counter, self._gpu_out_pcl,
                               self._gpu_out_normals, self._gpu_out_sem],
                       device=self._device)
-            wp.synchronize()
+            # counter.numpy() already does a blocking default-stream device->host
+            # copy that orders this readback, so a global wp.synchronize() here
+            # only adds an unnecessary all-device stall on the sim thread.
             n_valid = int(self._gpu_counter.numpy()[0])
 
             if not self._scan_logged:
@@ -666,8 +674,10 @@ class ImagingSonarSensor(Camera):
             self.binned_intensity = self.bin_sum
 
 
-        self.range_dependent_ray_noise.zero_()
-        self.gau_noise.zero_()
+        # gau_noise / range_dependent_ray_noise are fully overwritten every frame
+        # by normal_2d / range_dependent_rayleigh_2d (which write every cell), so
+        # zeroing them first is redundant. sonar_map.zero_() is kept: an
+        # unrecognized normalizing_method runs no map kernel, so it must start clean.
         self.sonar_map.zero_()
 
         # Calculate multiplicative gaussian noise
@@ -801,7 +811,10 @@ class ImagingSonarSensor(Camera):
             - Used internally for viewport display
             - Image dimensions match the sonar's polar binning resolution
         """
-        self.sonar_image.zero_()
+        # make_sonar_image writes all four channels (RGB + A=255) for every pixel
+        # via a bijective column map and never reads prior contents, so zeroing
+        # the buffer first is redundant. (The init/reset zero in sonar_initialize
+        # is untouched.)
         wp.launch(
             dim=self.sonar_map.shape,
             kernel=make_sonar_image,
@@ -889,6 +902,13 @@ class ImagingSonarSensor(Camera):
             - Required for proper shutdown when done using the sensor
             - Also closes viewport window if one was created
         """
+        # If sonar_initialize() never ran (or raised mid-way), cameraParams_annot
+        # won't exist; guard so close() on a half-initialized sensor doesn't raise
+        # an AttributeError that masks the rest of the scenario teardown.
+        if getattr(self, "cameraParams_annot", None) is None:
+            if getattr(self, "_viewport", False):
+                self.ui_destroy()
+            return
         # Same hydra-texture gating as sonar_initialize(): detaching also mutates
         # the SDGPipeline graph, so disable updates first to avoid a teardown-time
         # variant of the partial-graph SIGSEGV. (UNTESTED — see sonar_initialize.)

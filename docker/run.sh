@@ -14,16 +14,21 @@ set -euo pipefail
 IMAGE="${OCEANSIM_IMAGE:-oceansim:6.0.1}"
 
 # --- X11 display passthrough -------------------------------------------------
-# Allow the container's user to talk to the host X server. Revoke afterwards
-# with:  xhost -local:root
+# Allow the container's user to talk to the host X server, and revoke the grant
+# on ANY exit (normal, error, or Ctrl-C) so it doesn't stay open for the rest of
+# the login session.
 if command -v xhost >/dev/null 2>&1; then
     xhost +local:root >/dev/null
+    trap 'xhost -local:root >/dev/null 2>&1 || true' EXIT
 else
     echo "warning: 'xhost' not found - the GUI may fail to display. Install x11-xserver-utils." >&2
 fi
 
-# Persisted Isaac Sim caches (first run is slow while shaders compile).
+# Persisted Isaac Sim caches (first run is slow while shaders compile). The bulk
+# of the RTX/MDL shader cache on 6.0.x is /isaac-sim/kit/cache (~570 MB); without
+# it the shader compile is paid on every --rm run.
 mkdir -p \
+    ~/docker/isaac-sim/cache/kit \
     ~/docker/isaac-sim/cache/main \
     ~/docker/isaac-sim/cache/computecache \
     ~/docker/isaac-sim/logs \
@@ -38,6 +43,16 @@ if [[ -n "${OCEANSIM_ASSETS:-}" ]]; then
     ASSET_ARGS=(-v "${OCEANSIM_ASSETS}:/isaac-sim/OceanSim_assets:rw")
 fi
 
+# Only bind-mount the X cookie when it is an existing file. On Wayland/GDM the
+# $HOME/.Xauthority fallback often does not exist, and the old unconditional -v
+# created a stray empty host DIRECTORY where a cookie file is expected. Local
+# socket auth (xhost +local:root above) still works without it.
+XAUTH_ARGS=()
+XAUTH_FILE="${XAUTHORITY:-$HOME/.Xauthority}"
+if [[ -f "${XAUTH_FILE}" ]]; then
+    XAUTH_ARGS=(-v "${XAUTH_FILE}:/root/.Xauthority:rw" -e "XAUTHORITY=/root/.Xauthority")
+fi
+
 docker run --name oceansim --rm -it \
     --runtime=nvidia --gpus all \
     --network=host \
@@ -49,7 +64,8 @@ docker run --name oceansim --rm -it \
     -e "NVIDIA_DRIVER_CAPABILITIES=all" \
     -e "NVIDIA_VISIBLE_DEVICES=all" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v "${XAUTHORITY:-$HOME/.Xauthority}:/root/.Xauthority:rw" \
+    "${XAUTH_ARGS[@]}" \
+    -v ~/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw \
     -v ~/docker/isaac-sim/cache/main:/isaac-sim/.cache:rw \
     -v ~/docker/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache:rw \
     -v ~/docker/isaac-sim/logs:/isaac-sim/.nvidia-omniverse/logs:rw \

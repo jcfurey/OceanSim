@@ -22,6 +22,7 @@ from isaacsim.core.utils.extensions import get_extension_path
 from .scenario import MHL_Sensor_Example_Scenario
 from .global_variables import EXTENSION_DESCRIPTION, EXTENSION_TITLE, EXTENSION_LINK
 from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
+from isaacsim.oceansim.utils import platforms
 
 class UIBuilder():
     def __init__(self):
@@ -179,6 +180,34 @@ class UIBuilder():
                     on_clicked_fn=self._on_ctrl_mode_dropdown_clicked
                 )
 
+                # Vehicle platform picker (utils.platforms). Items are the
+                # registry's platforms, so adding a vehicle there adds it here.
+                self._platform_keys = platforms.available_platforms()
+                self._platform_labels = [
+                    platforms.get_platform(k).description.split('(')[0].strip() or k
+                    for k in self._platform_keys
+                ]
+                _default_platform_idx = (self._platform_keys.index(self._platform)
+                                         if self._platform in self._platform_keys else 0)
+                self._platform_dropdown_model = dropdown_builder(
+                    label='Vehicle Platform',
+                    default_val=_default_platform_idx,
+                    items=self._platform_labels,
+                    tooltip='Vehicle spawned on Load (e.g. BlueROV2 or DeepTrekker Revolution).',
+                    on_clicked_fn=self._on_platform_dropdown_clicked
+                )
+
+                # Optional URDF override: if set, the robot is imported from this
+                # URDF (creating the articulation) instead of the platform's USD.
+                # Leave empty to use the platform's own asset.
+                self._urdf_path_field = str_builder(
+                    label='URDF (optional)',
+                    default_val="",
+                    tooltip='Import the robot from this URDF instead of the platform USD',
+                    use_folder_picker=True,
+                    folder_button_title="Select URDF",
+                    folder_dialog_title='Select a robot URDF to import')
+
                 self._load_btn = LoadButton(
                     "Load Button", "LOAD", setup_scene_fn=self._setup_scene, setup_post_load_fn=self._setup_scenario
                 )
@@ -222,19 +251,17 @@ class UIBuilder():
 
     def _on_init(self):
 
-        # Robot parameters
-        self._rob_mass = 5.0 # kg
-        self._rob_angular_damping = 10.0
-        self._rob_linear_damping = 10.0
+        # Vehicle platform (utils.platforms): which vehicle the Load button
+        # spawns, chosen via the "Vehicle Platform" dropdown. The selected
+        # platform's spec supplies the USD, mass/damping, collision, spawn pose
+        # and the sensor mount poses below.
+        self._platform = platforms.DEFAULT_PLATFORM
 
         # Sensor
         self._sonar = None
-        self._sonar_trans = np.array([0.3,0.0, 0.3])
         self._cam = None
-        self._cam_trans = np.array([0.3,0.0, 0.1])
         self._cam_focal_length = 21
         self._DVL = None
-        self._DVL_trans = np.array([0,0,-0.1])
         self._baro = None
         self._water_surface = 1.43389 # Arbitrary
         
@@ -283,52 +310,101 @@ class UIBuilder():
                                             orientation=euler_angles_to_quat(np.array([0.0,0.0,90]), degrees=True), 
                                             )
             
-        # add bluerov robot as reference
+        # Spawn the selected vehicle platform (utils.platforms). Normally the
+        # platform USD is referenced; if the "URDF (optional)" field is set (or
+        # only a URDF exists), import that instead -- it creates the articulation,
+        # so joint manipulation works. The spec supplies dynamics, collision,
+        # spawn pose and sensor mounts.
+        spec = platforms.get_platform(self._platform)
+        print(f"[OceanSim] platform: {spec.name} -- {spec.description}")
         robot_prim_path = "/World/rob"
-        robot_usd_path = get_oceansim_assets_path() + "/Bluerov/BROV_low.usd"
-        self._rob = add_reference_to_stage(usd_path=robot_usd_path, prim_path=robot_prim_path)
-        # Toggle rigid body and collider preset for robot, and set zero gravity to mimic underwater environment
-        rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
-        rob_rigidBody_API.CreateDisableGravityAttr(True)
-        # Set damping of the robot
-        rob_rigidBody_API.GetLinearDampingAttr().Set(self._rob_linear_damping)
-        rob_rigidBody_API.GetAngularDampingAttr().Set(self._rob_angular_damping)
-        # Set the mass for the robot to suppress a warning from inertia autocomputation
-        rob_collider_prim = SingleGeometryPrim(prim_path=robot_prim_path,
-                                               collision=True)
-        rob_collider_prim.set_collision_approximation('boundingCube')
-        SingleRigidPrim(prim_path=robot_prim_path,
-                        mass=self._rob_mass,
-                        translation=np.array([-2.0, 0.0, -0.8]))
+        _urdf_override = self._urdf_path_field.get_value_as_string().strip()
+        src, why = platforms.resolve_robot_source(
+            asset_root=get_oceansim_assets_path(), platform=spec,
+            urdf_path=_urdf_override or None,
+            prefer="urdf" if _urdf_override else "usd")
+        if src is None:
+            carb.log_error(f"[OceanSim] no robot asset for platform '{spec.name}' ({why}).")
+            return
 
-        set_camera_view(eye=np.array([5,0.6,0.4]), target=rob_collider_prim.get_world_pose()[0])
-        
+        if src.kind == "urdf":
+            # URDF defines inertials/joints/collisions; only apply the underwater
+            # setup (no gravity, damping, spawn) -- don't override mass/collision.
+            from isaacsim.oceansim.utils import urdf_import
+            print(f"[OceanSim] importing URDF -> {src.path}")
+            robot_prim_path = urdf_import.import_urdf_to_stage(src.path, fix_base=False)
+            rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
+            rob_rigidBody_API.CreateDisableGravityAttr(True)
+            try:
+                rob_rigidBody_API.GetLinearDampingAttr().Set(spec.linear_damping)
+                rob_rigidBody_API.GetAngularDampingAttr().Set(spec.angular_damping)
+            except Exception:  # noqa: BLE001 - articulation root may differ
+                pass
+            SingleRigidPrim(prim_path=robot_prim_path,
+                            translation=np.array(spec.spawn_translation, dtype=float))
+        else:
+            print(f"[OceanSim] referencing USD -> {src.path}")
+            self._rob = add_reference_to_stage(usd_path=src.path, prim_path=robot_prim_path)
+            # Toggle rigid body and collider preset for robot, and set zero gravity to mimic underwater environment
+            rob_rigidBody_API = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_prim_path))
+            rob_rigidBody_API.CreateDisableGravityAttr(True)
+            rob_rigidBody_API.GetLinearDampingAttr().Set(spec.linear_damping)
+            rob_rigidBody_API.GetAngularDampingAttr().Set(spec.angular_damping)
+            rob_collider_prim = SingleGeometryPrim(prim_path=robot_prim_path,
+                                                   collision=True)
+            rob_collider_prim.set_collision_approximation(spec.collision_approximation)
+            SingleRigidPrim(prim_path=robot_prim_path,
+                            mass=spec.mass,
+                            translation=np.array(spec.spawn_translation, dtype=float))
+        self._rob = get_prim_at_path(robot_prim_path)
+
+        set_camera_view(eye=np.array([5, 0.6, 0.4]),
+                        target=np.array(spec.spawn_translation, dtype=float))
+
+        # When imported from a URDF, place the sensors at the URDF's sensor-link
+        # frames (fixed-joint origins), else at the platform spec mounts.
+        from isaacsim.oceansim.utils import urdf_parse
+        _urdf_text = None
+        if src.kind == "urdf":
+            try:
+                with open(src.path, 'r') as _f:
+                    _urdf_text = _f.read()
+            except Exception as e:  # noqa: BLE001
+                carb.log_warn(f"[OceanSim] could not read URDF for sensor mounts: {e}")
+
+        def _mount(kind, fallback_mount):
+            tr, rpy = urdf_parse.sensor_mount_or(
+                _urdf_text, kind, fallback_mount.translation, fallback_mount.rpy_deg)
+            return np.array(tr, dtype=float), np.array(rpy, dtype=float)
 
         if self._use_sonar:
             from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+            _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
             self._sonar = ImagingSonarSensor(prim_path=robot_prim_path + '/sonar',
-                                            translation=self._sonar_trans,
-                                            orientation=euler_angles_to_quat(np.array([0.0, 45, 0.0]),  degrees=True),
+                                            translation=_sonar_tr,
+                                            orientation=euler_angles_to_quat(_sonar_rpy, degrees=True),
                                             range_res=0.005,
                                             angular_res=0.25,
                                             hori_res=4000
                                             )
-            
+
         if self._use_camera:
             from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
 
+            _cam_tr, _ = _mount("camera", spec.camera_mount)
             self._cam = UW_Camera(prim_path=robot_prim_path + '/UW_camera',
                                     resolution=[1920,1080],
-                                    translation=self._cam_trans)
+                                    translation=_cam_tr)
             self._cam.set_focal_length(0.1 * self._cam_focal_length)
             self._cam.set_clipping_range(0.1, 100)
-            
+
         if self._use_DVL:
             from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
 
+            _dvl_tr, _ = _mount("dvl", spec.dvl_mount)
             self._DVL = DVLsensor(max_range=10)
             self._DVL.attachDVL(rigid_body_path=robot_prim_path,
-                                translation=self._DVL_trans)
+                                translation=_dvl_tr)
             self._DVL.add_debug_lines()
             
         if self._use_baro:
@@ -412,6 +488,16 @@ class UIBuilder():
         """This is called when the user opens a new stage from self.on_stage_event().
         All state should be reset.
         """
+        # Tear down the previous scenario before _on_init() discards it. Otherwise
+        # opening a new stage orphans the old scenario's render-product annotators
+        # (GPU caches), the carb keyboard subscription (which keeps a strong ref to
+        # the scenario, preventing GC), and any rclpy nodes/context it acquired.
+        # teardown_scenario() is null-safe on a never-set-up scenario.
+        if getattr(self, "_scenario", None) is not None:
+            try:
+                self._scenario.teardown_scenario()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[OceanSim] scenario teardown on stage-open warning: {exc}")
         self._on_init()
         self._reset_ui()
 
@@ -444,6 +530,15 @@ class UIBuilder():
     def _on_ctrl_mode_dropdown_clicked(self, model):
         self._ctrl_mode = model
         print(f'Ctrl mode: {model}. Reload the scene for changes to take effect.')
+
+    def _on_platform_dropdown_clicked(self, label):
+        """Map the selected dropdown label back to its canonical platform key
+        (utils.platforms). The vehicle is spawned on the next Load."""
+        try:
+            self._platform = self._platform_keys[self._platform_labels.index(label)]
+        except (ValueError, AttributeError):
+            self._platform = label  # fall back to treating the label as a key
+        print(f'Vehicle platform: {self._platform}. Reload the scene for changes to take effect.')
 
    
     def _add_extra_ui(self):

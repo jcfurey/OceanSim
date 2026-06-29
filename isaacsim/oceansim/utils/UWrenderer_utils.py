@@ -20,6 +20,13 @@ def UW_render(raw_image: wp.array(ndim=3, dtype=wp.uint8),
     i,j = wp.tid()
     raw_RGB = wp.vec3(wp.float32(raw_image[i,j,0]), wp.float32(raw_image[i,j,1]), wp.float32(raw_image[i,j,2]), dtype=wp.float32)
     depth = depth_image[i,j]
+    # distance_to_camera returns +inf for background (no hit). With a zero
+    # attenuation/backscatter coefficient channel, -inf * 0 = NaN -> exp(NaN) =
+    # NaN -> wp.uint8(NaN) is undefined and corrupts the pixel. Clamp a non-finite
+    # depth to a large finite range so a 0 coefficient yields exp(0)=1 (pixel
+    # unchanged) and a positive coefficient yields exp(-large)=0 (fully attenuated).
+    if not wp.isfinite(depth):
+        depth = wp.float32(1.0e4)
     exp_atten = vec3_exp(- depth * atten_coeff)
     exp_back = vec3_exp(- depth * backscatter_coeff)
     UW_RGB = vec3_mul(raw_RGB, exp_atten) + vec3_mul(backscatter_value * wp.float32(255), (wp.vec3f(1.0,1.0,1.0) - exp_back) )

@@ -50,6 +50,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from isaacsim.oceansim.utils import ros2_context
 from isaacsim.oceansim.utils import ros2_math
+from isaacsim.oceansim.utils import joint_control
+from isaacsim.oceansim.utils import ros2_qos
 # Pure (numpy-only) math lives in ros2_math so it can be unit tested without ROS.
 _quat_wxyz_to_xyzw = ros2_math.quat_wxyz_to_xyzw
 _RateGate = ros2_math.RateGate
@@ -60,22 +62,40 @@ except Exception:  # pragma: no cover - only importable inside Isaac Sim
     quat_to_rot_matrix = None
 
 
-def _sensor_qos(depth: int = 10) -> QoSProfile:
-    """Best-effort, keep-last QoS matching ``rclpy.qos.qos_profile_sensor_data``."""
+def _to_profile(q) -> QoSProfile:
+    """Build an rclpy QoSProfile from a pure ros2_qos.QoS spec, so the profiles
+    that are verified for compatibility in tests are exactly the ones used on the
+    wire."""
     return QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
+        reliability=(ReliabilityPolicy.RELIABLE if q.reliability == ros2_qos.RELIABLE
+                     else ReliabilityPolicy.BEST_EFFORT),
+        durability=(DurabilityPolicy.TRANSIENT_LOCAL if q.durability == ros2_qos.TRANSIENT_LOCAL
+                    else DurabilityPolicy.VOLATILE),
         history=HistoryPolicy.KEEP_LAST,
-        depth=depth,
+        depth=q.depth,
     )
+
+
+def _sensor_qos(depth: int = 10) -> QoSProfile:
+    """Best-effort, keep-last sensor QoS (matches qos_profile_sensor_data)."""
+    return _to_profile(ros2_qos.SENSOR_DATA._replace(depth=depth))
 
 
 def _clock_qos() -> QoSProfile:
-    return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=1,
-        durability=DurabilityPolicy.VOLATILE,
-    )
+    return _to_profile(ros2_qos.CLOCK)
+
+
+def _latched_qos() -> QoSProfile:
+    """Latched (TRANSIENT_LOCAL) QoS for the robot description: published once,
+    yet still delivered to subscribers that join later (RViz, robot_state_publisher)."""
+    return _to_profile(ros2_qos.LATCHED)
+
+
+def _reliable_state_qos() -> QoSProfile:
+    """RELIABLE QoS for /joint_states. robot_state_publisher subscribes with the
+    rclcpp default (RELIABLE), so a BEST_EFFORT publisher would be silently
+    dropped -- see ros2_qos.TOPIC_CONTRACTS / tests/test_ros2_qos.py."""
+    return _to_profile(ros2_qos.RELIABLE_STATE)
 
 
 class OceanSimSensorPublisher:
@@ -106,12 +126,27 @@ class OceanSimSensorPublisher:
         "baro_topic": "/oceansim/robot/pressure",
         "sonar_topic": "/oceansim/robot/sonar",
         "clock_topic": "/clock",
+        "robot_description_topic": "/robot_description",
+        "joint_states_topic": "/joint_states",
+        "joint_command_topic": "/oceansim/robot/joint_command",
         # rates (Hz, <=0 means "every sim step")
         "odom_rate": 60.0,
         "imu_rate": 100.0,
         "dvl_rate": 10.0,
         "baro_rate": 10.0,
         "sonar_rate": 5.0,
+        "joint_state_rate": 30.0,
+        # Robot description (URDF XML string) to latch on robot_description_topic
+        # so robot_state_publisher / RViz can load the platform model. None ->
+        # the description publisher is simply not created. The runner fills this
+        # from the selected platform's URDF (see utils.platforms).
+        "robot_description": None,
+        # Joint manipulation: publish the articulation's joint states on
+        # joint_states_topic (for robot_state_publisher TF), and -- when
+        # enable_joint_command is True -- subscribe to joint_command_topic
+        # (sensor_msgs/JointState of position targets) to drive the joints.
+        # Both are no-ops if the robot prim is not an Isaac articulation.
+        "enable_joint_command": True,
         # toggles
         "publish_clock": True,
         # Static TF base_link->{sensor} from the mount poses. OFF by default so it
@@ -122,6 +157,10 @@ class OceanSimSensorPublisher:
         "publish_static_tf": False,
         # sonar acoustic params (used to fill ProjectedSonarImage.ping_info)
         "sound_speed": 1500.0,
+        # Explicit override (Hz) for the sonar acoustic carrier reported in
+        # ping_info.frequency. None -> use the sensor's own modelled value
+        # (ImagingSonarSensor.acoustic_frequency / RtxAcousticSensor.center_frequency).
+        "sonar_acoustic_freq": None,
         # gravity magnitude (m/s^2) used to build the IMU specific force
         "gravity": 9.81,
     }
@@ -148,6 +187,11 @@ class OceanSimSensorPublisher:
         self._baro_pub = None
         self._sonar_pub = None
         self._clock_pub = None
+        self._robot_desc_pub = None    # latched /robot_description (URDF)
+        self._joint_state_pub = None   # /joint_states from the articulation
+        self._joint_cmd_sub = None     # joint position-command subscription
+        self._articulation = None      # lazily-resolved Isaac articulation (if any)
+        self._joint_names = None       # articulation dof order (cached)
 
         # rate gates
         self._odom_gate = _RateGate(self._cfg["odom_rate"])
@@ -155,6 +199,7 @@ class OceanSimSensorPublisher:
         self._dvl_gate = _RateGate(self._cfg["dvl_rate"])
         self._baro_gate = _RateGate(self._cfg["baro_rate"])
         self._sonar_gate = _RateGate(self._cfg["sonar_rate"])
+        self._joint_state_gate = _RateGate(self._cfg["joint_state_rate"])
 
         # IMU finite-difference state (world-frame velocity, for specific force)
         self._last_world_lin_vel = None
@@ -215,8 +260,61 @@ class OceanSimSensorPublisher:
                 self._node.get_logger().warn(
                     f"sonar publisher disabled (marine_acoustic_msgs missing?): {e}")
 
+        self._setup_robot_description()
+        self._setup_joints()
         self._setup_static_tf()
         self._node.get_logger().info("OceanSimSensorPublisher initialized")
+
+    def _setup_robot_description(self):
+        """Latch the platform URDF on robot_description_topic (if provided), so
+        robot_state_publisher / RViz can load the model. Published once with
+        TRANSIENT_LOCAL durability, so subscribers that join later still get it."""
+        urdf = self._cfg.get("robot_description")
+        if not urdf:
+            return
+        try:
+            from std_msgs.msg import String
+            self._robot_desc_pub = self._node.create_publisher(
+                String, self._cfg["robot_description_topic"], _latched_qos())
+            self._robot_desc_pub.publish(String(data=urdf))
+            self._node.get_logger().info(
+                f"latched robot_description ({len(urdf)} chars) on "
+                f"{self._cfg['robot_description_topic']}")
+        except Exception as e:  # pragma: no cover
+            self._node.get_logger().warn(f"robot_description publisher disabled: {e}")
+
+    def _setup_joints(self):
+        """Resolve the robot's articulation (if any) and set up joint state
+        publishing + the optional joint-command subscription. All a no-op when
+        the robot prim is a plain rigid body with no DOFs."""
+        try:
+            from isaacsim.core.prims import SingleArticulation
+            from isaacsim.core.utils.prims import get_prim_path
+            art = SingleArticulation(prim_path=get_prim_path(self._robot_prim))
+            try:
+                art.initialize()
+            except Exception:  # pragma: no cover - may already be initialized
+                pass
+            dof_names = list(getattr(art, "dof_names", None) or [])
+            if not dof_names:
+                return  # not an articulation / no joints -> nothing to manipulate
+            self._articulation = art
+            self._joint_names = dof_names
+        except Exception as e:  # pragma: no cover
+            self._node.get_logger().warn(f"articulation unavailable (no joint I/O): {e}")
+            return
+
+        from sensor_msgs.msg import JointState
+        self._joint_state_pub = self._node.create_publisher(
+            JointState, self._cfg["joint_states_topic"], _reliable_state_qos())
+        if self._cfg.get("enable_joint_command"):
+            self._joint_cmd_sub = self._node.create_subscription(
+                JointState, self._cfg["joint_command_topic"], self._on_joint_command,
+                _sensor_qos())
+        self._node.get_logger().info(
+            f"joint manipulation ready: {len(self._joint_names)} DOFs "
+            f"{self._joint_names} (states -> {self._cfg['joint_states_topic']}"
+            f"{', commands <- ' + self._cfg['joint_command_topic'] if self._joint_cmd_sub else ''})")
 
     def _setup_static_tf(self):
         """Broadcast base_link->{sensor} static transforms (latched /tf_static).
@@ -282,8 +380,11 @@ class OceanSimSensorPublisher:
             self._safe(self._publish_baro, stamp)
         if self._sonar_pub is not None and self._sonar_gate.ready(sim_time):
             self._safe(self._publish_sonar, stamp)
+        if self._joint_state_pub is not None and self._joint_state_gate.ready(sim_time):
+            self._safe(self._publish_joint_state, stamp)
 
-        # Service any timers/callbacks on our node without blocking the sim.
+        # Service any timers/callbacks on our node without blocking the sim
+        # (this is also what dispatches incoming joint commands).
         rclpy.spin_once(self._node, timeout_sec=0.0)
 
     def _safe(self, fn, *args):
@@ -297,6 +398,44 @@ class OceanSimSensorPublisher:
         from builtin_interfaces.msg import Time
         sec, nanosec = ros2_math.sim_time_to_sec_nanosec(sim_time)
         return Time(sec=sec, nanosec=nanosec)
+
+    def _publish_joint_state(self, stamp):
+        """Publish the articulation's joint positions/velocities as
+        sensor_msgs/JointState (the input robot_state_publisher needs, together
+        with the latched /robot_description, to broadcast the moving TF tree)."""
+        from sensor_msgs.msg import JointState
+        pos = np.asarray(self._articulation.get_joint_positions(), dtype=float).reshape(-1)
+        try:
+            vel = np.asarray(self._articulation.get_joint_velocities(), dtype=float).reshape(-1)
+        except Exception:  # pragma: no cover - velocity optional
+            vel = np.zeros_like(pos)
+        msg = JointState()
+        msg.header.stamp = stamp
+        msg.name = list(self._joint_names)
+        msg.position = [float(x) for x in pos]
+        msg.velocity = [float(x) for x in vel]
+        self._joint_state_pub.publish(msg)
+
+    def _on_joint_command(self, msg):
+        """Apply an incoming sensor_msgs/JointState position command to the
+        articulation. The command may be a subset / reordered / contain unknown
+        joints -- joint_control.map_named_command reconciles it against the DOF
+        order, holding the current target for any joint the command omits."""
+        if self._articulation is None or not msg.name:
+            return
+        try:
+            from isaacsim.core.utils.types import ArticulationAction
+            current = np.asarray(self._articulation.get_joint_positions(), dtype=float).reshape(-1)
+            targets, ignored = joint_control.map_named_command(
+                list(msg.name), list(msg.position), self._joint_names, current=current)
+            if ignored:
+                self._node.get_logger().warn(
+                    f"joint command names not on this robot, ignored: {ignored}",
+                    throttle_duration_sec=5.0)
+            self._articulation.apply_action(ArticulationAction(joint_positions=targets))
+        except Exception as e:  # keep the sim alive on a malformed command / API change
+            self._node.get_logger().warn(
+                f"joint command failed: {e}", throttle_duration_sec=5.0)
 
     def _publish_clock(self, sim_time: float):
         from rosgraph_msgs.msg import Clock
@@ -458,10 +597,17 @@ class OceanSimSensorPublisher:
         msg.header.frame_id = self._cfg["sonar_frame_id"]
 
         ping = PingInfo()
-        # ImagingSonarSensor is a Camera and may expose frequency=None; guard so
-        # float(None) doesn't throw (and fall back to a nominal acoustic freq).
-        _sonar_freq = getattr(self._sonar, "frequency", None)
-        ping.frequency = float(_sonar_freq) if _sonar_freq else 1.2e6
+        # Acoustic carrier frequency for ping_info. Prefer an explicit config
+        # override, then the sensor's own MODELLED acoustic frequency
+        # (ImagingSonarSensor.acoustic_frequency = 375 kHz for the Oculus M370s;
+        # RtxAcousticSensor.center_frequency for the RTX backend). Do NOT use the
+        # Camera `frequency` attribute -- on the imaging sonar that is the render
+        # frame rate (e.g. 5-60 Hz), not the acoustic carrier, which would publish
+        # a wildly wrong ping frequency to sonar_image_proc / sonar_proc.
+        _sonar_freq = (self._cfg.get("sonar_acoustic_freq")
+                       or getattr(self._sonar, "acoustic_frequency", None)
+                       or getattr(self._sonar, "center_frequency", None))
+        ping.frequency = float(_sonar_freq) if _sonar_freq else 375e3
         ping.sound_speed = float(self._cfg["sound_speed"])
         ping.tx_beamwidths = geom["tx_beamwidths"]
         ping.rx_beamwidths = geom["rx_beamwidths"]

@@ -100,6 +100,12 @@ class Extension(omni.ext.IExt):
 
         if self._window:
             self._window = None
+        # Release the carb event subscriptions so gc can reclaim this Extension
+        # instance on disable / hot-reload (they hold a C++-side ref to the bound
+        # callbacks), and stale callbacks don't fire after shutdown.
+        self._stage_event_sub = None
+        self._timeline_event_sub = None
+        self._physx_subscription = None
         self.ui_builder.cleanup()
         gc.collect()
 

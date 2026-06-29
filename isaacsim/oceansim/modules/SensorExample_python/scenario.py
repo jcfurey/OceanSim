@@ -19,6 +19,7 @@ except ImportError as e:
 class MHL_Sensor_Example_Scenario():
     def __init__(self):
         self._rob = None
+        self._rob_rigid = None
         self._sonar = None
         self._cam = None
         self._DVL = None
@@ -45,6 +46,10 @@ class MHL_Sensor_Example_Scenario():
 
     def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode):
         self._rob = rob
+        # Cache the rigid-body wrapper once (the prim never changes); the
+        # Straight-line control path built a fresh SingleRigidPrim -- prim-path
+        # resolution + PhysX view setup -- every physics step.
+        self._rob_rigid = SingleRigidPrim(prim_path=get_prim_path(rob)) if rob is not None else None
         self._sonar = sonar
         self._cam = cam
         self._DVL = DVL
@@ -182,12 +187,12 @@ class MHL_Sensor_Example_Scenario():
         self._time = 0.0
 
 
-    def update_scenario(self, step: float):
+    def update_scenario(self, step: float, sim_time: float = None):
 
-        
+
         if not self._running_scenario:
             return
-        
+
         self._time += step
 
         # Throttle the heavy sensor compute (sonar scan + camera UW_render) to
@@ -200,7 +205,10 @@ class MHL_Sensor_Example_Scenario():
             if self._sonar is not None:
                 self._sonar.make_sonar_data()
             if self._cam is not None:
-                self._cam.render()
+                # Pass the authoritative sim time (headless runner) so the camera
+                # rate-gates + stamps on the same clock as the other publishers;
+                # None (GUI) keeps the camera's wall-clock gate.
+                self._cam.render(sim_time)
             if self._DVL is not None:
                 self._DVL_reading = self._DVL.get_linear_vel()
             if self._baro is not None:
@@ -220,7 +228,7 @@ class MHL_Sensor_Example_Scenario():
             else:
                 print('Waypoints finished')                
         elif self._ctrl_mode=="Straight line":
-            SingleRigidPrim(prim_path=get_prim_path(self._rob)).set_linear_velocity(np.array([0.5,0,0])) 
+            self._rob_rigid.set_linear_velocity(np.array([0.5,0,0])) 
         elif self._ctrl_mode=="ROS control":
             if self._ros2_control_receiver is not None:
                 self._ros2_control_receiver.update_control()

@@ -74,7 +74,11 @@ class BarometerSensor(BaseSensor):
         physics_context = PhysicsContext()
         g_dir, scene_g = physics_context.get_gravity()
         if np.abs(self._g - np.abs(scene_g)) > 0.1:
-            carb.log_warn(f'[{self._name}] Detected USD scene gravity is different from user definition. Reduced to user definition.')
+            # get_pressure() always uses self._g; nothing is reconciled, so don't
+            # claim a correction was applied.
+            carb.log_warn(f'[{self._name}] USD scene gravity ({np.abs(scene_g):.3f}) '
+                          f'differs from the user-defined g ({self._g:.3f}); using '
+                          f'the user-defined g for pressure.')
         
 
     
@@ -92,8 +96,11 @@ class BarometerSensor(BaseSensor):
             When submerged (z-position < water_surface_z), hydrostatic pressure is added based on depth.
         """
 
-        if self.get_world_pose()[0][2] < self._water_surface_z:
-            depth = self._water_surface_z - self.get_world_pose()[0][2]
+        # Query the world pose once (it is a physics-view read on the per-step
+        # path); the old code called get_world_pose() twice.
+        z = self.get_world_pose()[0][2]
+        if z < self._water_surface_z:
+            depth = self._water_surface_z - z
         else:
             depth = 0.0
         

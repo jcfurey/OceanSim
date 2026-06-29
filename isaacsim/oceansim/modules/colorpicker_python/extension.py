@@ -91,6 +91,13 @@ class Extension(omni.ext.IExt):
 
         if self._window:
             self._window = None
+        # Release the carb event subscriptions before gc.collect(). They hold a
+        # C++-side strong ref to the bound callbacks (and thus this Extension
+        # instance), so without clearing them gc cannot reclaim it on disable /
+        # hot-reload while the window is visible, and stale callbacks may fire.
+        self._stage_event_sub = None
+        self._timeline_event_sub = None
+        self._physx_subscription = None
         self.ui_builder.cleanup()
         gc.collect()
 

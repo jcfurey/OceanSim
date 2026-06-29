@@ -13,6 +13,7 @@ from isaacsim.sensors.physx import _range_sensor
 
 # Custom import
 from isaacsim.oceansim.utils.MultivariateNormal import MultivariateNormal
+from isaacsim.oceansim.utils import dvl_math
 
 
 class DVLsensor:
@@ -62,16 +63,9 @@ class DVLsensor:
         self._mvn_dep = MultivariateNormal(4)
         self._mvn_dep.init_cov(depth_cov)
         
-        sinElev = np.sin(np.deg2rad(self._elevation))
-        cosElev = np.cos(np.deg2rad(self._elevation))
-        if sinElev == 0 or cosElev == 0:
-            raise ValueError(
-                f"[{self._name}] DVL beam elevation must not be 0 or 90 degrees "
-                f"(got {self._elevation}); the velocity transform divides by sin/cos(elevation).")
-        self._transform = np.array([[1/(2*sinElev), 0, -1/(2*sinElev), 0],
-                                    [0, 1/(2*sinElev), 0, -1/(2*sinElev)],
-                                    [1/(4*cosElev), 1/(4*cosElev), 1/(4*cosElev), 1/(4*cosElev)]
-                                    ])
+        # Janus beam -> body velocity transform (pure numpy, unit tested in
+        # utils/dvl_math.py). Raises for a 0 or 90 deg elevation (div by zero).
+        self._transform = dvl_math.beam_velocity_transform(self._elevation)
 
         # sensor dropout related params
         self._num_beams_out_range_threshold = num_beams_out_range_threshold
@@ -136,6 +130,7 @@ class DVLsensor:
                                   [-elevation, 0.0, rotation], 
                                   [0.0, -elevation, rotation]])
         orients_quat = []
+        beam_results = []
         for i in range(orients_euler.shape[0]):
             orients_quat.append(euler_angles_to_quat(orients_euler[i,:], degrees=True))
             self._beam_paths.append(sensor_prim_path + f"/beam_{i}")
@@ -148,11 +143,20 @@ class DVLsensor:
                 forward_axis=Gf.Vec3d(0, 0, -1),
                 num_rays=1,
                 )
+            beam_results.append(bool(result))
             SingleXFormPrim(prim_path=self._beam_paths[i]).set_local_pose(orientation=orients_quat[i])
-        if result:
+        # Require ALL four beams. The old code only checked the last beam's
+        # result, so a failure on beams 0-2 went unnoticed (and an all-failed
+        # case where the last beam happened to "succeed" would acquire an
+        # interface over incomplete sensors). get_depth/get_linear_vel need every
+        # beam, so acquire the interface only if all of them were created.
+        if all(beam_results):
             self._DVL_interface = _range_sensor.acquire_lightbeam_sensor_interface()
         else:
-            carb.log_error(f"[{self._name}] Beam Sensor fails to be loaded")
+            n_failed = beam_results.count(False)
+            carb.log_error(
+                f"[{self._name}] {n_failed}/{len(beam_results)} light-beam sensors failed to load; "
+                f"DVL interface not acquired.")
 
     def add_single_beam(self):
         self._single_beam_path = self._rigid_body_path + "/" + self._name +  "/SingleBeam"
@@ -237,8 +241,13 @@ class DVLsensor:
             depth.append(self._DVL_interface.get_linear_depth_data(beam_path)[0])
             if_hit.append(self._DVL_interface.get_beam_hit_data(beam_path)[0])
         if (self._mvn_dep.is_uncertain()):
+            # Draw the 4-vector once and add it elementwise (matching the
+            # single-draw pattern in get_linear_vel). The old code drew a fresh
+            # 4-vector per beam and kept only one component -- 4x the RNG work,
+            # and for a non-diagonal covariance it would also destroy the
+            # intended cross-beam correlation.
+            sample = self._mvn_dep.sample_array()
             for i in range(4):
-                sample = self._mvn_dep.sample_array()
                 depth[i] += sample[i]
         # check if the sensor is in dropout state
         if if_hit.count(False) >= self._num_beams_out_range_threshold:
@@ -263,15 +272,14 @@ class DVLsensor:
         if self._user_static_freq_flag:
             return self._dt
         else:
-            min_range = min(self.get_depth())
-            if min_range <= self._freq_dependent_range_bound[0]:
-                self._dt = 1 / self._freq_bound[1]
-            elif self._freq_dependent_range_bound[0] < min_range < self._freq_dependent_range_bound[1]:
-                # To avoid abrupt jumps at h_min and h_max, smooth the transitions with linear ramp
-                freq = self._freq_bound[1] - (self._freq_bound[1] - self._sound_speed/(2 * min_range))/(self._freq_dependent_range_bound[1] - self._freq_dependent_range_bound[0]) * (min_range - self._freq_dependent_range_bound[0])
-                self._dt = 1 / freq
-            else:
-                self._dt = 1 / self._freq_bound[0]
+            # Closest beam range drives the adaptive rate. np.nanmin ignores
+            # missed beams (NaN); all-missed -> NaN, which adaptive_sensor_dt
+            # maps to the slowest safe rate. (Pure ramp math is unit tested in
+            # utils/dvl_math.py.)
+            depths = np.asarray(self.get_depth(), dtype=float)
+            min_range = np.nanmin(depths) if np.any(np.isfinite(depths)) else float('nan')
+            self._dt = dvl_math.adaptive_sensor_dt(
+                min_range, self._freq_bound, self._freq_dependent_range_bound, self._sound_speed)
             return self._dt
         
     def get_beam_hit(self):
@@ -312,11 +320,9 @@ class DVLsensor:
         rot_m = quat_to_rot_matrix(world_orient)
         vel = rot_m.T @ world_vel
         if (self._mvn_vel.is_uncertain()):
-            sample = self._mvn_vel.sample_array()
-            for i in range(4):
-                for j in range(3):
-                    vel[j] += self._transform[j][i] * sample[i] 
-        
+            # vel += transform @ beam_noise (the old double loop, vectorised).
+            vel = vel + self._transform @ self._mvn_vel.sample_array()
+
         return vel
     
 
@@ -329,10 +335,14 @@ class DVLsensor:
         Returns:
             Union[np.ndarray, float]: Velocity vector if update is due, otherwise NaN.
         """
-        if self.get_dt() < physics_dt:
+        # Evaluate the (possibly adaptive) period once: in adaptive mode get_dt()
+        # runs a full get_depth() sweep of physics-view queries, so calling it
+        # twice per step doubled that cost.
+        sensor_dt = self.get_dt()
+        if sensor_dt < physics_dt:
             carb.log_warn(f'[{self._name}] Simulation physics_dt is larger than sensor_dt. Reduced to get_linear_vel().')
         self._elapsed_time_vel += physics_dt
-        if self._elapsed_time_vel >= self.get_dt():
+        if self._elapsed_time_vel >= sensor_dt:
             self._elapsed_time_vel = 0.0
             return self.get_linear_vel()
         else:
@@ -347,10 +357,12 @@ class DVLsensor:
         Returns:
             Union[list[float], float]: Depth measurements if update is due, otherwise NaN.
         """
-        if self.get_dt() < physics_dt:
+        # Evaluate the (possibly adaptive) period once -- see get_linear_vel_fd.
+        sensor_dt = self.get_dt()
+        if sensor_dt < physics_dt:
             carb.log_warn(f'[{self._name}] Simulation physics_dt is larger than sensor_dt. Reduced to get_depth().')
         self._elapsed_time_depth += physics_dt
-        if self._elapsed_time_depth >= self.get_dt():
+        if self._elapsed_time_depth >= sensor_dt:
             self._elapsed_time_depth = 0.0
             return self.get_depth()
         else:
