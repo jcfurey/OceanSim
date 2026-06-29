@@ -24,33 +24,35 @@ OceanSim's /clock.
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import Command, LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 
 
-def generate_launch_description():
-    urdf = LaunchConfiguration("urdf")
-    use_sim_time = LaunchConfiguration("use_sim_time")
-    return LaunchDescription([
-        DeclareLaunchArgument(
-            "urdf",
-            description="Path to the robot URDF -- the SAME file OceanSim imports "
-                        "/ publishes, so robot_state_publisher's TF matches."),
-        DeclareLaunchArgument("use_sim_time", default_value="true"),
+def _setup(context, *args, **kwargs):
+    # Read the URDF in Python rather than ParameterValue(Command(['cat ', urdf])).
+    # Command resolves to a single string that launch shlex-splits, so a path
+    # with a space would tokenize wrong and leave robot_description empty.
+    urdf_path = LaunchConfiguration("urdf").perform(context)
+    use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() == "true"
+    with open(urdf_path) as f:
+        robot_description = f.read()
+    return [
         # robot_state_publisher: URDF in as a parameter, /joint_states in (from
-        # OceanSim), TF out.
+        # OceanSim), TF out. Remap ITS /robot_description output away so OceanSim's
+        # latched TRANSIENT_LOCAL /robot_description is the single owner (rsp's TF
+        # is driven by the parameter, not the topic, so this is non-breaking).
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",
             output="screen",
             parameters=[{
-                "robot_description": ParameterValue(Command(["cat ", urdf]), value_type=str),
+                "robot_description": robot_description,
                 "use_sim_time": use_sim_time,
             }],
+            remappings=[("robot_description", "robot_state_publisher/robot_description")],
         ),
-        # RViz loads the model from the latched /robot_description topic.
+        # RViz loads the model from OceanSim's latched /robot_description topic.
         Node(
             package="rviz2",
             executable="rviz2",
@@ -58,4 +60,15 @@ def generate_launch_description():
             output="screen",
             parameters=[{"use_sim_time": use_sim_time}],
         ),
+    ]
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            "urdf",
+            description="Path to the robot URDF -- the SAME file OceanSim imports "
+                        "/ publishes, so robot_state_publisher's TF matches."),
+        DeclareLaunchArgument("use_sim_time", default_value="true"),
+        OpaqueFunction(function=_setup),
     ])

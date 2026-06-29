@@ -7,16 +7,19 @@ name: tests
 # ROS publishing) still need an on-hardware smoke test -- see tests/README.md.
 
 on:
+  # Only run push on the default branch; branch validation is covered by
+  # pull_request. (push and PR have different github.ref values, so the
+  # concurrency group below cannot dedupe a branch-with-open-PR -- restricting
+  # push avoids running the full matrix twice on every commit.)
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel superseded runs: a new push to a branch, or the push+PR pair on the
-# same ref, won't pile up redundant concurrent runs.
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
