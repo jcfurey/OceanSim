@@ -4,6 +4,7 @@ import omni.ui as ui
 import numpy as np
 from omni.replicator.core.scripts.functional import write_np
 import warp as wp
+import threading
 from isaacsim.oceansim.utils.ImagingSonar_kernels import *
 from isaacsim.oceansim.utils import sonar_scan_math
 
@@ -33,6 +34,8 @@ class ImagingSonarSensor(Camera):
                  gpu_point_filter: bool = False, # on-device point compaction; skips the
                                       # device->host->device round-trip. Self-heals to the
                                       # numpy path if the AOV outputs aren't on-device Warp arrays.
+                 async_compute: bool = False, # run the post-scan kernels + sonar_map readback on
+                                      # a worker thread so the sonar doesn't block the sim loop / odom.
                  ):
         
     
@@ -89,6 +92,7 @@ class ImagingSonarSensor(Camera):
         # Requested gpu_point_filter; applied in sonar_initialize (which resets the
         # live flag) so it survives (re)initialization.
         self._gpu_point_filter_init = gpu_point_filter
+        self._async_compute_init = async_compute
         # Acoustic carrier frequency of the modelled sonar (Hz). The Oculus M370s
         # is a 375 kHz single-frequency unit (Blueprint Subsea datasheet). This is
         # the value reported in ProjectedSonarImage.ping_info.frequency -- kept
@@ -199,6 +203,27 @@ class ImagingSonarSensor(Camera):
         # `sensor.gpu_point_filter = True` after sonar_initialize(), or pass
         # gpu_point_filter=True to the constructor (honored here).
         self.gpu_point_filter = self._gpu_point_filter_init
+
+        # Async compute worker (opt-in). scan() stays on the caller/main thread
+        # (it reads the render annotators, which is not thread-safe); the post-scan
+        # kernels + the sonar_map host readback run on this worker so they don't
+        # block the sim loop (and thus odom/imu). The worker only touches device
+        # buffers the main thread isn't using -- scan() is gated on _async_busy so
+        # it never overwrites scan_data mid-process.
+        self.async_compute = self._async_compute_init
+        self._async_busy = False
+        self._async_result = None
+        self._async_lock = threading.Lock()
+        self._async_scan_evt = threading.Event()
+        self._async_stop = False
+        self._async_params = {}
+        self._async_thread = None
+        if self.async_compute:
+            self._async_thread = threading.Thread(
+                target=self._async_worker, name=f"{self._name}_sonar_worker", daemon=True)
+            self._async_thread.start()
+            print(f"[{self._name}] async sonar compute enabled (worker thread started)", flush=True)
+
         self._gpu_out_pcl = None
         self._gpu_out_normals = None
         self._gpu_out_sem = None
@@ -572,6 +597,8 @@ class ImagingSonarSensor(Camera):
                         intensity_gain: float = 1.0, # scale intensity after normalization
                         central_peak: float = 2, # control the strength of the streak
                         central_std: float = 0.001, # control the spread of the streak
+                        _skip_scan: bool = False, # internal: worker has already run scan() on
+                                      # the main thread; run only the kernels on the live scan_data.
                         ):
         """Process raw scan data into a sonar image with configurable parameters.
 
@@ -594,7 +621,18 @@ class ImagingSonarSensor(Camera):
 
 
 
-        if self.scan():
+        if self.async_compute and not _skip_scan:
+            # Main thread: scan (reads annotators) + hand off to the worker; the
+            # heavy kernels + sonar_map readback run there. Returns immediately.
+            self._submit_scan_async(dict(
+                binning_method=binning_method, normalizing_method=normalizing_method,
+                query_prop=query_prop, attenuation=attenuation,
+                gau_noise_param=gau_noise_param, ray_noise_param=ray_noise_param,
+                intensity_offset=intensity_offset, intensity_gain=intensity_gain,
+                central_peak=central_peak, central_std=central_std))
+            return
+
+        if _skip_scan or self.scan():
             num_points = self.scan_data['pcl'].shape[0]
             # Reflectivity lookup (semantic id -> reflectivity). The mapping is a
             # pure function of (idToLabels, query_prop), which only changes when
@@ -805,13 +843,93 @@ class ImagingSonarSensor(Camera):
             self.backend.schedule(write_np, f'sonar_data_{self.id}.npy', data=self.sonar_map)
             print(f"[{self._name}] [{self.id}] Writing sonar data to {self.backend.output_dir}")
         
-        if self._viewport:
-            self._sonar_provider.set_bytes_data_from_gpu(self.make_sonar_image().ptr, 
+        if self._viewport and not self.async_compute:
+            # Skip in async mode: this pushes to the Isaac UI byte provider, which
+            # must not be touched from the worker thread. ROS consumers read the
+            # published sonar_map, not this in-Isaac viewport texture.
+            self._sonar_provider.set_bytes_data_from_gpu(self.make_sonar_image().ptr,
                                                     [self.sonar_map.shape[1], self.sonar_map.shape[0]])
             # self.backend.schedule(write_image, f'sonar_{self.id}.png', data = self.make_sonar_image())        
             
         self.id += 1
     
+
+    def _submit_scan_async(self, params):
+        """Main-thread half of async sonar: scan() (reads the annotators) then hand
+        the device-resident scan_data to the worker. Skips entirely while the worker
+        is still processing the previous scan, so scan_data is never overwritten
+        mid-process (which also self-throttles scans to the worker's throughput)."""
+        if self._async_busy:
+            return
+        if not self.scan():
+            return
+        self._async_params = params
+        self._async_busy = True
+        self._async_scan_evt.set()
+
+    def _async_worker(self):
+        """Worker half: run the post-scan kernels + sonar_map readback off the sim
+        loop. Re-enters make_sonar_data(_skip_scan=True) so the kernel path stays in
+        one place. Only touches device buffers the main thread isn't using (gated by
+        _async_busy) and the worker-owned result; never reads the annotators."""
+        while not self._async_stop:
+            if not self._async_scan_evt.wait(timeout=0.5):
+                continue
+            self._async_scan_evt.clear()
+            if self._async_stop:
+                break
+            try:
+                with wp.ScopedDevice(self._device):
+                    self.make_sonar_data(_skip_scan=True, **self._async_params)
+                    grid = self.sonar_map.numpy()
+                with self._async_lock:
+                    self._async_result = grid
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self._name}] async sonar worker error ({exc!r})", flush=True)
+            finally:
+                self._async_busy = False
+
+    def get_sonar_map_np(self):
+        """Host-side (n_range, n_azimuth, 3) sonar_map for the publisher. Async mode
+        returns the worker's latest readback (no GPU sync on the caller); sync mode
+        reads the device sonar_map directly. None if nothing has been produced yet."""
+        if getattr(self, 'async_compute', False):
+            with self._async_lock:
+                return self._async_result
+        sm = getattr(self, 'sonar_map', None)
+        if sm is None:
+            return None
+        return sm.numpy() if hasattr(sm, 'numpy') else np.asarray(sm)
+
+    def set_render_enabled(self, enabled: bool):
+        """Enable/disable this sonar camera's render-product updates. The sonar
+        raytrace is the dominant per-step render cost, but it only needs to render
+        at the scan cadence -- the runner disables it on non-scan steps so the sim
+        loop (physics + odom/imu + the GUI viewport) runs unblocked on those steps."""
+        rp = getattr(self, "_render_product", None)
+        if rp is None:
+            return
+        try:
+            rp.hydra_texture.set_updates_enabled(bool(enabled))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def ready_for_scan(self) -> bool:
+        """True when a new scan can be started. In async mode that means the worker
+        isn't still processing the previous scan (else rendering the sonar this step
+        would just be wasted -- the scan would be skipped)."""
+        if getattr(self, 'async_compute', False):
+            return not self._async_busy
+        return True
+
+    def stop_async(self):
+        """Stop the async worker thread (idempotent)."""
+        if getattr(self, '_async_thread', None) is None:
+            return
+        self._async_stop = True
+        self._async_scan_evt.set()
+        self._async_thread.join(timeout=2.0)
+        self._async_thread = None
 
     def make_sonar_image(self):
         """Convert processed sonar data to a viewable grayscale image.
@@ -914,6 +1032,9 @@ class ImagingSonarSensor(Camera):
             - Required for proper shutdown when done using the sensor
             - Also closes viewport window if one was created
         """
+        # Stop the async worker first so it isn't mid-kernel when the annotators /
+        # render product it reads through scan_data get torn down below.
+        self.stop_async()
         # If sonar_initialize() never ran (or raised mid-way), cameraParams_annot
         # won't exist; guard so close() on a half-initialized sensor doesn't raise
         # an AttributeError that masks the rest of the scenario teardown.

@@ -129,7 +129,15 @@ def load_config(args):
         # the scan (and unblock odom, which shares the sim loop) without losing
         # resolution. gpu_point_filter compacts points on-device (skips a host
         # round-trip; self-heals to the numpy path if outputs aren't on-device).
+        # async_compute runs the post-scan kernels + readback on a worker thread so
+        # the sonar doesn't block the sim loop (frees odom/imu); scan() stays on the
+        # sim thread. render_rate caps how often the sonar CAMERA renders (the
+        # dominant per-step cost): its render product is disabled on the other steps
+        # so physics/odom/GUI run unblocked. <=0 = no cap (async worker throughput
+        # is the real limit). With async_compute, render is also gated on the worker
+        # being idle so no rendered frame is wasted.
         "sonar_params": {"hori_res": 2500, "gpu_point_filter": True,
+                         "async_compute": False, "render_rate": 0.0,
                          "range_res": 0.005, "angular_res": 0.25},
         # Physics simulation device: None -> Isaac default (GPU/cuda:0). Set to
         # "cpu" to run PhysX on the CPU -- needed when the host NVIDIA driver is too
@@ -426,13 +434,15 @@ def main(argv):
             sp = cfg.get("sonar_params", {})
             _hori_res = int(sp.get("hori_res", 2500))
             _gpu_filter = bool(sp.get("gpu_point_filter", True))
+            _async = bool(sp.get("async_compute", False))
             print("[oceansim_ros2] sonar backend: oceansim (custom imaging sonar) "
-                  f"hori_res={_hori_res} gpu_point_filter={_gpu_filter}")
+                  f"hori_res={_hori_res} gpu_point_filter={_gpu_filter} async_compute={_async}")
             sonar = ImagingSonarSensor(
                 range_res=sp.get("range_res", 0.005),
                 angular_res=sp.get("angular_res", 0.25),
                 hori_res=_hori_res,
                 gpu_point_filter=_gpu_filter,
+                async_compute=_async,
                 **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
@@ -541,9 +551,32 @@ def main(argv):
     # The camera and imaging sonar both read Isaac render products, so rendering
     # must run when either is active even in headless mode.
     need_render = (not cfg["headless"]) or (cam is not None) or (sonar is not None)
-    print("[oceansim_ros2] simulation running; publishing ROS2 sensor data")
+
+    # Sonar render-cadence gating (opt-in via render_rate>0; OFF by default).
+    # KNOWN-LIMITED: the only per-step lever wired here is
+    # render_product.hydra_texture.set_updates_enabled(), which stops the sonar
+    # AOV readback (so scan() gets no data) WITHOUT removing the underlying RTX
+    # raytrace from the GPU pipeline -- so it breaks the sonar and does NOT free
+    # odom (the loop is GPU-render-bound; see nvidia-smi 100%). Left dormant until a
+    # lever that actually drops the sonar render product from the per-step GPU
+    # pipeline (with a re-enable warmup for render latency) is wired. async alone
+    # does NOT force it on.
+    _sonar_render_rate = float(cfg.get("sonar_params", {}).get("render_rate", 0.0) or 0.0)
+    _sonar_render_period = (1.0 / _sonar_render_rate) if _sonar_render_rate > 0 else 0.0
+    _sonar_gating = sonar is not None and _sonar_render_period > 0.0
+    _last_sonar_scan = -1e9
+    print("[oceansim_ros2] simulation running; publishing ROS2 sensor data"
+          + (f" (sonar render gated, cap={_sonar_render_rate or 'worker'} Hz)"
+             if _sonar_gating else ""))
     try:
         while sim_app.is_running() and running["flag"]:
+            # Decide -- before the step that would render it -- whether to render +
+            # scan the sonar this iteration.
+            sonar_tick = None
+            if _sonar_gating:
+                sonar_tick = ((prev_time - _last_sonar_scan) >= _sonar_render_period
+                              and sonar.ready_for_scan())
+                sonar.set_render_enabled(sonar_tick)
             world.step(render=need_render)
             if world.is_playing():
                 now = world.current_time
@@ -554,7 +587,9 @@ def main(argv):
                 if step <= 0.0:
                     step = fixed_dt    # first tick / after a reset
                 prev_time = now
-                scenario.update_scenario(step, now)
+                if sonar_tick:
+                    _last_sonar_scan = now
+                scenario.update_scenario(step, now, sonar_tick=sonar_tick)
                 publisher.publish(now)
     finally:
         print("[oceansim_ros2] shutting down")

@@ -193,7 +193,7 @@ class MHL_Sensor_Example_Scenario():
         self._time = 0.0
 
 
-    def update_scenario(self, step: float, sim_time: float = None):
+    def update_scenario(self, step: float, sim_time: float = None, sonar_tick: bool = None):
 
 
         if not self._running_scenario:
@@ -206,10 +206,15 @@ class MHL_Sensor_Example_Scenario():
         self._sensor_accum += step
         do_sensors = (self._sensor_update_period <= 0.0
                       or self._sensor_accum >= self._sensor_update_period)
+        # The runner can drive a separate sonar render cadence (sonar_tick): only
+        # scan on the steps where the sonar render product was enabled, so the
+        # expensive sonar render isn't wasted. Falls back to the shared do_sensors
+        # throttle when sonar_tick is None.
+        do_sonar = do_sensors if sonar_tick is None else bool(sonar_tick)
+        if do_sonar and self._sonar is not None:
+            self._sonar.make_sonar_data()
         if do_sensors:
             self._sensor_accum = 0.0
-            if self._sonar is not None:
-                self._sonar.make_sonar_data()
             if self._cam is not None:
                 # Pass the authoritative sim time (headless runner) so the camera
                 # rate-gates + stamps on the same clock as the other publishers;

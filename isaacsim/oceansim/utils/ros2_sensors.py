@@ -603,10 +603,17 @@ class OceanSimSensorPublisher:
         from marine_acoustic_msgs.msg import (
             ProjectedSonarImage, PingInfo, SonarImageData)
 
-        sonar_map = getattr(self._sonar, "sonar_map", None)
-        if sonar_map is None:
+        # get_sonar_map_np() returns a host-side grid: in async mode it's the
+        # worker's latest readback (no GPU sync on this sim-thread publish); in
+        # sync mode it reads the device sonar_map. Fall back for backends without it.
+        if hasattr(self._sonar, "get_sonar_map_np"):
+            grid = self._sonar.get_sonar_map_np()
+        else:
+            sonar_map = getattr(self._sonar, "sonar_map", None)
+            grid = (sonar_map.numpy() if hasattr(sonar_map, "numpy")
+                    else np.asarray(sonar_map) if sonar_map is not None else None)
+        if grid is None:
             return
-        grid = sonar_map.numpy() if hasattr(sonar_map, "numpy") else np.asarray(sonar_map)
         # (n_range, n_azimuth, 3) vec3 grid; channel 2 is intensity in [0, 1].
         if grid.ndim != 3 or grid.shape[2] < 3 or grid.size == 0:
             return
