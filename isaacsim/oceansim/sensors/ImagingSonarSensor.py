@@ -378,7 +378,9 @@ class ImagingSonarSensor(Camera):
                               self._gpu_counter, self._gpu_out_pcl,
                               self._gpu_out_normals, self._gpu_out_sem],
                       device=self._device)
-            wp.synchronize()
+            # counter.numpy() already does a blocking default-stream device->host
+            # copy that orders this readback, so a global wp.synchronize() here
+            # only adds an unnecessary all-device stall on the sim thread.
             n_valid = int(self._gpu_counter.numpy()[0])
 
             if not self._scan_logged:
@@ -672,8 +674,10 @@ class ImagingSonarSensor(Camera):
             self.binned_intensity = self.bin_sum
 
 
-        self.range_dependent_ray_noise.zero_()
-        self.gau_noise.zero_()
+        # gau_noise / range_dependent_ray_noise are fully overwritten every frame
+        # by normal_2d / range_dependent_rayleigh_2d (which write every cell), so
+        # zeroing them first is redundant. sonar_map.zero_() is kept: an
+        # unrecognized normalizing_method runs no map kernel, so it must start clean.
         self.sonar_map.zero_()
 
         # Calculate multiplicative gaussian noise
@@ -807,7 +811,10 @@ class ImagingSonarSensor(Camera):
             - Used internally for viewport display
             - Image dimensions match the sonar's polar binning resolution
         """
-        self.sonar_image.zero_()
+        # make_sonar_image writes all four channels (RGB + A=255) for every pixel
+        # via a bijective column map and never reads prior contents, so zeroing
+        # the buffer first is redundant. (The init/reset zero in sonar_initialize
+        # is untouched.)
         wp.launch(
             dim=self.sonar_map.shape,
             kernel=make_sonar_image,

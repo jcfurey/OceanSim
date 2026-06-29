@@ -19,6 +19,7 @@ except ImportError as e:
 class MHL_Sensor_Example_Scenario():
     def __init__(self):
         self._rob = None
+        self._rob_rigid = None
         self._sonar = None
         self._cam = None
         self._DVL = None
@@ -45,6 +46,10 @@ class MHL_Sensor_Example_Scenario():
 
     def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode):
         self._rob = rob
+        # Cache the rigid-body wrapper once (the prim never changes); the
+        # Straight-line control path built a fresh SingleRigidPrim -- prim-path
+        # resolution + PhysX view setup -- every physics step.
+        self._rob_rigid = SingleRigidPrim(prim_path=get_prim_path(rob)) if rob is not None else None
         self._sonar = sonar
         self._cam = cam
         self._DVL = DVL
@@ -223,7 +228,7 @@ class MHL_Sensor_Example_Scenario():
             else:
                 print('Waypoints finished')                
         elif self._ctrl_mode=="Straight line":
-            SingleRigidPrim(prim_path=get_prim_path(self._rob)).set_linear_velocity(np.array([0.5,0,0])) 
+            self._rob_rigid.set_linear_velocity(np.array([0.5,0,0])) 
         elif self._ctrl_mode=="ROS control":
             if self._ros2_control_receiver is not None:
                 self._ros2_control_receiver.update_control()

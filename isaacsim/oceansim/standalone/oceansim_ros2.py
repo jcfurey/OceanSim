@@ -369,10 +369,14 @@ def main(argv):
             print(f"[oceansim_ros2] could not read URDF for sensor mounts: {e}")
 
     def _mount(kind, fallback_mount):
-        tr, rpy = urdf_parse.sensor_mount_or(
-            urdf_text, kind, fallback_mount.translation, fallback_mount.rpy_deg)
-        if urdf_text is not None and urdf_parse.sensor_mount(urdf_text, kind) is not None:
+        # Parse the URDF once (sensor_mount_or also parses, so the old extra
+        # sensor_mount() call just to gate the log re-parsed the whole URDF).
+        m = urdf_parse.sensor_mount(urdf_text, kind) if urdf_text is not None else None
+        if m is not None:
+            tr, rpy = m
             print(f"[oceansim_ros2] {kind} mount from URDF link -> {tr}")
+        else:
+            tr, rpy = fallback_mount.translation, fallback_mount.rpy_deg
         return np.array(tr, dtype=float), np.array(rpy, dtype=float)
 
     # ---- sensors (mounts from the URDF if present, else the platform spec) -
@@ -499,7 +503,8 @@ def main(argv):
     signal.signal(signal.SIGTERM, _stop)
 
     world.play()
-    dt = cfg["physics_dt"]
+    fixed_dt = cfg["physics_dt"]
+    prev_time = world.current_time
     # The camera and imaging sonar both read Isaac render products, so rendering
     # must run when either is active even in headless mode.
     need_render = (not cfg["headless"]) or (cam is not None) or (sonar is not None)
@@ -508,8 +513,16 @@ def main(argv):
         while sim_app.is_running() and running["flag"]:
             world.step(render=need_render)
             if world.is_playing():
-                scenario.update_scenario(dt, world.current_time)
-                publisher.publish(world.current_time)
+                now = world.current_time
+                # Pass the ACTUAL sim-time advance (= rendering_dt when it differs
+                # from physics_dt), so the scenario's sensor-compute throttle is
+                # rate-correct. Equals physics_dt at the default config.
+                step = now - prev_time
+                if step <= 0.0:
+                    step = fixed_dt    # first tick / after a reset
+                prev_time = now
+                scenario.update_scenario(step, now)
+                publisher.publish(now)
     finally:
         print("[oceansim_ros2] shutting down")
         # Best-effort teardown: a failure in publisher.close() or
