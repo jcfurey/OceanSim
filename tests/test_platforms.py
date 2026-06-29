@@ -117,3 +117,51 @@ def test_resolve_missing_file_reports_reason(p, tmp_path):
 def test_resolve_nothing_available(p):
     text, src = p.resolve_robot_description()
     assert text is None and src == "none"
+
+
+# --- resolve_robot_source (USD vs URDF import) -----------------------------
+
+def _touch(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("x")
+    return str(path)
+
+
+def test_source_prefers_existing_usd(p, tmp_path):
+    usd = _touch(tmp_path / "Bluerov" / "BROV_low.usd")
+    src, why = p.resolve_robot_source(asset_root=str(tmp_path), platform="bluerov2")
+    assert why == "ok" and src.kind == "usd" and src.path == usd
+
+
+def test_source_falls_back_to_urdf_when_no_usd(p, tmp_path):
+    # only a URDF on disk -> "I only have a URDF" resolves to the URDF import.
+    urdf = _touch(tmp_path / "Bluerov" / "bluerov2.urdf")
+    src, why = p.resolve_robot_source(asset_root=str(tmp_path), platform="bluerov2")
+    assert why == "ok" and src.kind == "urdf" and src.path == urdf
+
+
+def test_source_prefer_urdf_when_both_exist(p, tmp_path):
+    _touch(tmp_path / "Bluerov" / "BROV_low.usd")
+    urdf = _touch(tmp_path / "Bluerov" / "bluerov2.urdf")
+    src, why = p.resolve_robot_source(asset_root=str(tmp_path), platform="bluerov2",
+                                      prefer="urdf")
+    assert src.kind == "urdf" and src.path == urdf
+
+
+def test_source_explicit_urdf_override_wins(p, tmp_path):
+    _touch(tmp_path / "Bluerov" / "BROV_low.usd")          # platform usd exists
+    custom = _touch(tmp_path / "custom.urdf")
+    src, why = p.resolve_robot_source(asset_root=str(tmp_path), platform="bluerov2",
+                                      urdf_path=custom)
+    assert src.kind == "urdf" and src.path == custom
+
+
+def test_source_missing_reports_paths(p, tmp_path):
+    src, why = p.resolve_robot_source(asset_root=str(tmp_path), platform="bluerov2")
+    assert src is None and why.startswith("missing:")
+    assert "BROV_low.usd" in why and "bluerov2.urdf" in why
+
+
+def test_source_nothing_configured(p):
+    src, why = p.resolve_robot_source()
+    assert src is None and why == "none"

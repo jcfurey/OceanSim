@@ -69,9 +69,13 @@ def parse_args(argv):
     p.add_argument("--platform", default=None,
                    help="Vehicle platform to import (e.g. 'bluerov2', "
                         "'deeptrekker_revolution'). See utils.platforms.")
+    p.add_argument("--urdf", dest="urdf", default=None,
+                   help="Import the robot from this URDF (creates the articulation; "
+                        "used when you have a URDF but no prebuilt USD). It is also "
+                        "published on /robot_description unless --robot-description is set.")
     p.add_argument("--robot-description", dest="robot_description", default=None,
-                   help="Path to a URDF to latch on /robot_description, "
-                        "overriding the platform's default robot description.")
+                   help="Path to a URDF to latch on /robot_description only, "
+                        "without changing the imported robot.")
     p.add_argument("--control-mode", default=None,
                    choices=["No control", "Straight line", "Waypoints",
                             "Manual control", "ROS control"],
@@ -146,8 +150,10 @@ def load_config(args):
         cfg["asset_path"] = args.asset_path
     if args.platform is not None:
         cfg["platform"] = args.platform
+    if args.urdf is not None:
+        cfg.setdefault("robot", {})["urdf_path"] = args.urdf
     if args.robot_description is not None:
-        cfg.setdefault("robot", {})["urdf_path"] = args.robot_description
+        cfg.setdefault("robot", {})["robot_description_path"] = args.robot_description
     if args.control_mode is not None:
         cfg["control_mode"] = args.control_mode
     if args.sonar_backend is not None:
@@ -290,21 +296,52 @@ def main(argv):
     # Each field falls back to the platform spec unless explicitly overridden in
     # cfg["robot"]. (For bluerov2 the spec values equal the old hardcoded ones,
     # so this is behaviour-preserving.)
-    usd_path = rob_cfg.get("usd_path") or spec.usd_path(assets)
-    mass = float(rob_cfg.get("mass", spec.mass))
     lin_d = float(rob_cfg.get("linear_damping", spec.linear_damping))
     ang_d = float(rob_cfg.get("angular_damping", spec.angular_damping))
-    collision = rob_cfg.get("collision_approximation", spec.collision_approximation)
     spawn = np.array(rob_cfg.get("translation", spec.spawn_translation), dtype=float)
 
-    add_reference_to_stage(usd_path=usd_path, prim_path=robot_path)
-    rob_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_path))
-    rob_rb.CreateDisableGravityAttr(True)
-    rob_rb.GetLinearDampingAttr().Set(lin_d)
-    rob_rb.GetAngularDampingAttr().Set(ang_d)
-    rob_collider = SingleGeometryPrim(prim_path=robot_path, collision=True)
-    rob_collider.set_collision_approximation(collision)
-    SingleRigidPrim(prim_path=robot_path, mass=mass, translation=spawn)
+    # USD or URDF? An explicit robot.usd_path / robot.urdf_path wins, else the
+    # platform's own assets are used (prefer "usd", or set robot.prefer_source
+    # = "urdf"). Resolves to a URDF automatically if that's all that exists.
+    src, why = platforms.resolve_robot_source(
+        asset_root=assets, platform=spec,
+        usd_path=rob_cfg.get("usd_path"), urdf_path=rob_cfg.get("urdf_path"),
+        prefer=rob_cfg.get("prefer_source", "usd"))
+    if src is None:
+        raise FileNotFoundError(
+            f"[oceansim_ros2] no robot asset for platform '{spec.name}' ({why}). "
+            f"Provide a USD or URDF under the asset root, or set robot.usd_path / "
+            f"robot.urdf_path.")
+
+    if src.kind == "urdf":
+        # Import the URDF (creates the articulation). The URDF already defines
+        # inertials / joints / collisions, so do NOT override mass or collision
+        # here -- only match the underwater setup (no gravity, damping, spawn).
+        from isaacsim.oceansim.utils import urdf_import
+        print(f"[oceansim_ros2] importing URDF -> {src.path}")
+        robot_path = urdf_import.import_urdf_to_stage(
+            src.path, fix_base=False,
+            merge_fixed_joints=rob_cfg.get("merge_fixed_joints", True))
+        rob_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_path))
+        rob_rb.CreateDisableGravityAttr(True)
+        try:
+            rob_rb.GetLinearDampingAttr().Set(lin_d)
+            rob_rb.GetAngularDampingAttr().Set(ang_d)
+        except Exception:  # noqa: BLE001 - articulation root may differ
+            pass
+        SingleRigidPrim(prim_path=robot_path, translation=spawn)
+    else:
+        print(f"[oceansim_ros2] referencing USD -> {src.path}")
+        mass = float(rob_cfg.get("mass", spec.mass))
+        collision = rob_cfg.get("collision_approximation", spec.collision_approximation)
+        add_reference_to_stage(usd_path=src.path, prim_path=robot_path)
+        rob_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_path))
+        rob_rb.CreateDisableGravityAttr(True)
+        rob_rb.GetLinearDampingAttr().Set(lin_d)
+        rob_rb.GetAngularDampingAttr().Set(ang_d)
+        rob_collider = SingleGeometryPrim(prim_path=robot_path, collision=True)
+        rob_collider.set_collision_approximation(collision)
+        SingleRigidPrim(prim_path=robot_path, mass=mass, translation=spawn)
     robot_prim = get_prim_at_path(robot_path)
 
     def _mount_quat(mount):
@@ -366,7 +403,7 @@ def main(argv):
         urdf_text, src = platforms.resolve_robot_description(
             asset_root=assets, platform=spec,
             inline=rob_cfg.get("robot_description"),
-            path=rob_cfg.get("urdf_path"))
+            path=rob_cfg.get("robot_description_path") or rob_cfg.get("urdf_path"))
         if urdf_text:
             pub_cfg["robot_description"] = urdf_text
             print(f"[oceansim_ros2] robot_description from {src} "

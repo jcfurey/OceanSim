@@ -20,6 +20,7 @@ Pure data + stdlib only (no Isaac/USD imports) so it is unit tested in CI.
 """
 
 import os
+from collections import namedtuple
 from dataclasses import dataclass, field
 
 
@@ -147,6 +148,58 @@ def get_platform(name):
             f"Unknown OceanSim platform {name!r}. Available platforms: "
             f"{available_platforms()} (aliases: {sorted(_ALIASES)}).")
     return PLATFORMS[key]
+
+
+# How to bring a vehicle onto the stage: from a prebuilt USD (add_reference) or
+# by importing a URDF (Isaac's URDF importer creates the articulation). ``kind``
+# is "usd" or "urdf"; ``path`` is the absolute file.
+RobotSource = namedtuple("RobotSource", ["kind", "path"])
+
+
+def resolve_robot_source(asset_root=None, platform=None,
+                         usd_path=None, urdf_path=None, prefer="usd"):
+    """Decide what to load a vehicle from -- a prebuilt USD or a URDF to import.
+
+    Precedence: an explicit ``usd_path`` then ``urdf_path`` (when the file
+    exists) always win; otherwise the platform's own ``usd_subpath`` /
+    ``urdf_subpath`` under ``asset_root`` are tried, in the order set by
+    ``prefer`` (``"usd"`` default, or ``"urdf"`` if you only have / prefer a
+    URDF). Only paths whose file actually exists are considered, so "I only have
+    a URDF" resolves to the URDF automatically even with the default preference.
+
+    Returns ``(RobotSource, "ok")`` or ``(None, reason)`` where reason is
+    ``"none"`` (nothing configured) or ``"missing:<a>,<b>"`` (configured assets
+    don't exist) -- so the caller can raise a clear error instead of feeding a
+    bad path to the stage loader. Pure: only stats files, never loads them.
+    """
+    tried = []
+
+    def _ok(path):
+        if not path:
+            return False
+        tried.append(path)
+        return os.path.isfile(path)
+
+    if _ok(usd_path):
+        return RobotSource("usd", usd_path), "ok"
+    if _ok(urdf_path):
+        return RobotSource("urdf", urdf_path), "ok"
+
+    spec = None
+    if platform is not None:
+        spec = platform if isinstance(platform, PlatformSpec) else get_platform(platform)
+    if spec is not None and asset_root:
+        spec_usd = spec.usd_path(asset_root)
+        spec_urdf = spec.urdf_path(asset_root)
+        order = [("urdf", spec_urdf), ("usd", spec_usd)] if prefer == "urdf" \
+            else [("usd", spec_usd), ("urdf", spec_urdf)]
+        for kind, path in order:
+            if _ok(path):
+                return RobotSource(kind, path), "ok"
+
+    if not tried:
+        return None, "none"
+    return None, "missing:" + ",".join(tried)
 
 
 def resolve_robot_description(asset_root=None, platform=None, inline=None, path=None):
