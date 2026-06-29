@@ -44,7 +44,7 @@ class MHL_Sensor_Example_Scenario():
         self._enable_ros2_control = True
         self._ros2_control_mode = "velocity control"
 
-    def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode):
+    def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode, sensor_viewports=True):
         self._rob = rob
         # The rigid-body wrapper is created LAZILY on first use in update_scenario
         # (after world.play()), NOT here. A SingleRigidPrim (physics tensor view)
@@ -61,10 +61,15 @@ class MHL_Sensor_Example_Scenario():
         self._DVL = DVL
         self._baro = baro
         self._ctrl_mode = ctrl_mode
+        # sensor_viewports=False skips the per-sensor GUI windows (sonar + UW camera)
+        # AND their per-frame set_bytes_data_from_gpu readback, while still rendering
+        # the AOVs for ROS publishing and keeping the main Isaac viewport. (Manually
+        # closing the windows in the UI does NOT stop the readback -- the _viewport
+        # flag stays set -- so this is the way to actually drop that GPU work.)
         if self._sonar is not None:
-            self._sonar.sonar_initialize(include_unlabelled=True)
+            self._sonar.sonar_initialize(include_unlabelled=True, viewport=sensor_viewports)
         if self._cam is not None:
-            self._cam.initialize()
+            self._cam.initialize(viewport=sensor_viewports)
         if self._DVL is not None:
             self._DVL_reading = [0.0, 0.0, 0.0]
         if self._baro is not None:

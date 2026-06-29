@@ -118,6 +118,10 @@ def load_config(args):
         "platform": "bluerov2",
         "robot": {},
         "sensors": {"sonar": True, "camera": True, "dvl": True, "baro": True},
+        # Per-sensor GUI windows (sonar + UW camera viewports). False also skips
+        # their per-frame set_bytes_data_from_gpu readback; AOVs still render for ROS
+        # and the main Isaac viewport stays. (Default True preserves prior behavior.)
+        "sensor_viewports": True,
         # Sonar backend: "oceansim" = custom imaging sonar (Camera + pointcloud
         # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
         # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
@@ -464,7 +468,8 @@ def main(argv):
     # ---- scenario + sensor publisher --------------------------------------
     world.reset()
     scenario = MHL_Sensor_Example_Scenario()
-    scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"])
+    scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"],
+                            sensor_viewports=bool(cfg.get("sensor_viewports", True)))
     # Throttle the heavy sensor compute to sensor_compute_rate (0 = every step).
     _scr = float(cfg.get("sensor_compute_rate", 0.0) or 0.0)
     scenario._sensor_update_period = (1.0 / _scr) if _scr > 0 else 0.0
