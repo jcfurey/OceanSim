@@ -100,6 +100,20 @@ Calibration gaps (all in `RtxAcousticSensor._build_acoustic_attributes` +
    (still RT-core, so far cheaper than the Camera backend) is unknown until capture
    runs. Only then are the geometry/beamforming items below testable.
 
+   UPDATE (headless test, 2026-06-29): running rtx_acoustic with OCEANSIM_GUI=false
+   did NOT fix capture -- still no `FIRST VALID` / `writer frames`, and the
+   `tickRateInHz: 0` + `failed to create Hydra Engine thread` warnings persist
+   headless. So it is NOT a GUI/viewport conflict; the acoustic sensor's hydra
+   engine ticks at 0 regardless (created with tick_rate=30 -- the rate isn't
+   reaching the engine), so the render product never renders. This is a deeper
+   experimental-API integration issue (likely needs rep.orchestrator driving the
+   SDG, an explicit render-product/tick wiring, or an Isaac fix) -- uncertain,
+   multi-cycle. PRAGMATIC ALTERNATIVE: `rtx_lidar` via the STANDARD, battle-tested
+   `isaacsim.sensors.rtx` RTX-Lidar API (not the experimental one) is far more
+   likely to capture cleanly under `world.step` + reuses the validated geometric
+   binning -- it is probably the faster route to a working fast sonar, with
+   rtx_acoustic as a later physical-fidelity track once its capture is solved.
+
 1. **Receiver array** — currently 8 placeholder elements at 2 cm spacing across the
    FOV. Replace with the real Oculus receiver geometry (element count + spacing);
    this sets the achievable azimuth resolution.
