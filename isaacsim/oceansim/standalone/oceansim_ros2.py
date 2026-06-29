@@ -122,6 +122,15 @@ def load_config(args):
         # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
         # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
         "sonar_backend": "oceansim",
+        # Imaging-sonar tuning (oceansim backend). range_res (m) + angular_res
+        # (deg) set the OUTPUT image resolution (range bins x beams). hori_res is
+        # the raytrace SUPERSAMPLING (vert auto = hori_res/AR); it drives compute
+        # (~hori_res^2 points) but NOT output resolution -- lower it to speed up
+        # the scan (and unblock odom, which shares the sim loop) without losing
+        # resolution. gpu_point_filter compacts points on-device (skips a host
+        # round-trip; self-heals to the numpy path if outputs aren't on-device).
+        "sonar_params": {"hori_res": 2500, "gpu_point_filter": True,
+                         "range_res": 0.005, "angular_res": 0.25},
         # Physics simulation device: None -> Isaac default (GPU/cuda:0). Set to
         # "cpu" to run PhysX on the CPU -- needed when the host NVIDIA driver is too
         # new for Isaac 6.0.1's bundled CUDA (e.g. driver 595.80 / CUDA 13.2 leaves
@@ -335,10 +344,15 @@ def main(argv):
             f"robot.urdf_path.")
 
     if src.kind == "urdf":
-        # Import the URDF (creates the articulation). The URDF already defines
-        # inertials / joints / collisions, so do NOT override mass or collision
-        # here -- only match the underwater setup (no gravity, damping, spawn).
+        # Import the URDF (creates the articulation). Our staged platform URDFs
+        # carry joints + (visual-derived) collisions but NO <inertial>, so set the
+        # base body's mass to the platform figure -- without it PhysX assigns an
+        # invalid/negative mass to the root. urdf_import's link_density gives the
+        # other links a valid geometry-based mass. Otherwise just match the
+        # underwater setup (no gravity, damping, spawn).
         from isaacsim.oceansim.utils import urdf_import
+        from pxr import UsdPhysics
+        mass = float(rob_cfg.get("mass", spec.mass))
         print(f"[oceansim_ros2] importing URDF -> {src.path}")
         robot_path = urdf_import.import_urdf_to_stage(
             src.path, fix_base=False,
@@ -350,6 +364,7 @@ def main(argv):
             rob_rb.GetAngularDampingAttr().Set(ang_d)
         except Exception:  # noqa: BLE001 - articulation root may differ
             pass
+        UsdPhysics.MassAPI.Apply(get_prim_at_path(robot_path)).GetMassAttr().Set(mass)
         SingleRigidPrim(prim_path=robot_path, translation=spawn)
     else:
         print(f"[oceansim_ros2] referencing USD -> {src.path}")
@@ -408,9 +423,17 @@ def main(argv):
                 range_res=0.005, angular_res=0.25, **_sonar_xform)
         else:
             from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
-            print("[oceansim_ros2] sonar backend: oceansim (custom imaging sonar)")
+            sp = cfg.get("sonar_params", {})
+            _hori_res = int(sp.get("hori_res", 2500))
+            _gpu_filter = bool(sp.get("gpu_point_filter", True))
+            print("[oceansim_ros2] sonar backend: oceansim (custom imaging sonar) "
+                  f"hori_res={_hori_res} gpu_point_filter={_gpu_filter}")
             sonar = ImagingSonarSensor(
-                range_res=0.005, angular_res=0.25, hori_res=4000, **_sonar_xform)
+                range_res=sp.get("range_res", 0.005),
+                angular_res=sp.get("angular_res", 0.25),
+                hori_res=_hori_res,
+                gpu_point_filter=_gpu_filter,
+                **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
         _cam_translation, _ = _mount("camera", spec.camera_mount)

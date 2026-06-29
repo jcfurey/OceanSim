@@ -90,10 +90,22 @@ _BLUEROV2 = PlatformSpec(
 # DeepTrekker REVOLUTION: 26 kg in air, 717 x 440 x 235 mm, 6 thrusters, 305 m
 # rated (Deep Trekker REVOLUTION spec sheet). Mass is the real in-air figure;
 # damping is a tunable water-drag proxy (PhysX has no hydrodynamics model), set a
-# bit higher than the BlueROV2 to reflect the larger, heavier frame. The mount
-# poses are sensible defaults for the larger hull and should be trimmed to the
-# actual USD geometry. Ship the asset at <asset_root>/DeepTrekker/revolution.usd
-# (or override robot.usd_path in config).
+# bit higher than the BlueROV2 to reflect the larger, heavier frame.
+#
+# The sensor mounts are taken from the ROS-stack URDF (description_platform_
+# deeptrekker_revolution + settings_erdc/urdf/sensors.urdf.xacro), expressed in
+# base_link at pivot_head angle 0, so the sim places sensors where
+# robot_state_publisher's TF tree expects them:
+#   sonar:  base->pivot_head (0.215,0,0) + Oculus mount (0.0625,0,0.04, pitch 30)
+#           = (0.2775,0,0.04) pitch 30. NOTE the real sonar rides the articulated
+#           pivot_head (revolute joint); this static mount is exact only at angle 0.
+#   dvl:    Waterlinked A50 at (-0.209,0,-0.06).
+#   camera: child of the sonar connection link, ~(0.2675,0,0.0227).
+# These act as FALLBACKS: when the robot is imported from revolution.urdf the
+# runner reads each mount from the URDF directly (urdf_parse). The "camera" link
+# matches by name so it is read live; the sonar/dvl frames are slashed
+# (sonar0/..., dvl0/...) and don't match urdf_parse's bare-name lookup, so those
+# two use the values below.
 _DEEPTREKKER_REVOLUTION = PlatformSpec(
     name="deeptrekker_revolution",
     usd_subpath=os.path.join("DeepTrekker", "revolution.usd"),
@@ -102,9 +114,9 @@ _DEEPTREKKER_REVOLUTION = PlatformSpec(
     angular_damping=15.0,
     collision_approximation="boundingCube",
     spawn_translation=(-2.0, 0.0, -0.8),
-    sonar_mount=SensorMount((0.35, 0.0, 0.1), (0.0, 45.0, 0.0)),
-    camera_mount=SensorMount((0.35, 0.0, 0.0)),
-    dvl_mount=SensorMount((0.0, 0.0, -0.12)),
+    sonar_mount=SensorMount((0.2775, 0.0, 0.04), (0.0, 30.0, 0.0)),
+    camera_mount=SensorMount((0.2675, 0.0, 0.0227)),
+    dvl_mount=SensorMount((-0.209, 0.0, -0.06)),
     description="Deep Trekker REVOLUTION (mid-size inspection ROV, 26 kg, 6 thrusters).",
     urdf_subpath=os.path.join("DeepTrekker", "revolution.urdf"),
 )

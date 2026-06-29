@@ -28,8 +28,11 @@ class ImagingSonarSensor(Camera):
                  hori_fov: float = 130.0, # deg
                  vert_fov: float = 20.0, # deg
                  angular_res: float = 0.5, # deg
-                 hori_res: int = 3000 # isaac camera render product only accepts square pixel, 
-                                      # for now vertical res is automatically set with ratio of hori_fov vs.vert_fov 
+                 hori_res: int = 3000, # isaac camera render product only accepts square pixel,
+                                      # for now vertical res is automatically set with ratio of hori_fov vs.vert_fov
+                 gpu_point_filter: bool = False, # on-device point compaction; skips the
+                                      # device->host->device round-trip. Self-heals to the
+                                      # numpy path if the AOV outputs aren't on-device Warp arrays.
                  ):
         
     
@@ -83,6 +86,9 @@ class ImagingSonarSensor(Camera):
         self.vert_fov = vert_fov # degree (vert_fov is 20 degrees in datasheet)
         self.angular_res = angular_res # degree (datasheet is 2 deg)
         self.hori_res= hori_res
+        # Requested gpu_point_filter; applied in sonar_initialize (which resets the
+        # live flag) so it survives (re)initialization.
+        self._gpu_point_filter_init = gpu_point_filter
         # Acoustic carrier frequency of the modelled sonar (Hz). The Oculus M370s
         # is a 375 kHz single-frequency unit (Blueprint Subsea datasheet). This is
         # the value reported in ProjectedSonarImage.ping_info.frequency -- kept
@@ -190,8 +196,9 @@ class ImagingSonarSensor(Camera):
         # self._device can only be confirmed on hardware. So it self-heals --
         # if the outputs are not on-device Warp arrays (or anything throws) it
         # disables itself and falls back to the proven numpy path. Enable with
-        # `sensor.gpu_point_filter = True` after sonar_initialize().
-        self.gpu_point_filter = False
+        # `sensor.gpu_point_filter = True` after sonar_initialize(), or pass
+        # gpu_point_filter=True to the constructor (honored here).
+        self.gpu_point_filter = self._gpu_point_filter_init
         self._gpu_out_pcl = None
         self._gpu_out_normals = None
         self._gpu_out_sem = None
@@ -353,10 +360,15 @@ class ImagingSonarSensor(Camera):
                 return None
 
             n_px = depth.size
-            depth_f = depth.reshape((-1,))                       # (N,)
-            pcl_f = pcl.reshape((-1, 3))                         # (N,3)
-            nm_f = normals.reshape((-1, normals.shape[-1]))[:, :3]  # (N,3) view
-            sem_f = sem.reshape((-1,))                           # (N,)
+            # Warp's reshape requires C-contiguity, but the annotator AOVs can come
+            # back strided/non-contiguous ("Reshaping non-contiguous arrays is
+            # unsupported"). Make a contiguous device-resident copy first -- a cheap
+            # GPU->GPU copy that still avoids the device->host->device round-trip.
+            depth_f = depth.contiguous().reshape((-1,))          # (N,)
+            pcl_f = pcl.contiguous().reshape((-1, 3))            # (N,3)
+            nm_c = normals.contiguous()
+            nm_f = nm_c.reshape((-1, nm_c.shape[-1]))[:, :3]     # (N,3) view
+            sem_f = sem.contiguous().reshape((-1,))              # (N,)
             if (pcl_f.shape[0] != n_px or nm_f.shape[0] != n_px
                     or sem_f.shape[0] != n_px):
                 return None
