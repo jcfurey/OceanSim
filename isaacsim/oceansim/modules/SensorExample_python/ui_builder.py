@@ -488,6 +488,16 @@ class UIBuilder():
         """This is called when the user opens a new stage from self.on_stage_event().
         All state should be reset.
         """
+        # Tear down the previous scenario before _on_init() discards it. Otherwise
+        # opening a new stage orphans the old scenario's render-product annotators
+        # (GPU caches), the carb keyboard subscription (which keeps a strong ref to
+        # the scenario, preventing GC), and any rclpy nodes/context it acquired.
+        # teardown_scenario() is null-safe on a never-set-up scenario.
+        if getattr(self, "_scenario", None) is not None:
+            try:
+                self._scenario.teardown_scenario()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[OceanSim] scenario teardown on stage-open warning: {exc}")
         self._on_init()
         self._reset_ui()
 

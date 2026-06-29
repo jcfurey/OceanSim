@@ -164,6 +164,18 @@ class ROS2ControlReceiver:
             
         except Exception as e:
             self._enable_ros2 = False
+            # Destroy any node already created before the failure (e.g. the vel
+            # node when force-node creation raises), or it leaks for the process
+            # lifetime -- close()'s teardown was gated on _enable_ros2, which we
+            # just set False.
+            for _attr in ("_ros2_vel_node", "_ros2_force_node"):
+                _node = getattr(self, _attr, None)
+                if _node is not None:
+                    try:
+                        _node.destroy_node()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    setattr(self, _attr, None)
             print(f'[{self._name}] ROS2 subscriber setup failed: {e}')
 
     def _setup_ros2_control_mode(self, ctrl_mode):
@@ -286,14 +298,15 @@ class ROS2ControlReceiver:
 
     def close(self):
         try:
-            # Clean up ROS2 resources
-            if self._enable_ros2:
-                if self._ros2_vel_node:
-                    self._ros2_vel_node.destroy_node()
-                    self._ros2_vel_node = None
-                if self._ros2_force_node:
-                    self._ros2_force_node.destroy_node()
-                    self._ros2_force_node = None
+            # Clean up ROS2 resources. Gate on the node existing, not on
+            # _enable_ros2 (which a failed setup flips to False while a node may
+            # already have been created).
+            if self._ros2_vel_node:
+                self._ros2_vel_node.destroy_node()
+                self._ros2_vel_node = None
+            if self._ros2_force_node:
+                self._ros2_force_node.destroy_node()
+                self._ros2_force_node = None
 
             self._update_count = 0
             self.force_cmd = [0.0, 0.0, 0.0]

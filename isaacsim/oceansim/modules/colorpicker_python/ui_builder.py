@@ -194,7 +194,10 @@ class UIBuilder:
                         default_val=params_default[i])
                     self._param_models.append(param_model)
                     param_model.add_value_changed_fn(self._on_color_param_changes)
-                    self._on_color_param_changes(param_model)
+                # Render once after building all sliders (self._param is pre-seeded
+                # with the defaults); the per-slider call rendered 9 times and
+                # allocated 9 RGBA buffers, displaying only the last.
+                self._update_demo_render()
                 with ui.ZStack(height=300):
                     ui.Rectangle(style={"background_color": 0xFF000000})
                     ui.ImageWithProvider(self._demo_provider,
@@ -374,8 +377,11 @@ class UIBuilder:
                 'backscatter_coeff': self._param[3:6]
                 }
             save_dir = self.save_dir_field.get_value()
-            yaml_path = save_dir + f"{self.file_name_field.get_value()}.yaml"
-            png_path = save_dir + f"{self.file_name_field.get_value()}.png"
+            # The folder picker returns a directory with no trailing slash; bare
+            # concatenation wrote e.g. '/home/out' + 'name.yaml' to the PARENT dir
+            # as '/home/outname.yaml'. Join properly.
+            yaml_path = os.path.join(save_dir, f"{self.file_name_field.get_value()}.yaml")
+            png_path = os.path.join(save_dir, f"{self.file_name_field.get_value()}.png")
             with open(yaml_path, 'w') as file:
                 try:
                     yaml.dump(data, file, sort_keys=False)

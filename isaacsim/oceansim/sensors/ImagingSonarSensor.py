@@ -895,6 +895,13 @@ class ImagingSonarSensor(Camera):
             - Required for proper shutdown when done using the sensor
             - Also closes viewport window if one was created
         """
+        # If sonar_initialize() never ran (or raised mid-way), cameraParams_annot
+        # won't exist; guard so close() on a half-initialized sensor doesn't raise
+        # an AttributeError that masks the rest of the scenario teardown.
+        if getattr(self, "cameraParams_annot", None) is None:
+            if getattr(self, "_viewport", False):
+                self.ui_destroy()
+            return
         # Same hydra-texture gating as sonar_initialize(): detaching also mutates
         # the SDGPipeline graph, so disable updates first to avoid a teardown-time
         # variant of the partial-graph SIGSEGV. (UNTESTED — see sonar_initialize.)

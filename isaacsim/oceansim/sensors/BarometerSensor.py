@@ -74,7 +74,11 @@ class BarometerSensor(BaseSensor):
         physics_context = PhysicsContext()
         g_dir, scene_g = physics_context.get_gravity()
         if np.abs(self._g - np.abs(scene_g)) > 0.1:
-            carb.log_warn(f'[{self._name}] Detected USD scene gravity is different from user definition. Reduced to user definition.')
+            # get_pressure() always uses self._g; nothing is reconciled, so don't
+            # claim a correction was applied.
+            carb.log_warn(f'[{self._name}] USD scene gravity ({np.abs(scene_g):.3f}) '
+                          f'differs from the user-defined g ({self._g:.3f}); using '
+                          f'the user-defined g for pressure.')
         
 
     

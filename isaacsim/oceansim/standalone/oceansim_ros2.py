@@ -179,16 +179,27 @@ def _deep_update(base, new):
 
 
 def maybe_register_assets(asset_path):
-    """Write OceanSim's asset_path.json if a path was supplied and not yet set."""
+    """Write OceanSim's asset_path.json when a path is supplied. An explicit
+    --asset-path / config asset_path is honored even if a (possibly stale)
+    asset_path.json already exists -- the old code returned early on any existing
+    file, so an explicit override was silently ignored after the first run."""
     if not asset_path:
         return
     import isaacsim.oceansim.utils as _utils_pkg
     json_path = os.path.join(os.path.dirname(_utils_pkg.__file__), "asset_path.json")
+    abspath = os.path.abspath(asset_path)
     if os.path.isfile(json_path):
-        return
+        try:
+            with open(json_path) as f:
+                existing = json.load(f).get("asset_path")
+        except Exception:  # noqa: BLE001 - malformed json -> rewrite it
+            existing = None
+        if existing == abspath:
+            return
+        print(f"[oceansim_ros2] overriding asset path {existing} -> {abspath}")
     with open(json_path, "w") as f:
-        json.dump({"asset_path": os.path.abspath(asset_path)}, f, indent=2)
-    print(f"[oceansim_ros2] registered asset path -> {asset_path}")
+        json.dump({"asset_path": abspath}, f, indent=2)
+    print(f"[oceansim_ros2] registered asset path -> {abspath}")
 
 
 def main(argv):
@@ -501,11 +512,17 @@ def main(argv):
                 publisher.publish(world.current_time)
     finally:
         print("[oceansim_ros2] shutting down")
-        try:
-            publisher.close()
-        finally:
-            scenario.teardown_scenario()
-            sim_app.close()
+        # Best-effort teardown: a failure in publisher.close() or
+        # teardown_scenario() must NOT skip sim_app.close() (the old nested
+        # finally dropped sim_app.close when teardown raised, orphaning the kit
+        # process + the rclpy context).
+        for _what, _fn in (("publisher.close", publisher.close),
+                           ("scenario.teardown", scenario.teardown_scenario)):
+            try:
+                _fn()
+            except Exception as _e:  # noqa: BLE001
+                print(f"[oceansim_ros2] {_what} warning: {_e}")
+        sim_app.close()
 
 
 if __name__ == "__main__":

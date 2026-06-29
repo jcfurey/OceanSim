@@ -71,6 +71,11 @@ def import_urdf_to_stage(urdf_path, fix_base=False, merge_fixed_joints=True,
 
     status, prim_path = omni.kit.commands.execute(
         "URDFParseAndImportFile", urdf_path=urdf_path, import_config=import_config)
-    if not prim_path:
-        raise RuntimeError(f"URDF import produced no prim for {urdf_path}")
+    # The importer can return status False with a stale/partial prim_path; honor
+    # the documented contract (clear error -> offline conversion) rather than
+    # letting downstream apply physics APIs to a malformed prim.
+    if not status or not prim_path:
+        raise RuntimeError(
+            f"URDF import failed (status={status}) for {urdf_path}; "
+            f"convert to USD offline and set the platform's usd_subpath instead.")
     return prim_path
