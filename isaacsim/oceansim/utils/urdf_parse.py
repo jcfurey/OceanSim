@@ -87,10 +87,27 @@ def _parse(urdf_text):
 
 
 def _root_link(joints_by_child, links):
-    """The link that is never a joint child (the kinematic root / base)."""
+    """The kinematic root (base) link -- the link that is never a joint child.
+
+    ``links`` is a set, so the selection is made deterministic (sorted) rather
+    than following hash-randomized iteration order. When several links are
+    childless (e.g. a stray decorative link), prefer one that actually parents a
+    joint (the real kinematic root). And honor the ROS ``<link name="world"/>``
+    convention: a fixed ``world`` base parenting the real robot base resolves to
+    that single child, so frames/mounts come out relative to the base, not world.
+    """
     children = set(joints_by_child)
-    roots = [l for l in links if l not in children]
-    return roots[0] if len(roots) == 1 else (roots[0] if roots else None)
+    parents = {p for (p, _, _) in joints_by_child.values()}
+    roots = sorted(l for l in links if l not in children)
+    if not roots:
+        return None
+    connected = [r for r in roots if r in parents]
+    root = connected[0] if connected else roots[0]
+    if root == "world":
+        world_children = sorted(c for c, (p, _, _) in joints_by_child.items() if p == "world")
+        if len(world_children) == 1:
+            return world_children[0]
+    return root
 
 
 def link_pose_in_base(urdf_text, link_name, base_link=None):

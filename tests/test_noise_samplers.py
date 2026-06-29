@@ -125,3 +125,27 @@ def test_zero_cov_matches_old_zero_output(MVN):
     m.init_cov(0.0)
     assert np.array_equal(m.sample_array(), np.zeros(4))
     assert np.array_equal(m.sample_list(), [0.0, 0.0, 0.0, 0.0])
+
+
+def test_non_pd_covariance_disables_noise_no_garbage(MVN):
+    # A non-positive-definite full covariance must NOT leave half-Cholesky garbage
+    # in sqrt_cov; the in-place decompose is done on a scratch copy and noise is
+    # disabled (zeros) on failure instead of multiplying by partial results.
+    bad = np.array([[1.0, 2.0], [2.0, 1.0]])   # eigenvalues 3, -1 -> not PD
+    m = MVN(2)
+    m.init_cov(bad)
+    assert not m.is_uncertain()
+    assert np.array_equal(m.sample_array(), np.zeros(2))
+    assert np.array_equal(m.get_sqrt_cov(), np.zeros((2, 2)))   # no leftover garbage
+
+
+def test_uniform_accepts_int_bound(MVU):
+    u = MVU(1)
+    u.init_bounds(2)                 # int scalar used to raise ValueError
+    assert u.is_uncertain()
+    u.rng = np.random.default_rng(0)
+    s = np.array([u.sample_float() for _ in range(2000)])
+    assert s.min() >= 0.0 and s.max() <= 2.0
+    u0 = MVU(3)
+    u0.init_bounds(0)                # int zero -> not uncertain
+    assert not u0.is_uncertain()

@@ -44,10 +44,19 @@ class MultivariateNormal:
                 np.fill_diagonal(self.sqrt_cov, np.sqrt(cov))
             elif cov.ndim == 2:  # Full covariance matrix
                 assert cov.shape == (self.N, self.N), f"Covariance matrix size {cov.shape} should be ({self.N}, {self.N})"
-                self.sqrt_cov = cov.copy()
-                success = self.cholesky(self.sqrt_cov)
-                if not success:
-                    print("Warning: MVN encountered a non-positive definite covariance")
+                # Decompose a scratch copy and commit only on success. The
+                # in-place cholesky returns False partway through on a
+                # non-positive-definite matrix, leaving a mix of raw off-diagonals
+                # and partial sqrt results -- so assigning cov to sqrt_cov first
+                # would make sample_array() multiply noise by that garbage. On
+                # failure, disable the noise (zero sqrt_cov -> uncertain False ->
+                # zeros) instead.
+                tmp = cov.copy()
+                if self.cholesky(tmp):
+                    self.sqrt_cov = tmp
+                else:
+                    print("Warning: MVN encountered a non-positive definite covariance; noise disabled")
+                    self.sqrt_cov = np.zeros((self.N, self.N))
             else:
                 raise ValueError("Invalid covariance input")
         # See init_sigma: skip the per-step noise sampling when cov == 0.

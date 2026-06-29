@@ -25,12 +25,14 @@ class MultivariateUniform:
         self.rng = np.random.default_rng()
 
     def init_bounds(self, max_: Union[float, List[float]]):
-        if isinstance(max_, float):
-            self.max.fill(max_)
-        elif isinstance(max_, list) and len(max_) == self.N:
+        # Accept any numeric scalar (int included), mirroring MultivariateNormal
+        # which takes (float, int); init_bounds(1) used to raise ValueError.
+        if isinstance(max_, (int, float, np.integer, np.floating)):
+            self.max.fill(float(max_))
+        elif isinstance(max_, (list, np.ndarray)) and len(max_) == self.N:
             self.max = np.array(max_)
         else:
-            raise ValueError(f"Expected a float or list of size {self.N}, got {max_}")
+            raise ValueError(f"Expected a number or list of size {self.N}, got {max_}")
         self.uncertain = np.any(self.max != 0)
 
     def sample_array(self) -> np.ndarray:

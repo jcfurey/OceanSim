@@ -54,9 +54,15 @@ def adaptive_sensor_dt(min_range, freq_bound, range_bound, sound_speed):
     elif min_range <= near:
         freq = hi_f
     elif near < min_range < far:
-        # Linear ramp between the bounds (continuous with the near branch at
-        # min_range == near, where the second term is zero -> freq == hi_f).
-        freq = hi_f - (hi_f - sound_speed / (2 * min_range)) / (far - near) * (min_range - near)
+        # Linear ramp from the max frequency (at near) down to the sound-speed-
+        # limited frequency at the FAR bound. The old formula interpolated toward
+        # sound_speed/(2*min_range) -- a moving target at the current range --
+        # which makes the frequency RISE with range (physically backwards: a
+        # longer round trip must lower, not raise, the max ping rate) whenever
+        # sound_speed/(2*near) > hi_f. Use a fixed far endpoint and clamp.
+        far_freq = min(hi_f, sound_speed / (2.0 * far))
+        freq = hi_f + (far_freq - hi_f) * (min_range - near) / (far - near)
+        freq = min(max(freq, lo_f), hi_f)
     else:
         freq = lo_f
     return 1.0 / freq

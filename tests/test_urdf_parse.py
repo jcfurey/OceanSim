@@ -132,3 +132,29 @@ def test_sensor_link_lookup(u):
     assert u.sensor_link(URDF, "camera") == "camera_link"
     assert u.sensor_link(URDF, "baro") is None          # not in this URDF
     assert u.sensor_link("<robot><broken", "sonar") is None
+
+
+def test_root_link_world_convention(u):
+    # ROS '<link name="world"/>' fixed-base convention: root resolves to the real
+    # base (world's child), and poses are relative to base, not world.
+    urdf = """<robot name="r">
+      <link name="world"/><link name="base_link"/><link name="sonar_link"/>
+      <joint name="wj" type="fixed"><parent link="world"/><child link="base_link"/>
+        <origin xyz="5 0 0" rpy="0 0 0"/></joint>
+      <joint name="sj" type="fixed"><parent link="base_link"/><child link="sonar_link"/>
+        <origin xyz="0.3 0 0" rpy="0 0 0"/></joint>
+    </robot>"""
+    assert u.root_link(urdf) == "base_link"
+    tr, rpy = u.link_pose_in_base(urdf, "sonar_link")
+    assert np.allclose(tr, [0.3, 0.0, 0.0])             # relative to base, not 5.3
+
+
+def test_root_link_prefers_connected_over_isolated(u):
+    # A stray decorative link is also "childless"; the kinematic root (one that
+    # parents a joint) must be chosen deterministically.
+    urdf = """<robot name="r">
+      <link name="base_link"/><link name="decoration"/><link name="arm"/>
+      <joint name="j" type="fixed"><parent link="base_link"/><child link="arm"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/></joint>
+    </robot>"""
+    assert u.root_link(urdf) == "base_link"
