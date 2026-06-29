@@ -122,6 +122,12 @@ def load_config(args):
         # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
         # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
         "sonar_backend": "oceansim",
+        # Physics simulation device: None -> Isaac default (GPU/cuda:0). Set to
+        # "cpu" to run PhysX on the CPU -- needed when the host NVIDIA driver is too
+        # new for Isaac 6.0.1's bundled CUDA (e.g. driver 595.80 / CUDA 13.2 leaves
+        # the GPU physics-tensor SimulationView invalid, so get_velocities fails and
+        # odom/IMU/control all break). Rendering (camera/sonar/RTX) stays on the GPU.
+        "physics_device": None,
         # Hz cap on the heavy per-step sensor compute (sonar scan + camera
         # UW_render). They run in update_scenario every physics step (~60 Hz) but
         # are published ~5 Hz, so the rest is wasted. 15 Hz keeps published frames
@@ -268,8 +274,12 @@ def main(argv):
     from isaacsim.oceansim.utils.ros2_sensors import OceanSimSensorPublisher
 
     create_new_stage()
-    world = World(physics_dt=cfg["physics_dt"], rendering_dt=cfg["rendering_dt"],
-                  stage_units_in_meters=1.0)
+    _world_kwargs = dict(physics_dt=cfg["physics_dt"], rendering_dt=cfg["rendering_dt"],
+                         stage_units_in_meters=1.0)
+    if cfg.get("physics_device"):
+        _world_kwargs["device"] = cfg["physics_device"]
+        print(f"[oceansim_ros2] physics device override: {cfg['physics_device']}")
+    world = World(**_world_kwargs)
 
     # ---- scene (mirrors ui_builder._setup_scene) --------------------------
     if cfg["scene_usd"]:

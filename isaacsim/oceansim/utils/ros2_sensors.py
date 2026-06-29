@@ -214,14 +214,14 @@ class OceanSimSensorPublisher:
     # ------------------------------------------------------------------ setup
     def initialize(self):
         """Create the rclpy node and publishers for the active sensors."""
-        from isaacsim.core.prims import SingleRigidPrim
-        from isaacsim.core.utils.prims import get_prim_path
-
         ros2_context.acquire()
         self._ros2_acquired = True
         self._node = rclpy.create_node("oceansim_sensor_publisher")
 
-        self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
+        # NOTE: the robot rigid-prim wrapper is acquired lazily (see
+        # _ensure_rigid_prim), NOT here: initialize() runs before world.play(),
+        # and under Isaac Sim 6.0.1 SingleRigidPrim.__init__ eagerly reads
+        # rigid-body velocities, which raises before the physics backend is live.
 
         from nav_msgs.msg import Odometry
         from sensor_msgs.msg import Imu, FluidPressure
@@ -287,6 +287,22 @@ class OceanSimSensorPublisher:
         """Resolve the robot's articulation (if any) and set up joint state
         publishing + the optional joint-command subscription. All a no-op when
         the robot prim is a plain rigid body with no DOFs."""
+        # GUARD: only touch an articulation when the robot prim actually IS one.
+        # Constructing a SingleArticulation on a plain rigid hull fails *and* deletes
+        # that prim's physics tensor view ("prim '/World/rob' was deleted ... the
+        # physics.tensors simulationView was invalidated"), which then breaks the
+        # odom/IMU velocity reads here AND OceanSim's own ROS2ControlReceiver. Detect
+        # via USD (no tensor view), so a rigid body is a true no-op.
+        try:
+            from pxr import Usd, UsdPhysics
+            if not any(p.HasAPI(UsdPhysics.ArticulationRootAPI)
+                       for p in Usd.PrimRange(self._robot_prim)):
+                return  # rigid body -> no joints; leave its rigid tensor view intact
+        except Exception as e:  # noqa: BLE001 - if the USD probe fails, skip joint I/O
+            self._node.get_logger().warn(
+                f"articulation probe failed ({e}); skipping joint I/O")
+            return
+
         try:
             from isaacsim.core.prims import SingleArticulation
             from isaacsim.core.utils.prims import get_prim_path
@@ -443,11 +459,27 @@ class OceanSimSensorPublisher:
         msg.clock = self._stamp(sim_time)
         self._clock_pub.publish(msg)
 
+    def _ensure_rigid_prim(self):
+        """Wrap the robot prim once the physics backend is live (lazy).
+
+        Built on first use inside the run loop -- after world.play() and the first
+        world.step() -- not in initialize(): under Isaac Sim 6.0.1
+        SingleRigidPrim.__init__ -> RigidPrim._on_physics_ready() eagerly calls
+        get_velocities(), which raises "Failed to get rigid body velocities from
+        backend" when the physics tensor view isn't initialized yet, and
+        initialize() runs before play()."""
+        if self._rigid_prim is None:
+            from isaacsim.core.prims import SingleRigidPrim
+            from isaacsim.core.utils.prims import get_prim_path
+            self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
+        return self._rigid_prim
+
     def _robot_state(self):
         """Return (pos, quat_wxyz, lin_vel_world, ang_vel_world) as numpy arrays."""
-        pos, quat = self._rigid_prim.get_world_pose()
-        lin_vel = np.asarray(self._rigid_prim.get_linear_velocity(), dtype=float)
-        ang_vel = np.asarray(self._rigid_prim.get_angular_velocity(), dtype=float)
+        rp = self._ensure_rigid_prim()
+        pos, quat = rp.get_world_pose()
+        lin_vel = np.asarray(rp.get_linear_velocity(), dtype=float)
+        ang_vel = np.asarray(rp.get_angular_velocity(), dtype=float)
         return np.asarray(pos, dtype=float), np.asarray(quat, dtype=float), lin_vel, ang_vel
 
     def _publish_odom(self, stamp):
