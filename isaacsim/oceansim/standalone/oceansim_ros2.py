@@ -344,18 +344,36 @@ def main(argv):
         SingleRigidPrim(prim_path=robot_path, mass=mass, translation=spawn)
     robot_prim = get_prim_at_path(robot_path)
 
-    def _mount_quat(mount):
-        return euler_angles_to_quat(np.array(mount.rpy_deg, dtype=float), degrees=True)
+    # If the robot came from a URDF, let the URDF's sensor links define the mount
+    # poses (a "sonar" / "camera" / "dvl" link's fixed-joint origin relative to
+    # base), falling back to the platform spec mount for any sensor the URDF
+    # doesn't define. (urdf_parse is pure + unit tested.)
+    from isaacsim.oceansim.utils import urdf_parse
+    urdf_text = None
+    if src.kind == "urdf":
+        try:
+            with open(src.path, "r") as _f:
+                urdf_text = _f.read()
+        except Exception as e:  # noqa: BLE001
+            print(f"[oceansim_ros2] could not read URDF for sensor mounts: {e}")
 
-    # ---- sensors (mount poses come from the platform spec) ----------------
+    def _mount(kind, fallback_mount):
+        tr, rpy = urdf_parse.sensor_mount_or(
+            urdf_text, kind, fallback_mount.translation, fallback_mount.rpy_deg)
+        if urdf_text is not None and urdf_parse.sensor_mount(urdf_text, kind) is not None:
+            print(f"[oceansim_ros2] {kind} mount from URDF link -> {tr}")
+        return np.array(tr, dtype=float), np.array(rpy, dtype=float)
+
+    # ---- sensors (mounts from the URDF if present, else the platform spec) -
     sensors = cfg["sensors"]
     sonar = cam = dvl = baro = None
     if sensors.get("sonar"):
         sonar_backend = cfg.get("sonar_backend", "oceansim")
+        _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
         _sonar_xform = dict(
             prim_path=robot_path + "/sonar",
-            translation=np.array(spec.sonar_mount.translation, dtype=float),
-            orientation=_mount_quat(spec.sonar_mount))
+            translation=_sonar_tr,
+            orientation=euler_angles_to_quat(_sonar_rpy, degrees=True))
         if sonar_backend == "rtx_acoustic":
             # Isaac native RTX acoustic sensor (experimental). Avoids the 6.0.1
             # pointcloud-annotator SIGSEGV; output mapping is a scaffold (see class).
@@ -370,16 +388,16 @@ def main(argv):
                 range_res=0.005, angular_res=0.25, hori_res=4000, **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
-        _cam_translation = np.array(spec.camera_mount.translation, dtype=float)
+        _cam_translation, _ = _mount("camera", spec.camera_mount)
         cam = UW_Camera(prim_path=robot_path + "/UW_camera",
                         resolution=[1920, 1080], translation=_cam_translation)
         cam.set_focal_length(0.1 * 21)
         cam.set_clipping_range(0.1, 100)
     if sensors.get("dvl"):
         from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
+        _dvl_translation, _ = _mount("dvl", spec.dvl_mount)
         dvl = DVLsensor(max_range=10)
-        dvl.attachDVL(rigid_body_path=robot_path,
-                      translation=np.array(spec.dvl_mount.translation, dtype=float))
+        dvl.attachDVL(rigid_body_path=robot_path, translation=_dvl_translation)
     if sensors.get("baro"):
         from isaacsim.oceansim.sensors.BarometerSensor import BarometerSensor
         baro = BarometerSensor(prim_path=robot_path + "/Baro",

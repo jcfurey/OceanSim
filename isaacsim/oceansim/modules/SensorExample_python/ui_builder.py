@@ -361,12 +361,28 @@ class UIBuilder():
         set_camera_view(eye=np.array([5, 0.6, 0.4]),
                         target=np.array(spec.spawn_translation, dtype=float))
 
+        # When imported from a URDF, place the sensors at the URDF's sensor-link
+        # frames (fixed-joint origins), else at the platform spec mounts.
+        from isaacsim.oceansim.utils import urdf_parse
+        _urdf_text = None
+        if src.kind == "urdf":
+            try:
+                with open(src.path, 'r') as _f:
+                    _urdf_text = _f.read()
+            except Exception as e:  # noqa: BLE001
+                carb.log_warn(f"[OceanSim] could not read URDF for sensor mounts: {e}")
+
+        def _mount(kind, fallback_mount):
+            tr, rpy = urdf_parse.sensor_mount_or(
+                _urdf_text, kind, fallback_mount.translation, fallback_mount.rpy_deg)
+            return np.array(tr, dtype=float), np.array(rpy, dtype=float)
 
         if self._use_sonar:
             from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+            _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
             self._sonar = ImagingSonarSensor(prim_path=robot_prim_path + '/sonar',
-                                            translation=np.array(spec.sonar_mount.translation, dtype=float),
-                                            orientation=euler_angles_to_quat(np.array(spec.sonar_mount.rpy_deg, dtype=float),  degrees=True),
+                                            translation=_sonar_tr,
+                                            orientation=euler_angles_to_quat(_sonar_rpy, degrees=True),
                                             range_res=0.005,
                                             angular_res=0.25,
                                             hori_res=4000
@@ -375,18 +391,20 @@ class UIBuilder():
         if self._use_camera:
             from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
 
+            _cam_tr, _ = _mount("camera", spec.camera_mount)
             self._cam = UW_Camera(prim_path=robot_prim_path + '/UW_camera',
                                     resolution=[1920,1080],
-                                    translation=np.array(spec.camera_mount.translation, dtype=float))
+                                    translation=_cam_tr)
             self._cam.set_focal_length(0.1 * self._cam_focal_length)
             self._cam.set_clipping_range(0.1, 100)
 
         if self._use_DVL:
             from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
 
+            _dvl_tr, _ = _mount("dvl", spec.dvl_mount)
             self._DVL = DVLsensor(max_range=10)
             self._DVL.attachDVL(rigid_body_path=robot_prim_path,
-                                translation=np.array(spec.dvl_mount.translation, dtype=float))
+                                translation=_dvl_tr)
             self._DVL.add_debug_lines()
             
         if self._use_baro:
