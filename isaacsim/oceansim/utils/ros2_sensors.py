@@ -51,6 +51,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from isaacsim.oceansim.utils import ros2_context
 from isaacsim.oceansim.utils import ros2_math
 from isaacsim.oceansim.utils import joint_control
+from isaacsim.oceansim.utils import ros2_qos
 # Pure (numpy-only) math lives in ros2_math so it can be unit tested without ROS.
 _quat_wxyz_to_xyzw = ros2_math.quat_wxyz_to_xyzw
 _RateGate = ros2_math.RateGate
@@ -61,34 +62,40 @@ except Exception:  # pragma: no cover - only importable inside Isaac Sim
     quat_to_rot_matrix = None
 
 
-def _sensor_qos(depth: int = 10) -> QoSProfile:
-    """Best-effort, keep-last QoS matching ``rclpy.qos.qos_profile_sensor_data``."""
+def _to_profile(q) -> QoSProfile:
+    """Build an rclpy QoSProfile from a pure ros2_qos.QoS spec, so the profiles
+    that are verified for compatibility in tests are exactly the ones used on the
+    wire."""
     return QoSProfile(
-        reliability=ReliabilityPolicy.BEST_EFFORT,
+        reliability=(ReliabilityPolicy.RELIABLE if q.reliability == ros2_qos.RELIABLE
+                     else ReliabilityPolicy.BEST_EFFORT),
+        durability=(DurabilityPolicy.TRANSIENT_LOCAL if q.durability == ros2_qos.TRANSIENT_LOCAL
+                    else DurabilityPolicy.VOLATILE),
         history=HistoryPolicy.KEEP_LAST,
-        depth=depth,
+        depth=q.depth,
     )
+
+
+def _sensor_qos(depth: int = 10) -> QoSProfile:
+    """Best-effort, keep-last sensor QoS (matches qos_profile_sensor_data)."""
+    return _to_profile(ros2_qos.SENSOR_DATA._replace(depth=depth))
 
 
 def _clock_qos() -> QoSProfile:
-    return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=1,
-        durability=DurabilityPolicy.VOLATILE,
-    )
+    return _to_profile(ros2_qos.CLOCK)
 
 
 def _latched_qos() -> QoSProfile:
     """Latched (TRANSIENT_LOCAL) QoS for the robot description: published once,
-    yet still delivered to subscribers that join later (RViz, robot_state_publisher).
-    Matches the QoS those tools use for /robot_description."""
-    return QoSProfile(
-        reliability=ReliabilityPolicy.RELIABLE,
-        history=HistoryPolicy.KEEP_LAST,
-        depth=1,
-        durability=DurabilityPolicy.TRANSIENT_LOCAL,
-    )
+    yet still delivered to subscribers that join later (RViz, robot_state_publisher)."""
+    return _to_profile(ros2_qos.LATCHED)
+
+
+def _reliable_state_qos() -> QoSProfile:
+    """RELIABLE QoS for /joint_states. robot_state_publisher subscribes with the
+    rclcpp default (RELIABLE), so a BEST_EFFORT publisher would be silently
+    dropped -- see ros2_qos.TOPIC_CONTRACTS / tests/test_ros2_qos.py."""
+    return _to_profile(ros2_qos.RELIABLE_STATE)
 
 
 class OceanSimSensorPublisher:
@@ -299,7 +306,7 @@ class OceanSimSensorPublisher:
 
         from sensor_msgs.msg import JointState
         self._joint_state_pub = self._node.create_publisher(
-            JointState, self._cfg["joint_states_topic"], _sensor_qos())
+            JointState, self._cfg["joint_states_topic"], _reliable_state_qos())
         if self._cfg.get("enable_joint_command"):
             self._joint_cmd_sub = self._node.create_subscription(
                 JointState, self._cfg["joint_command_topic"], self._on_joint_command,
