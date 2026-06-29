@@ -148,6 +148,22 @@ Calibration gaps (all in `RtxAcousticSensor._build_acoustic_attributes` +
    recommended path to a working fast sonar; revisit rtx_acoustic if/when the
    World-coexistence issue is resolved upstream.
 
+   CONCLUSION 2 (fork-patch attempt, 2026-06-29): also ruled out `/app/asyncRendering
+   = False` (force synchronous rendering so the render product doesn't spawn its own
+   engine thread) -- still 2034 warnings, no data. FOUR Python/config levers now
+   exhausted (GUI/headless, camera on/off, simulation_app.update() SDG pump,
+   asyncRendering off). CRUCIALLY: the failing call `UsdContext::createRunloopThread
+   ForHydraEngineImpl` is in PRECOMPILED omni.usd / Kit CORE -- it is NOT in the
+   IsaacSim fork source (grep confirms). So "patch the Isaac fork" CANNOT fix this:
+   the broken code isn't in the fork; it ships as a compiled Kit plugin. Real
+   options: (1) `rtx_lidar` via the standard/deprecated `isaacsim.sensors.rtx`
+   `LidarRtx` (source/deprecated/isaacsim.sensors.rtx/python/impl/lidar_rtx.py),
+   which uses a different creation path and runs under `World` -- RECOMMENDED;
+   (2) file an upstream NVIDIA bug (experimental `AcousticSensor` render product
+   can't create its hydra engine thread under `World`/`SimulationContext`; min repro
+   = the example + `World()`); (3) the big runner restructure (drive without
+   `World`). Do NOT spend more cycles on Python/carb levers for rtx_acoustic.
+
 1. **Receiver array** — currently 8 placeholder elements at 2 cm spacing across the
    FOV. Replace with the real Oculus receiver geometry (element count + spacing);
    this sets the achievable azimuth resolution.
