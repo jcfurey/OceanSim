@@ -147,6 +147,14 @@ class OceanSimSensorPublisher:
         # (sensor_msgs/JointState of position targets) to drive the joints.
         # Both are no-ops if the robot prim is not an Isaac articulation.
         "enable_joint_command": True,
+        # Position-drive PD gains applied to the articulation's joints after import.
+        # The staged platform URDFs carry NO actuator gains, so PhysX imports the
+        # joints with a zero-stiffness drive ("actuator created without gain
+        # parameters") -- apply_action(joint_positions) then has no authority and the
+        # joint never tracks the command. Non-zero stiffness/damping give it a real
+        # position drive. Tunable (a small head pivot needs little); 0 disables.
+        "joint_drive_stiffness": 10000.0,
+        "joint_drive_damping": 1000.0,
         # toggles
         "publish_clock": True,
         # Static TF base_link->{sensor} from the mount poses. OFF by default so it
@@ -316,6 +324,23 @@ class OceanSimSensorPublisher:
                 return  # not an articulation / no joints -> nothing to manipulate
             self._articulation = art
             self._joint_names = dof_names
+            # Give the joints a real position drive: the staged URDFs import with
+            # zero-stiffness actuators, so apply_action(joint_positions) otherwise
+            # has no authority and the joint never tracks the command.
+            kp = float(self._cfg.get("joint_drive_stiffness", 0.0) or 0.0)
+            kd = float(self._cfg.get("joint_drive_damping", 0.0) or 0.0)
+            if kp > 0.0 or kd > 0.0:
+                try:
+                    n = len(dof_names)
+                    # Gains live on the articulation's PD controller, not the prim
+                    # wrapper (SingleArticulation has no set_gains).
+                    art.get_articulation_controller().set_gains(
+                        kps=np.full(n, kp, dtype=float),
+                        kds=np.full(n, kd, dtype=float))
+                    self._node.get_logger().info(
+                        f"joint drive gains set: stiffness={kp}, damping={kd}")
+                except Exception as e:  # noqa: BLE001
+                    self._node.get_logger().warn(f"could not set joint drive gains: {e}")
         except Exception as e:  # pragma: no cover
             self._node.get_logger().warn(f"articulation unavailable (no joint I/O): {e}")
             return
@@ -628,14 +653,7 @@ class OceanSimSensorPublisher:
 
         min_range, max_range = self._sonar.get_range()
         hori_fov, vert_fov = self._sonar.get_fov()  # degrees
-        geom = self._sonar_geometry(n_range, n_beams, min_range, max_range,
-                                    hori_fov, vert_fov)
 
-        msg = ProjectedSonarImage()
-        msg.header.stamp = stamp
-        msg.header.frame_id = self._cfg["sonar_frame_id"]
-
-        ping = PingInfo()
         # Acoustic carrier frequency for ping_info. Prefer an explicit config
         # override, then the sensor's own MODELLED acoustic frequency
         # (ImagingSonarSensor.acoustic_frequency = 375 kHz for the Oculus M370s;
@@ -646,7 +664,19 @@ class OceanSimSensorPublisher:
         _sonar_freq = (self._cfg.get("sonar_acoustic_freq")
                        or getattr(self._sonar, "acoustic_frequency", None)
                        or getattr(self._sonar, "center_frequency", None))
-        ping.frequency = float(_sonar_freq) if _sonar_freq else 375e3
+        _sonar_freq = float(_sonar_freq) if _sonar_freq else 375e3
+
+        # beamwidths are frequency-dependent (Oculus constants), so key the geometry
+        # on the frequency too.
+        geom = self._sonar_geometry(n_range, n_beams, min_range, max_range,
+                                    hori_fov, vert_fov, _sonar_freq)
+
+        msg = ProjectedSonarImage()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self._cfg["sonar_frame_id"]
+
+        ping = PingInfo()
+        ping.frequency = _sonar_freq
         ping.sound_speed = float(self._cfg["sound_speed"])
         ping.tx_beamwidths = geom["tx_beamwidths"]
         ping.rx_beamwidths = geom["rx_beamwidths"]
@@ -663,7 +693,8 @@ class OceanSimSensorPublisher:
         msg.image = data
         self._sonar_pub.publish(msg)
 
-    def _sonar_geometry(self, n_range, n_beams, min_range, max_range, hori_fov, vert_fov):
+    def _sonar_geometry(self, n_range, n_beams, min_range, max_range, hori_fov, vert_fov,
+                        frequency_hz=1.2e6):
         """Cached ProjectedSonarImage geometry, rebuilt only if the sonar grid
         shape / FOV changes (it does not, frame to frame).
 
@@ -680,11 +711,16 @@ class OceanSimSensorPublisher:
           beamwidth of the transmit swath. sonar_proc indexes both per beam, so a
           length-1 tx array reads out of bounds.
         """
-        key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov)
+        key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov, frequency_hz)
         cache = self._sonar_geom
         if cache is not None and cache["key"] == key:
             return cache
         from geometry_msgs.msg import Vector3
+        # rx (azimuth) + tx (elevation) BEAMWIDTHS from the Oculus M-series constants
+        # for this carrier frequency (liboculus/Constants.h via ros2_math). The
+        # beamwidth is the angular WIDTH of a beam, NOT the beam spacing -- the old
+        # rx = hori_fov/n_beams (0.25deg) understated it (real M300d LF is 0.6deg).
+        az_bw, el_bw = ros2_math.oculus_beamwidths(frequency_hz)
         geom = {
             "key": key,
             "beam_directions": [
@@ -692,8 +728,8 @@ class OceanSimSensorPublisher:
                 for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams)
             ],
             "ranges": ros2_math.sonar_ranges(min_range, max_range, n_range),
-            "tx_beamwidths": [math.radians(vert_fov)] * n_beams,
-            "rx_beamwidths": [math.radians(hori_fov / max(n_beams, 1))] * n_beams,
+            "tx_beamwidths": [float(el_bw)] * n_beams,
+            "rx_beamwidths": [float(az_bw)] * n_beams,
         }
         self._sonar_geom = geom
         return geom

@@ -93,8 +93,33 @@ def sonar_beam_directions(hori_fov_deg, n_beams):
 
 
 def sonar_ranges(min_range, max_range, n_range):
-    """Range axis values (metres) for a ProjectedSonarImage."""
-    return np.linspace(float(min_range), float(max_range), n_range).astype(np.float32).tolist()
+    """Per-bin range CENTRES (metres) for a ProjectedSonarImage.
+
+    Oculus convention (oculus_sonar_driver/ping_to_sonar_image.h):
+    ``range(i) = (i + 0.5) * rangeResolution`` -- bin centres, not edges. We use
+    ``rangeResolution = (max - min) / n_range`` and add the sensor's ``min_range``
+    offset (the real driver assumes 0; our sensor has a non-zero near range).
+    """
+    res = (float(max_range) - float(min_range)) / max(int(n_range), 1)
+    return (float(min_range) + (np.arange(int(n_range)) + 0.5) * res).astype(np.float32).tolist()
+
+
+def oculus_beamwidths(frequency_hz):
+    """(azimuth, elevation) beamwidths in RADIANS for the Oculus M-series, keyed by
+    frequency band -- mirrors liboculus/Constants.h + oculus_sonar_driver's
+    ping_to_sonar_image.h (rx_beamwidths = AzimuthBeamwidthRad, tx_beamwidths =
+    ElevationBeamwidthRad). The beamwidth is the angular WIDTH of a beam, NOT the
+    beam spacing (hori_fov / n_beams). Defaults to the 1.2 MHz (M3000d/M1200d
+    low-freq) values for an unrecognised frequency.
+    """
+    f = float(frequency_hz)
+    if 1.1e6 < f < 1.3e6:        # 1.2 MHz (M300d/M1200d LF): az 0.6 deg, el 20 deg
+        return math.radians(0.6), math.radians(20.0)
+    if 2.0e6 < f < 2.2e6:        # 2.1 MHz (M1200d): az 0.4 deg, el 20 deg
+        return math.radians(0.4), math.radians(20.0)
+    if 2.9e6 < f < 3.1e6:        # 3.0 MHz (M300d HF): az 0.4 deg, el 20 deg
+        return math.radians(0.4), math.radians(20.0)
+    return math.radians(0.6), math.radians(20.0)
 
 
 def sonar_intensity_uint8(grid):

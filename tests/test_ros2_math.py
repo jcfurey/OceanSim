@@ -86,9 +86,24 @@ def test_sonar_beam_directions(m):
     assert dirs[0][1] > 0 and dirs[2][1] < 0                  # azimuth spread in -y
 
 
-def test_sonar_ranges_endpoints(m):
+def test_sonar_ranges_bin_centres(m):
+    # Oculus convention: range(i) = min + (i+0.5)*res, res = (max-min)/n.
     r = m.sonar_ranges(0.2, 3.0, 5)
-    assert r[0] == pytest.approx(0.2) and r[-1] == pytest.approx(3.0) and len(r) == 5
+    res = (3.0 - 0.2) / 5            # 0.56
+    assert len(r) == 5
+    assert r[0] == pytest.approx(0.2 + 0.5 * res)   # first bin CENTRE, not min
+    assert r[-1] == pytest.approx(0.2 + 4.5 * res)  # last bin centre, < max
+    assert np.allclose(np.diff(r), res)             # uniform spacing == res
+
+
+def test_oculus_beamwidths_by_frequency(m):
+    az12, el12 = m.oculus_beamwidths(1.2e6)
+    assert az12 == pytest.approx(math.radians(0.6))   # M300d LF azimuth beamwidth
+    assert el12 == pytest.approx(math.radians(20.0))  # elevation aperture
+    az30, _ = m.oculus_beamwidths(3.0e6)
+    assert az30 == pytest.approx(math.radians(0.4))   # HF azimuth beamwidth
+    # rx beamwidth (0.6deg) is WIDER than typical beam spacing (e.g. 130/520=0.25deg)
+    assert az12 > math.radians(130.0 / 520.0)
 
 
 def test_sonar_intensity_uint8_range_major(m):

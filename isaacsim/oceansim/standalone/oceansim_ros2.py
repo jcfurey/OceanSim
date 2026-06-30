@@ -314,6 +314,21 @@ def main(argv):
         print(f"[oceansim_ros2] physics device override: {cfg['physics_device']}")
     world = World(**_world_kwargs)
 
+    # Underwater vehicles are operated near neutral buoyancy, so the net vertical
+    # force is ~0 -- we model that as NO gravity rather than gravity+buoyancy. Per-
+    # body DisableGravity does NOT propagate to URDF articulation links (they sink to
+    # the floor and tip), so zero the SCENE gravity globally: the robust no-gravity
+    # model for the whole sim. (Per-link DisableGravity below is then belt-and-suspenders.)
+    try:
+        _pc = world.get_physics_context()
+        try:
+            _pc.set_gravity(0.0)            # scalar magnitude API
+        except TypeError:
+            _pc.set_gravity([0.0, 0.0, 0.0])  # vector API fallback
+        print("[oceansim_ros2] scene gravity = 0 (neutral-buoyancy underwater model)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[oceansim_ros2] could not zero scene gravity: {exc}")
+
     # ---- scene (mirrors ui_builder._setup_scene) --------------------------
     if cfg["scene_usd"]:
         add_reference_to_stage(usd_path=cfg["scene_usd"], prim_path="/World/scene")
@@ -381,14 +396,36 @@ def main(argv):
         robot_path = urdf_import.import_urdf_to_stage(
             src.path, fix_base=False,
             merge_fixed_joints=rob_cfg.get("merge_fixed_joints", True))
-        rob_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(get_prim_at_path(robot_path))
+        # Disable gravity + set damping on EVERY rigid-body link, not just the root:
+        # for a URDF articulation, DisableGravity on the root does NOT propagate to
+        # the child links, so they fall under gravity -- the robot sinks (looks "in
+        # the ground" with no collision, or falls onto the floor and TIPS once
+        # collision is enabled). Iterating all links keeps the whole vehicle neutrally
+        # floating at its spawn pose.
+        from pxr import Usd
+        _root_prim = get_prim_at_path(robot_path)
+        _n_links = 0
+        for _p in Usd.PrimRange(_root_prim):
+            if _p.HasAPI(UsdPhysics.RigidBodyAPI) or _p.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+                _rb = PhysxSchema.PhysxRigidBodyAPI.Apply(_p)
+                _rb.CreateDisableGravityAttr(True)
+                try:
+                    _rb.GetLinearDampingAttr().Set(lin_d)
+                    _rb.GetAngularDampingAttr().Set(ang_d)
+                except Exception:  # noqa: BLE001
+                    pass
+                _n_links += 1
+        rob_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(_root_prim)
         rob_rb.CreateDisableGravityAttr(True)
-        try:
-            rob_rb.GetLinearDampingAttr().Set(lin_d)
-            rob_rb.GetAngularDampingAttr().Set(ang_d)
-        except Exception:  # noqa: BLE001 - articulation root may differ
-            pass
+        print(f"[oceansim_ros2] disabled gravity on {_n_links} robot link(s)")
         UsdPhysics.MassAPI.Apply(get_prim_at_path(robot_path)).GetMassAttr().Set(mass)
+        # NOTE: robot collision is intentionally NOT enabled on the URDF articulation.
+        # With gravity disabled (above) the vehicle floats at its spawn pose and never
+        # sinks into the seafloor, so a collider is unnecessary -- and enabling one
+        # (convex hull / boundingCube on the articulation root) caused a persistent
+        # spawn-contact TIP (~28deg) without any benefit, since velocity control
+        # (set_linear_velocity) kinematically overrides contact response anyway. Revisit
+        # only with force/thrust-based control, where contacts can actually resist motion.
         SingleRigidPrim(prim_path=robot_path, translation=spawn)
     else:
         print(f"[oceansim_ros2] referencing USD -> {src.path}")
@@ -442,9 +479,21 @@ def main(argv):
             # Isaac native RTX acoustic sensor (experimental). Avoids the 6.0.1
             # pointcloud-annotator SIGSEGV; output mapping is a scaffold (see class).
             from isaacsim.oceansim.sensors.RtxAcousticSensor import RtxAcousticSensor
-            print("[oceansim_ros2] sonar backend: rtx_acoustic (native, experimental)")
+            _sp = cfg.get("sonar_params", {})
+            # rtx_acoustic emits ONE signal way (= one azimuth return) per receiver
+            # mount, so the number of returns == n_elements. Bump it for a denser
+            # fan (the default 8 gives only ~8 returns). Tunable via sonar_params.
+            _n_el = int(_sp.get("n_elements", 64))
+            _cf = float(_sp.get("center_frequency", 1.2e6))  # M300d LF default
+            print(f"[oceansim_ros2] sonar backend: rtx_acoustic (native, experimental), "
+                  f"n_elements={_n_el} receivers, center_frequency={_cf:.3g} Hz")
             sonar = RtxAcousticSensor(
-                range_res=0.005, angular_res=0.25, **_sonar_xform)
+                range_res=_sp.get("range_res", 0.005),
+                angular_res=_sp.get("angular_res", 0.25),
+                hori_fov=_sp.get("hori_fov_deg", 130.0),
+                vert_fov=_sp.get("vert_fov_deg", 20.0),
+                center_frequency=_cf,
+                n_elements=_n_el, **_sonar_xform)
         else:
             from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
             sp = cfg.get("sonar_params", {})

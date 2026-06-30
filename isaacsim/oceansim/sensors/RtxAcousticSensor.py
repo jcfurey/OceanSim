@@ -131,7 +131,7 @@ class RtxAcousticSensor:
                  vert_fov: float = 20.0,
                  angular_res: float = 0.5,
                  n_elements: int = 8,
-                 center_frequency: float = 51200.0,
+                 center_frequency: float = 1200000.0,  # Oculus M300d LF (1.2 MHz)
                  sound_speed: float = 1500.0,
                  sensor_sound_speed: float = 343.0,
                  tick_rate: float = 30.0,
@@ -193,7 +193,14 @@ class RtxAcousticSensor:
         return None
 
     def _build_acoustic_attributes(self) -> dict:
-        attrs = {"omni:sensor:WpmAcoustic:centerFrequency": self.center_frequency}
+        # azSpanDeg/elSpanDeg set the sensor's raytraced fan to the configured FOV
+        # (default schema is 90deg az); without them receivers fanned beyond +-45deg
+        # get no returns. Matches the Oculus aperture (e.g. M300d LF 130x20).
+        attrs = {
+            "omni:sensor:WpmAcoustic:centerFrequency": self.center_frequency,
+            "omni:sensor:WpmAcoustic:azSpanDeg": self.hori_fov,
+            "omni:sensor:WpmAcoustic:elSpanDeg": self.vert_fov,
+        }
         half = np.deg2rad(self.hori_fov) / 2.0
         angles = np.linspace(-half, half, self._n_elements)
         for i, a in enumerate(angles):
