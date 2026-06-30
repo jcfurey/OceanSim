@@ -149,6 +149,39 @@ def test_root_link_world_convention(u):
     assert np.allclose(tr, [0.3, 0.0, 0.0])             # relative to base, not 5.3
 
 
+def test_find_link_namespaced_leaf_match(u):
+    # ROS-stack URDFs namespace sensor frames (e.g. sonar0/sonar_link). The leaf
+    # segment matches a candidate, so it is found live instead of falling back.
+    urdf = """<robot name="r">
+      <link name="base_link"/><link name="sonar0/sonar_link"/>
+      <joint name="j" type="fixed"><parent link="base_link"/><child link="sonar0/sonar_link"/>
+        <origin xyz="0.2775 0 0.04" rpy="0 0.5235987756 0"/></joint>
+    </robot>"""
+    assert u.find_link(urdf, ["sonar", "sonar_link"]) == "sonar0/sonar_link"
+    # and the pose composes correctly off the namespaced link
+    tr, rpy = u.sensor_mount(urdf, "sonar")
+    assert np.allclose(tr, [0.2775, 0.0, 0.04])
+    assert np.allclose(rpy, [0.0, 30.0, 0.0], atol=1e-4)
+
+
+def test_find_link_ambiguous_namespace_falls_back(u):
+    # Two namespaced links share a matching leaf -> ambiguous -> no match (the
+    # caller falls back to the spec mount rather than guessing the wrong frame).
+    urdf = """<robot name="r">
+      <link name="base_link"/><link name="sonar0/sonar_link"/><link name="sonar1/sonar_link"/>
+      <joint name="j0" type="fixed"><parent link="base_link"/><child link="sonar0/sonar_link"/>
+        <origin xyz="0.2 0 0" rpy="0 0 0"/></joint>
+      <joint name="j1" type="fixed"><parent link="base_link"/><child link="sonar1/sonar_link"/>
+        <origin xyz="0.3 0 0" rpy="0 0 0"/></joint>
+    </robot>"""
+    assert u.find_link(urdf, ["sonar_link"]) is None
+
+
+def test_find_link_exact_still_wins(u):
+    # A non-namespaced exact match is preferred over any leaf scan (unchanged).
+    assert u.find_link(URDF, ["sonar_link"]) == "sonar_link"
+
+
 def test_root_link_prefers_connected_over_isolated(u):
     # A stray decorative link is also "childless"; the kinematic root (one that
     # parents a joint) must be chosen deterministically.

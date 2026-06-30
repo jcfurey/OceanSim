@@ -166,13 +166,29 @@ def sensor_link(urdf_text, kind, candidates=None):
 
 
 def find_link(urdf_text, candidates):
-    """First link in ``candidates`` that exists in the URDF (case-insensitive),
-    returned with its actual casing; None if none match."""
+    """The URDF link matching one of ``candidates`` (case-insensitive), or None.
+
+    1. Exact full-name match (e.g. candidate ``sonar_link`` -> link ``sonar_link``).
+    2. Otherwise, a namespaced link whose LEAF segment (after the last ``/``)
+       equals a candidate -- e.g. candidate ``sonar_link`` -> link
+       ``sonar0/sonar_link`` -- but ONLY when exactly one link's leaf matches.
+       This lets ROS-stack URDFs that namespace their sensor frames be read live
+       (instead of falling back to the platform spec mount), while the
+       single-match requirement means an ambiguous namespace (two sub-links with
+       a matching leaf) is never resolved to the wrong frame -- it falls back.
+    """
     _, links = _parse(urdf_text)
+    cset = {c.lower() for c in candidates}
+
     lower = {l.lower(): l for l in links}
     for c in candidates:
         if c.lower() in lower:
             return lower[c.lower()]
+
+    leaf_hits = [l for l in links
+                 if "/" in l and l.rsplit("/", 1)[-1].lower() in cset]
+    if len(leaf_hits) == 1:
+        return leaf_hits[0]
     return None
 
 
