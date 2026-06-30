@@ -195,20 +195,43 @@ Calibration gaps (all in `RtxAcousticSensor._build_acoustic_attributes` +
    `FIRST VALID acoustic frame 1: numElements=2560`, sonar publishing on ROS ~2 Hz,
    odom ~22 Hz, 0 hydra warnings.
 
-   REMAINING (calibration, separate task): the GMO `timeOffsetNs` come back all 0
-   (`t_ns=[0,0]`) -> every sample maps to range 0, so the folded image collapses.
-   rtx_acoustic now CAPTURES; making the output physically correct (range/timing +
-   the Oculus geometry) is the next step -- see the calibration roadmap below.
+   ===========================================================================
+   *** RANGE/TIMING CALIBRATED (2026-06-30) -- the timeOffsetNs=0 blocker is FIXED. ***
+   The acoustic GMO is NOT a per-sample point cloud: it is SIGNAL WAYS (A-scans).
+   `numElements = numSgws * numSamplesPerSgw`, laid out as numSgws contiguous
+   row-major blocks; each block is one signal way's amplitude envelope vs SAMPLE
+   INDEX. Range lives in the sample index, NOT in `timeOffsetNs` (always 0 for
+   acoustic -- Isaac's own examples never read it). The fix (committed):
+   `fold_gmo_to_grid` reshapes scalar -> (numSgws, numSamplesPerSgw) and maps
+   sample k -> range = range_offset + k * meters_per_sample, with
+   `meters_per_sample = c_sensor * sampleDuration / 2`. Measured constants (isolated
+   GMO dump `dump_acoustic_gmo.py`, 4 point targets @ known range/azimuth; fit R vs
+   peak-sample-index):
+     - `numSamplesPerSgw = 320` -- ONLY populated at aux_output_level="BASIC"; the
+       GMO header maxRangeM/minAzRad/numSgws... are 0 unless BASIC is set.
+     - `sampleDuration = 1.024e-4 s` -- a READABLE prim attr
+       (`omni:sensor:WpmAcoustic:sampleDuration`), read at sonar_initialize.
+     - The sensor models AIR, **c_sensor ~= 343 m/s** (NO sound-speed attr exists) ->
+       meters_per_sample ~= 0.01756 (empirical fit 0.01754). So the range window is
+       only **~6 m** (320*0.01756) -- a HARD CAP for an underwater sonar wanting
+       10 m+ (numSamplesPerSgw is not obviously settable). OceanSim sound_speed=1500
+       is IRRELEVANT here; `sensor_sound_speed=343` is a new RtxAcousticSensor ctor arg.
+     - `range_offset ~= 0.40 m` (~= c_sensor * pulseDuration/2, pulseDuration=2.5e-3 s
+       attr -- the pulse-length echo delay).
+   Verify on the full sim: the `FOLDED grid` log (lit cells + range-bin extent, proves
+   the image is no longer collapsed) and the `FIRST VALID` line (numSgws,
+   meters_per_sample).
    ===========================================================================
 
-1. **Receiver array** — currently 8 placeholder elements at 2 cm spacing across the
-   FOV. Replace with the real Oculus receiver geometry (element count + spacing);
-   this sets the achievable azimuth resolution.
-2. **Beamforming (the core gap)** — `fold_gmo_to_grid` maps ~8 receivers onto 520
-   beams, so azimuth is quantized to ~8 values. Need delay-and-sum beamforming
-   across the receiver elements to synthesize the 520 beams — or configure the
-   `AcousticSensor` to emit beam-resolved GMO directly (check `aux_output_level` /
-   `rxGroup` semantics).
+1. **Receiver array / azimuth source** — per-element x/y/z (tx/rx/ch ids) are
+   UNRELIABLE at BASIC (y was mostly 0 with sparse 1s), so azimuth currently comes
+   from the signal-way INDEX (linear spread), not per-element rx. The sensor FOV is
+   `azSpanDeg=elSpanDeg=90` (+-45deg), NOT the 130deg OceanSim sets. Replace the 8
+   placeholder mounts with the real Oculus receiver geometry to set azimuth resolution.
+2. **Beamforming (the core gap)** — azimuth resolution == number of signal ways, so
+   only that many of the 520 beams are lit. Need delay-and-sum beamforming across the
+   receiver elements to synthesize the 520 beams — or configure the `AcousticSensor`
+   to emit beam-resolved GMO directly (check `rxGroup` / firingSeq semantics).
 3. **Intensity** — map GMO amplitude → sonar-intensity scale (vs the reflectivity
    model the `oceansim` backend uses).
 4. **Validation** — compare range/azimuth/intensity vs `oceansim` on the same scene,

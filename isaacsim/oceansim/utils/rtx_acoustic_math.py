@@ -1,51 +1,66 @@
 """Pure (numpy-only) folding of acoustic GenericModelOutput samples into the
 OceanSim ``(n_range, n_beams)`` intensity grid.
 
-Extracted from ``RtxAcousticSensor.make_sonar_data`` so the time->range and
-receiver->beam mapping (an experimental scaffold that still needs calibrating
-against real sonar geometry) is unit testable without Isaac Sim, and so the
-accumulation can be optimised against a characterisation test.
+Extracted from ``RtxAcousticSensor.make_sonar_data`` so the sample->range and
+signal-way->beam mapping is unit testable without Isaac Sim.
+
+GMO layout (measured against Isaac 6.0.1, ``aux_output_level="BASIC"``): the
+acoustic GMO is organised as **signal ways**, NOT a per-sample point cloud --
+``numElements = numSgws * numSamplesPerSgw``, laid out as ``numSgws`` *contiguous
+row-major blocks*. Each block is one signal way's amplitude envelope vs SAMPLE
+INDEX (an A-scan). Range lives in the sample index; the per-element
+``timeOffsetNs`` field is ALWAYS 0 for acoustic (the original ``range =
+sound_speed * timeOffsetNs / 2`` model collapsed every sample to range 0). Sample
+``k`` maps to range ``range_offset + k * meters_per_sample`` where
+``meters_per_sample = c_sensor * sampleDuration / 2`` (the sensor models air,
+c~=343 m/s; ``sampleDuration`` is a readable prim attribute).
 """
 
 import numpy as np
 
 
-def fold_gmo_to_grid(rx, amp, t_ns, sound_speed, min_range, range_res,
-                     n_range, n_beams, n_elements):
-    """Fold per-sample acoustic returns into a normalised intensity grid.
+def fold_gmo_to_grid(amp, num_samples_per_sgw, meters_per_sample, range_offset,
+                     min_range, range_res, n_range, n_beams):
+    """Fold acoustic signal-way A-scans into a normalised ``(n_range, n_beams)`` grid.
 
-    For each sample: range = sound_speed * t / 2 (t in ns) -> range bin; receiver
-    mount id -> beam by a linear spread across the receiver fan. ``|amplitude|`` is
-    accumulated per (range, beam) cell (bincount over flattened indices -- many
-    samples share a cell), then the grid is normalised by its peak.
+    ``amp`` is the flat GMO ``scalar`` buffer (``numSgws * num_samples_per_sgw``
+    amplitude samples). It is reshaped to ``(numSgws, num_samples_per_sgw)``; each
+    row is one signal way's A-scan. Sample ``k`` maps to range
+    ``range_offset + k * meters_per_sample`` -> a range bin. Each signal way's
+    INDEX maps linearly to an azimuth beam (the GMO carries no per-sample azimuth;
+    true delay-and-sum beamforming across the receiver array is a separate task).
+    ``|amplitude|`` is accumulated per (range_bin, beam) then peak-normalised.
 
     Returns a float32 ``(n_range, n_beams)`` array in [0, 1] (all zeros if there
     are no samples in range).
     """
-    rx = np.asarray(rx)
-    amp = np.asarray(amp)
-    t_ns = np.asarray(t_ns, dtype=np.float64)
+    amp = np.abs(np.asarray(amp, dtype=np.float64))
     grid = np.zeros((n_range, n_beams), dtype=np.float32)
-    if t_ns.size == 0:
+    nspg = int(num_samples_per_sgw)
+    if amp.size == 0 or nspg <= 0 or amp.size < nspg:
         return grid
 
-    rng = sound_speed * (t_ns * 1e-9) / 2.0
-    # Map non-finite ranges (e.g. a missing time sample) to a finite, out-of-range
-    # sentinel (rbin == -1) so the int cast below never sees inf/nan (an undefined
-    # cast). These are dropped by the rbin >= 0 check, same as before.
-    rng = np.where(np.isfinite(rng), rng, min_range - range_res)
-    rbin = np.round((rng - min_range) / range_res).astype(np.int64)
-    n_mounts = max(n_elements, int(rx.max()) + 1 if rx.size else n_elements)
-    beam = np.round(rx.astype(np.float64) / max(n_mounts - 1, 1) * (n_beams - 1)).astype(np.int64)
+    n_sgw = amp.size // nspg
+    a2 = amp[:n_sgw * nspg].reshape(n_sgw, nspg)
 
-    valid = ((rbin >= 0) & (rbin < n_range)
-             & (beam >= 0) & (beam < n_beams))
-    if np.any(valid):
-        flat = rbin[valid] * n_beams + beam[valid]
-        acc = np.bincount(flat, weights=np.abs(amp[valid]),
-                          minlength=n_range * n_beams)
-        grid[:] = acc.reshape(n_range, n_beams)
-        peak = float(grid.max())
-        if peak > 0.0:
-            grid /= peak
+    # sample index -> range bin (shared across all signal ways)
+    k = np.arange(nspg)
+    rng = range_offset + k * meters_per_sample
+    rbin = np.round((rng - min_range) / range_res).astype(np.int64)
+    kv = (rbin >= 0) & (rbin < n_range)
+    if not np.any(kv):
+        return grid
+    rbin_v = rbin[kv]
+
+    # signal-way index -> azimuth beam (linear spread across the fan)
+    beams = np.round(np.arange(n_sgw) / max(n_sgw - 1, 1) * (n_beams - 1)).astype(np.int64)
+
+    for s in range(n_sgw):
+        b = int(beams[s])
+        if 0 <= b < n_beams:
+            np.add.at(grid[:, b], rbin_v, a2[s, kv])
+
+    peak = float(grid.max())
+    if peak > 0.0:
+        grid /= peak
     return grid

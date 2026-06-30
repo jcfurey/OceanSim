@@ -24,23 +24,28 @@ Data delivery (the hard-won part):
   ``rep.orchestrator.step()`` itself, because an explicit pump conflicts with
   ``world.step``'s render control ("renderer failed to advance").
 
-Acoustic GMO field semantics (per create_acoustic_basic.py):
+Acoustic GMO layout (measured against Isaac 6.0.1, aux_output_level="BASIC"): the
+GMO is organised as **signal ways**, NOT a per-sample point cloud.
+``numElements = numSgws * numSamplesPerSgw``, laid out as numSgws *contiguous
+row-major A-scan blocks*. Each block is one signal way's amplitude envelope
+(``scalar``) vs SAMPLE INDEX -- the sample index is the range/TOF axis. The
+per-element ``timeOffsetNs`` is ALWAYS 0 for acoustic (the old ``range =
+sound_speed * timeOffsetNs / 2`` collapsed every sample to range 0); ``x``/``y``/
+``z`` (tx/rx/channel ids) are likewise unreliable at BASIC, so azimuth is taken
+from the signal-way INDEX. Sample ``k`` -> range ``range_offset + k *
+meters_per_sample`` with ``meters_per_sample = c_sensor * sampleDuration / 2``
+(the sensor models AIR, c~=343 m/s; ``sampleDuration`` ~= 1.024e-4 s is a readable
+prim attr) -> a ~6 m range window over 320 samples.
 
-    x      -> transmitter sensor-mount ID
-    y      -> receiver sensor-mount ID
-    z      -> channel ID
-    scalar -> amplitude sample
-    timeOffsetNs -> sample time offset (range = sound_speed * t / 2)
-
-We fold those into the ``(n_range, n_beams)`` intensity grid the rest of the
-OceanSim pipeline expects (``sonar_map``: Warp ``vec3``, channel 2 = intensity in
-[0, 1], consumed by ``OceanSimSensorPublisher``), exposing the same interface as
+We fold those A-scans into the ``(n_range, n_beams)`` intensity grid the rest of
+the OceanSim pipeline expects (``sonar_map``: Warp ``vec3``, channel 2 = intensity
+in [0, 1], consumed by ``OceanSimSensorPublisher``), exposing the same interface as
 ``ImagingSonarSensor`` so the two backends are interchangeable via ``sonar_backend``.
 
-STATUS: EXPERIMENTAL.  The Tx/Rx fan authored below is a placeholder array and the
-time->range / receiver->azimuth mapping is a first pass needing calibration
-against real sonar geometry.  Range comes from real time-of-flight; azimuth from
-the fanned receiver geometry.
+STATUS: EXPERIMENTAL.  Range is now calibrated (sample index -> range via the
+sensor's sampleDuration). REMAINING: azimuth resolution == number of signal ways
+(no per-sample azimuth; needs delay-and-sum beamforming -- see RTX_SONAR_BACKENDS.md
+item #2), the ~6 m air-medium range cap, and the 90deg sensor FOV vs Oculus 130deg.
 """
 
 from __future__ import annotations
@@ -96,12 +101,13 @@ def _ensure_gmo_writer():
                     n = int(getattr(gmo, "numElements", 0) or 0)
                     if n <= 0:
                         continue
+                    # numSamplesPerSgw is the A-scan length: numElements = numSgws *
+                    # numSamplesPerSgw, the 640/2560/... samples laid out as numSgws
+                    # contiguous A-scan blocks. ONLY populated at aux_output_level=BASIC.
                     self.latest = {
                         "n": n,
-                        "tx": _gmo_field(gmo.x, n).astype(np.int64),
-                        "rx": _gmo_field(gmo.y, n).astype(np.int64),
+                        "nspg": int(getattr(gmo, "numSamplesPerSgw", 0) or 0),
                         "amp": _gmo_field(gmo.scalar, n).astype(np.float32),
-                        "t_ns": _gmo_field(gmo.timeOffsetNs, n).astype(np.float64),
                     }
             except Exception as exc:  # noqa: BLE001 - never throw inside the SDG pipeline
                 print(f"[{_GMO_WRITER_NAME}] write error: {exc}", flush=True)
@@ -127,6 +133,7 @@ class RtxAcousticSensor:
                  n_elements: int = 8,
                  center_frequency: float = 51200.0,
                  sound_speed: float = 1500.0,
+                 sensor_sound_speed: float = 343.0,
                  tick_rate: float = 30.0,
                  name: str = "RtxAcousticSonar"):
         self._name = name
@@ -145,8 +152,19 @@ class RtxAcousticSensor:
         # reports the real acoustic frequency in ProjectedSonarImage.ping_info.
         self.frequency = self.center_frequency
         self.sound_speed = float(sound_speed)
+        # The Isaac RTX acoustic sensor raytraces time-of-flight in AIR (c~=343 m/s;
+        # there is NO sound-speed attribute on the WpmAcoustic schema). Range per
+        # A-scan sample is c_sensor * sampleDuration / 2, so this -- NOT the
+        # underwater self.sound_speed -- sets the sample->range mapping below.
+        self.sensor_sound_speed = float(sensor_sound_speed)
         self.tick_rate = float(tick_rate)
         self._n_elements = int(n_elements)
+
+        # sample->range mapping, finalised in sonar_initialize from the prim's
+        # sampleDuration/pulseDuration attrs. Fallback assumes the measured
+        # sampleDuration=1.024e-4 s, pulseDuration=2.5e-3 s (Isaac 6.0.1 defaults).
+        self.meters_per_sample = self.sensor_sound_speed * 1.024e-4 / 2.0
+        self.range_offset = self.sensor_sound_speed * 2.5e-3 / 2.0
 
         self.n_range = max(1, int(round((self.max_range - self.min_range) / self.range_res)))
         self.n_beams = max(1, int(round(self.hori_fov / self.angular_res)))
@@ -157,6 +175,7 @@ class RtxAcousticSensor:
         self._rep = None
         self._frame_i = 0
         self._logged_valid = False
+        self._logged_fold = False
         self._map_np = np.zeros((self.n_range, self.n_beams, 3), dtype=np.float32)
         self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
 
@@ -223,6 +242,29 @@ class RtxAcousticSensor:
                 self._acoustic.set_world_poses(positions=self._translation.reshape(1, 3))
             except Exception:  # noqa: BLE001
                 pass
+
+        # Read the acoustic timing from the prim so the sample->range mapping tracks
+        # the real sensor config: range(k) = range_offset + k * meters_per_sample,
+        # meters_per_sample = c_sensor * sampleDuration / 2 (sensor models air), and
+        # range_offset ~= c_sensor * pulseDuration / 2 (the pulse-length echo delay).
+        try:
+            import omni.usd
+            from pxr import Usd  # noqa: F401
+            stage = omni.usd.get_context().get_stage()
+            prim = stage.GetPrimAtPath(str(self._acoustic.paths[0]))
+            sd = prim.GetAttribute("omni:sensor:WpmAcoustic:sampleDuration")
+            pd = prim.GetAttribute("omni:sensor:WpmAcoustic:pulseDuration")
+            if sd and sd.IsValid() and sd.Get():
+                self.meters_per_sample = self.sensor_sound_speed * float(sd.Get()) / 2.0
+            if pd and pd.IsValid() and pd.Get():
+                self.range_offset = self.sensor_sound_speed * float(pd.Get()) / 2.0
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self._name}] could not read acoustic timing attrs "
+                  f"(using fallback mps={self.meters_per_sample:.5f}): {exc}", flush=True)
+        print(f"[{self._name}] sample->range: meters_per_sample={self.meters_per_sample:.5f} m, "
+              f"range_offset={self.range_offset:.3f} m, "
+              f"sensor range window~={self.range_offset + self.meters_per_sample * 320:.2f} m "
+              f"(c_sensor={self.sensor_sound_speed:.0f} m/s, air)", flush=True)
         # annotators=[] -- the writer brings its own GenericModelOutput annotator.
         self._sensor = AcousticSensor(self._acoustic, annotators=[])
         writer_name = _ensure_gmo_writer()
@@ -257,24 +299,42 @@ class RtxAcousticSensor:
             return
 
         n = int(latest["n"])
-        tx, rx = latest["tx"], latest["rx"]
-        amp, t_ns = latest["amp"], latest["t_ns"]
+        amp = latest["amp"]
+        nspg = int(latest.get("nspg", 0) or 0)
+        n_sgw = (n // nspg) if nspg > 0 else 0
 
         if not self._logged_valid:
             self._logged_valid = True
             print(f"[{self._name}] FIRST VALID acoustic frame {self._frame_i}: "
-                  f"numElements={n}, tx={np.unique(tx).tolist()[:8]}, "
-                  f"rx={np.unique(rx).tolist()[:8]}, "
-                  f"t_ns=[{t_ns.min():.0f},{t_ns.max():.0f}], "
-                  f"|amp|=[{np.abs(amp).min():.4g},{np.abs(amp).max():.4g}]", flush=True)
+                  f"numElements={n}, numSamplesPerSgw={nspg}, numSgws={n_sgw}, "
+                  f"|amp|=[{np.abs(amp).min():.4g},{np.abs(amp).max():.4g}], "
+                  f"meters_per_sample={self.meters_per_sample:.5f}, "
+                  f"range_offset={self.range_offset:.3f}", flush=True)
 
-        # Fold the GMO samples into the (n_range, n_beams) intensity grid
-        # (rtx_acoustic_math.fold_gmo_to_grid is pure numpy + unit tested).
+        # Fold the signal-way A-scans into the (n_range, n_beams) intensity grid:
+        # range(k) = range_offset + k * meters_per_sample (sample index = range axis;
+        # the per-element timeOffsetNs is always 0 for acoustic). Pure numpy + unit tested.
         self._map_np[:] = 0.0
         self._map_np[:, :, 2] = rtx_acoustic_math.fold_gmo_to_grid(
-            rx, amp, t_ns, self.sound_speed, self.min_range, self.range_res,
-            self.n_range, self.n_beams, self._n_elements)
+            amp, nspg, self.meters_per_sample, self.range_offset,
+            self.min_range, self.range_res, self.n_range, self.n_beams)
         self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
+
+        # One-time post-fold sanity: prove the image is NOT collapsed (the old
+        # timeOffsetNs=0 bug put everything in/below bin 0). Reports how many
+        # range/beam cells are lit and the range extent actually hit.
+        if not self._logged_fold:
+            self._logged_fold = True
+            inten = self._map_np[:, :, 2]
+            rbins, beams = np.nonzero(inten)
+            if rbins.size:
+                print(f"[{self._name}] FOLDED grid: {rbins.size} lit cells, "
+                      f"range bins [{rbins.min()},{rbins.max()}] "
+                      f"= [{self.min_range + rbins.min()*self.range_res:.2f},"
+                      f"{self.min_range + rbins.max()*self.range_res:.2f}] m, "
+                      f"beams hit={np.unique(beams).size}/{self.n_beams}", flush=True)
+            else:
+                print(f"[{self._name}] FOLDED grid is EMPTY (collapsed!) -- check calibration", flush=True)
 
     def close(self):
         try:
