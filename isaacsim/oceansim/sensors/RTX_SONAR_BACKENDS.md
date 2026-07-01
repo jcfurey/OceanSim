@@ -381,6 +381,70 @@ Tasks:
 
 Effort: **medium**. Geometric (no acoustic speckle/multipath) but fast + direct.
 
+===========================================================================
+*** BLOCKED (2026-07-01) -- isolated smoke test never got a valid GMO frame.
+Parked; not started on the real `RtxLidarSensor` class. ***
+
+Schema research (via the `omniSensorGenericLidarCoreAPI.h` /
+`...EmitterStateAPI.h` C++ headers in the image, the same way `firingSeq` was
+found for the acoustic sensor) found a promising-looking custom-scan path:
+`omni:sensor:Core:scanType="SOLID_STATE"` (no mechanical rotation),
+`omni:sensor:Core:instantLidar=true` ("produce one full scan at frame end
+timepoint disregarding actual timing and scan rates"),
+`omni:sensor:Core:elementsCoordsType="SPHERICAL"` (native range/az/el, no XYZ
+reconstruction), and a `MultipleApplyAPI` `EmitterState` schema taking direct
+parallel arrays (`azimuthDeg[]`/`elevationDeg[]`/`fireTimeNs[]`/`channelId[]`)
+for a fully custom ray pattern -- authored via
+`isaacsim.sensors.experimental.rtx.Lidar(path, attributes={...})`, same
+pattern as `Acoustic`.
+
+Two real API gotchas found and fixed along the way (kept here in case anyone
+retries this):
+- Array-valued attributes in the `attributes=` dict must be `pxr.Vt.FloatArray`/
+  `Vt.UIntArray` objects, not plain Python lists -- the Replicator helper
+  (`omni.replicator.core...functional.create_batch.omni_lidar` ->
+  `modify.set_attributes`) does `python_class(*v)` for a `list` value, which
+  *unpacks* it as individual positional args and throws a `Boost.Python.
+  ArgumentError` for any array longer than a few elements.
+- `channelId` is 1-indexed (`channelId 0 at index 0 is greater than the
+  numberOfChannels 128 or less than 1` if you use `range(n)`).
+- The same Motion-BVH boot-arg gotcha as the acoustic sensor applies:
+  `--/renderer/raytracingMotion/enabled=True` must be a `sys.argv` entry set
+  BEFORE `SimulationApp()` is constructed, or you get the "Multi-tick is
+  enabled but motion BVH is not active" warning and an empty frame.
+- `get_data("generic-model-output")` is unreliable here too (same lesson as
+  acoustic) -- use a Replicator `Writer` (`attach_writer`) instead.
+
+None of that was enough to get real data, though. With all of the above
+correctly applied (verified via `rep.orchestrator.set_capture_on_play(True)`
+too), the writer never fired a single frame -- not even an empty one -- under
+EITHER driving method tried:
+- `World.step(render=True)` (matches OceanSim's actual runner): 0 writer
+  frames after 55 steps.
+- `simulation_app.update()` (matches the official reference test
+  `isaacsim.sensors.experimental.rtx.tests.test_lidar_sensor.
+  TestLidarSensor.test_gmo_writer`'s driving pattern): still 0 writer frames,
+  AND a severe unexplained per-call slowdown appeared around iteration 85
+  (2.9s -> 26.5s -> 4s per `update()` call, CPU pegged at 99%, GPU ~idle at
+  2%) with no data ever appearing before the run was killed.
+
+The reference test itself (only found AFTER the above attempts) uses the
+BARE DEFAULT config (no custom `scanType`/`instantLidar`/`EmitterState` at
+all -- just `outputFrameOfReference: "WORLD"` + `aux_output_level: "FULL"`),
+driven by `omni.timeline.play()` + `await next_update_async()` for a full
+3 SECONDS (180 updates at 60fps) before asserting `valid_frame_count > 0` --
+i.e. it tolerates many empty frames before a valid one appears, which our
+smoke test's much shorter windows (55-200 iterations, no real timeline) may
+not have given long enough a runway even ignoring the custom-scan question.
+
+**Not yet tried, and the logical next step if this is picked back up:** run
+the reference test's EXACT recipe verbatim (default config, `timeline.play()`
++ `next_update_async()`, 3s window) first to confirm the baseline pipeline
+captures at all in this image, then reintroduce the custom
+`SOLID_STATE`/`instantLidar`/`EmitterState` attributes one at a time to find
+which one (if any) breaks capture, before writing `RtxLidarSensor` for real.
+===========================================================================
+
 ## Recommended sequencing
 
 1. **`rtx_lidar` first** — medium effort, fast + geometrically correct, an immediate
