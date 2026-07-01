@@ -18,6 +18,7 @@ so, we suggest that make sure the extension isaacsim.ros2.bridge is being setup 
 import rclpy
 
 from isaacsim.oceansim.utils import ros2_context
+from isaacsim.oceansim.utils import ros2_control_math
 
 try:
     from pxr import Gf, PhysxSchema
@@ -40,18 +41,28 @@ class ROS2ControlReceiver:
     for recieving velocity and force command
     """
     
-    def __init__(self, robot_prim, name="ROS2ControlReceiver"):
+    def __init__(self, robot_prim, name="ROS2ControlReceiver",
+                 max_linear_vel=None, max_angular_vel=None,
+                 max_force=None, max_torque=None):
         """
         initialize ROS2 Control Receiver
-        
+
         Args:
             robot_prim: robot prim path
             name (str): receiver name
+            max_linear_vel (float | None): clamp on the incoming linear-velocity
+                vector's magnitude (m/s). None (default) = unbounded.
+            max_angular_vel (float | None): clamp on the incoming angular-velocity
+                vector's magnitude (rad/s). None (default) = unbounded.
+            max_force (float | None): clamp on the incoming force vector's
+                magnitude (N). None (default) = unbounded.
+            max_torque (float | None): clamp on the incoming torque vector's
+                magnitude (N*m). None (default) = unbounded.
         """
         self._name = name
         self._robot_prim = robot_prim
         self._rigid_prim = None  # lazily created SingleRigidPrim, cached across ticks
-        
+
         # configuration
         self._enable_ros2 = False
         self._ros2_acquired = False
@@ -59,7 +70,15 @@ class ROS2ControlReceiver:
         self._ros2_control_mode = ROS2_CONTROL_MODE.VEL  # control mode
         self._ros2_vel_node = None
         self._ros2_force_node = None
-        
+
+        # Command clamping (magnitude-preserving-direction). No repo-documented
+        # physical limits exist for this vehicle today, so these default to
+        # None (unbounded) -- set real numbers here once they're known.
+        self._max_linear_vel = max_linear_vel
+        self._max_angular_vel = max_angular_vel
+        self._max_force = max_force
+        self._max_torque = max_torque
+
         # command cache
         self.force_cmd = [0.0, 0.0, 0.0]
         self.torque_cmd = [0.0, 0.0, 0.0]
@@ -67,6 +86,10 @@ class ROS2ControlReceiver:
         self.angular_vel = [0.0, 0.0, 0.0]
         self.last_command_time = time.time()
         self.command_timeout = 2.0
+        # Set once we've warned about a stale command, so the watchdog logs a
+        # single message per disconnect instead of spamming every tick; reset
+        # as soon as a fresh command arrives.
+        self._stale_warned = False
         self._update_count = 0
         
         # Physics API - using scenario.py created instance
@@ -198,11 +221,14 @@ class ROS2ControlReceiver:
         
         try:
             current_time = time.time()
-            
-            self.linear_vel = [msg.linear.x, msg.linear.y, msg.linear.z]
-            self.angular_vel = [msg.angular.x, msg.angular.y, msg.angular.z]
+
+            self.linear_vel = self._clamp_magnitude(
+                [msg.linear.x, msg.linear.y, msg.linear.z], self._max_linear_vel)
+            self.angular_vel = self._clamp_magnitude(
+                [msg.angular.x, msg.angular.y, msg.angular.z], self._max_angular_vel)
             self.last_command_time = current_time
-            
+            self._stale_warned = False  # fresh command -- watchdog can warn again next time it goes stale
+
             print(f'Received velocity - Linear: {self.linear_vel}, Angular: {self.angular_vel}')
             # self._update_receive_stats(current_time)
 
@@ -224,15 +250,28 @@ class ROS2ControlReceiver:
         try:
             current_time = time.time()
 
-            self.force_cmd = [msg.force.x, msg.force.y, msg.force.z]  # force
-            self.torque_cmd = [msg.torque.x, msg.torque.y, msg.torque.z]  # torque
+            self.force_cmd = self._clamp_magnitude(
+                [msg.force.x, msg.force.y, msg.force.z], self._max_force)
+            self.torque_cmd = self._clamp_magnitude(
+                [msg.torque.x, msg.torque.y, msg.torque.z], self._max_torque)
             self.last_command_time = current_time
+            self._stale_warned = False  # fresh command -- watchdog can warn again next time it goes stale
 
             print(f'Received force - Force: {self.force_cmd}, Torque: {self.torque_cmd}')
 
         except Exception as e:
             print(f'[{self._name}] force Receive Failed: {e}')
-    
+
+    @staticmethod
+    def _clamp_magnitude(vec, max_mag):
+        """Clamp a 3-vector's magnitude to max_mag, preserving direction.
+
+        max_mag=None (the default everywhere in this class) disables clamping.
+        Delegates to ros2_control_math (pure, unit tested independently of
+        rclpy/Isaac Sim -- see tests/test_ros2_control.py).
+        """
+        return ros2_control_math.clamp_magnitude(vec, max_mag)
+
     def update_control(self):
         """
         update control
@@ -243,6 +282,12 @@ class ROS2ControlReceiver:
             return
         
         try:
+            # Dead-man's-switch: if the ROS2 link that feeds this receiver has
+            # dropped (teleop crash, network partition, lost zenoh session),
+            # do not keep actuating the last command received forever -- zero
+            # it out once command_timeout has elapsed with no fresh message.
+            stale = self._is_command_stale()
+
             if self._ros2_control_mode == ROS2_CONTROL_MODE.VEL: # velocity mode
                 # Drain the cmd_vel queue every step with a non-blocking spin --
                 # the same pattern the sensor publisher (ros2_sensors) and camera
@@ -257,10 +302,12 @@ class ROS2ControlReceiver:
 
                 if self._rigid_prim is None:
                     self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
+                lin_cmd = [0.0, 0.0, 0.0] if stale else self.linear_vel
+                ang_cmd = [0.0, 0.0, 0.0] if stale else self.angular_vel
                 # The incoming Twist is a body-frame command (ROS cmd_vel
                 # convention), but Isaac's set_*_velocity take world-frame
                 # vectors. Rotate body -> world by the robot's orientation.
-                lin_w, ang_w = self._body_to_world(self.linear_vel, self.angular_vel)
+                lin_w, ang_w = self._body_to_world(lin_cmd, ang_cmd)
                 self._rigid_prim.set_linear_velocity(lin_w)
                 self._rigid_prim.set_angular_velocity(ang_w)
 
@@ -269,8 +316,10 @@ class ROS2ControlReceiver:
                 if PXR_AVAILABLE:
                     rclpy.spin_once(self._ros2_force_node, timeout_sec=0.0)
 
-                    force_gf = Gf.Vec3f(float(self.force_cmd[0]), float(self.force_cmd[1]), float(self.force_cmd[2]))
-                    torque_gf = Gf.Vec3f(float(self.torque_cmd[0]), float(self.torque_cmd[1]), float(self.torque_cmd[2]))
+                    force_cmd = [0.0, 0.0, 0.0] if stale else self.force_cmd
+                    torque_cmd = [0.0, 0.0, 0.0] if stale else self.torque_cmd
+                    force_gf = Gf.Vec3f(float(force_cmd[0]), float(force_cmd[1]), float(force_cmd[2]))
+                    torque_gf = Gf.Vec3f(float(torque_cmd[0]), float(torque_cmd[1]), float(torque_cmd[2]))
 
                     if self._force_api:
                         try:
@@ -281,6 +330,22 @@ class ROS2ControlReceiver:
 
         except Exception as e:
             print(f'[{self._name}] Control Update Failed: {e}')
+
+    def _is_command_stale(self):
+        """True if no vel/force command has arrived within command_timeout.
+
+        Staleness check delegates to ros2_control_math (pure, unit tested).
+        Logs a single warning per disconnect (not every tick) via
+        self._stale_warned, which the vel/force callbacks reset as soon as a
+        fresh command arrives.
+        """
+        stale = ros2_control_math.is_command_stale(
+            time.time(), self.last_command_time, self.command_timeout)
+        if stale and not self._stale_warned:
+            print(f'[{self._name}] no command received for over '
+                  f'{self.command_timeout}s -- zeroing command (watchdog)')
+            self._stale_warned = True
+        return stale
     
     def _body_to_world(self, lin_body, ang_body):
         """Rotate a body-frame velocity command into the world frame.
@@ -313,6 +378,7 @@ class ROS2ControlReceiver:
             self.torque_cmd = [0.0, 0.0, 0.0]
             self.linear_vel = [0.0, 0.0, 0.0]
             self.angular_vel = [0.0, 0.0, 0.0]
+            self._stale_warned = False
         finally:
             # Always release the shared rclpy context, even if node teardown
             # raised, so the ref count never leaks.

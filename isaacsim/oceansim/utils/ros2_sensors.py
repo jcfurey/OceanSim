@@ -376,7 +376,12 @@ class OceanSimSensorPublisher:
 
         self._static_tf_broadcaster = StaticTransformBroadcaster(self._node)
         base = self._cfg["base_frame_id"]
-        stamp = self._node.get_clock().now().to_msg()
+        # Sim time is genuinely 0.0 here (this runs once at initialize(), before
+        # the sim loop starts stepping) -- use the same _stamp() helper every
+        # other message in this file uses, rather than the node's wall clock
+        # (this node never sets use_sim_time), so /tf_static isn't the one
+        # wall-clock-stamped topic in an otherwise all-sim-time graph.
+        stamp = self._stamp(0.0)
         msgs = []
         for t in transforms:
             child = t.get("child_frame_id")
@@ -628,17 +633,24 @@ class OceanSimSensorPublisher:
         from marine_acoustic_msgs.msg import (
             ProjectedSonarImage, PingInfo, SonarImageData)
 
-        # get_sonar_map_np() returns a host-side grid: in async mode it's the
-        # worker's latest readback (no GPU sync on this sim-thread publish); in
-        # sync mode it reads the device sonar_map. Fall back for backends without it.
+        # get_sonar_map_np() returns (capture_sim_time, grid): capture_sim_time
+        # is the sim time the frame was actually scanned at, which in async mode
+        # can lag the ambient sim_time passed to publish() if the worker is
+        # still catching up -- stamp with it instead of "now" so a slow/stalled
+        # worker is diagnosable (the header stamp stops advancing) rather than
+        # always looking fresh. Fall back to the ambient stamp for backends that
+        # don't report a capture time (e.g. RtxAcousticSensor).
         if hasattr(self._sonar, "get_sonar_map_np"):
-            grid = self._sonar.get_sonar_map_np()
+            result = self._sonar.get_sonar_map_np()
+            capture_time, grid = result if result is not None else (None, None)
         else:
             sonar_map = getattr(self._sonar, "sonar_map", None)
             grid = (sonar_map.numpy() if hasattr(sonar_map, "numpy")
                     else np.asarray(sonar_map) if sonar_map is not None else None)
+            capture_time = None
         if grid is None:
             return
+        stamp = self._stamp(capture_time) if capture_time is not None else stamp
         # (n_range, n_azimuth, 3) vec3 grid; channel 2 is intensity in [0, 1].
         if grid.ndim != 3 or grid.shape[2] < 3 or grid.size == 0:
             return

@@ -44,7 +44,8 @@ class MHL_Sensor_Example_Scenario():
         self._enable_ros2_control = True
         self._ros2_control_mode = "velocity control"
 
-    def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode, sensor_viewports=True):
+    def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode, sensor_viewports=True,
+                       control_params=None):
         self._rob = rob
         # The rigid-body wrapper is created LAZILY on first use in update_scenario
         # (after world.play()), NOT here. A SingleRigidPrim (physics tensor view)
@@ -115,18 +116,24 @@ class MHL_Sensor_Example_Scenario():
             self._rob_forceAPI = PhysxSchema.PhysxForceAPI.Apply(self._rob)
 
             # initialize ROS2ControlReceiver
-            self._setup_ros2_control()
-            
+            self._setup_ros2_control(control_params)
+
         self._running_scenario = True
 
-    def _setup_ros2_control(self):
+    def _setup_ros2_control(self, control_params=None):
         """setup ROS2 control receiver"""
         if not ROS2_CONTROL_AVAILABLE:
             return
-        
+
+        control_params = control_params or {}
         try:
-            self._ros2_control_receiver = ROS2ControlReceiver(self._rob, "ROS2ControlReceiver")
-            
+            self._ros2_control_receiver = ROS2ControlReceiver(
+                self._rob, "ROS2ControlReceiver",
+                max_linear_vel=control_params.get("max_linear_vel"),
+                max_angular_vel=control_params.get("max_angular_vel"),
+                max_force=control_params.get("max_force"),
+                max_torque=control_params.get("max_torque"))
+
             if hasattr(self, '_rob_forceAPI') and self._rob_forceAPI is not None:
                 self._ros2_control_receiver.set_scenario_force_api(self._rob_forceAPI)
 
@@ -198,6 +205,18 @@ class MHL_Sensor_Example_Scenario():
         self._time = 0.0
 
 
+    @staticmethod
+    def _safe_call(fn, *args, name, **kwargs):
+        """Run fn(*args, **kwargs), logging and swallowing any exception instead
+        of letting it propagate. A single transient GPU/CUDA hiccup in sonar or
+        camera compute must not tear down the whole simulation -- every
+        publish call in ros2_sensors.py already gets this same treatment via
+        its _safe() helper; this mirrors it for the compute side."""
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001 -- keep sim alive on compute error
+            print(f'[Scenario] {name} failed: {e}')
+
     def update_scenario(self, step: float, sim_time: float = None, sonar_tick: bool = None):
 
 
@@ -217,14 +236,15 @@ class MHL_Sensor_Example_Scenario():
         # throttle when sonar_tick is None.
         do_sonar = do_sensors if sonar_tick is None else bool(sonar_tick)
         if do_sonar and self._sonar is not None:
-            self._sonar.make_sonar_data()
+            self._safe_call(self._sonar.make_sonar_data, sim_time=sim_time,
+                            name="sonar make_sonar_data")
         if do_sensors:
             self._sensor_accum = 0.0
             if self._cam is not None:
                 # Pass the authoritative sim time (headless runner) so the camera
                 # rate-gates + stamps on the same clock as the other publishers;
                 # None (GUI) keeps the camera's wall-clock gate.
-                self._cam.render(sim_time)
+                self._safe_call(self._cam.render, sim_time, name="camera render")
             if self._DVL is not None:
                 self._DVL_reading = self._DVL.get_linear_vel()
             if self._baro is not None:

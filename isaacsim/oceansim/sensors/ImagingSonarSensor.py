@@ -212,12 +212,24 @@ class ImagingSonarSensor(Camera):
         # it never overwrites scan_data mid-process.
         self.async_compute = self._async_compute_init
         self._async_busy = False
+        # (capture_sim_time, grid) -- capture_sim_time is the sim time scan()
+        # actually ran at (recorded on the main thread in _submit_scan_async),
+        # NOT the time the worker finished processing it or the time the
+        # publisher later reads it. Lets the publisher stamp messages with
+        # when the data was captured instead of "now", and lets a stalled/dead
+        # worker's frozen frame be detected (the capture time stops advancing).
         self._async_result = None
+        self._async_capture_time = None
         self._async_lock = threading.Lock()
         self._async_scan_evt = threading.Event()
         self._async_stop = False
         self._async_params = {}
         self._async_thread = None
+        # Sim time of the most recent successful scan in SYNC (non-async) mode,
+        # for the same reason -- kept separate from _async_capture_time so
+        # get_sonar_map_np() has a uniform (capture_time, grid) contract
+        # regardless of backend mode.
+        self._last_sync_capture_time = None
         if self.async_compute:
             self._async_thread = threading.Thread(
                 target=self._async_worker, name=f"{self._name}_sonar_worker", daemon=True)
@@ -597,6 +609,8 @@ class ImagingSonarSensor(Camera):
                         intensity_gain: float = 1.0, # scale intensity after normalization
                         central_peak: float = 2, # control the strength of the streak
                         central_std: float = 0.001, # control the spread of the streak
+                        sim_time: float = None, # sim time this scan is captured at (for
+                                      # publisher header stamps); None if unknown/unused.
                         _skip_scan: bool = False, # internal: worker has already run scan() on
                                       # the main thread; run only the kernels on the live scan_data.
                         ):
@@ -629,10 +643,17 @@ class ImagingSonarSensor(Camera):
                 query_prop=query_prop, attenuation=attenuation,
                 gau_noise_param=gau_noise_param, ray_noise_param=ray_noise_param,
                 intensity_offset=intensity_offset, intensity_gain=intensity_gain,
-                central_peak=central_peak, central_std=central_std))
+                central_peak=central_peak, central_std=central_std),
+                sim_time=sim_time)
             return
 
         if _skip_scan or self.scan():
+            if not _skip_scan:
+                # True sync-mode scan (not the async worker re-entering with the
+                # main thread's already-captured scan_data) -- record when it
+                # happened so get_sonar_map_np()/the publisher can stamp with the
+                # actual capture time instead of "now".
+                self._last_sync_capture_time = sim_time
             num_points = self.scan_data['pcl'].shape[0]
             # Reflectivity lookup (semantic id -> reflectivity). The mapping is a
             # pure function of (idToLabels, query_prop), which only changes when
@@ -854,16 +875,23 @@ class ImagingSonarSensor(Camera):
         self.id += 1
     
 
-    def _submit_scan_async(self, params):
+    def _submit_scan_async(self, params, sim_time=None):
         """Main-thread half of async sonar: scan() (reads the annotators) then hand
         the device-resident scan_data to the worker. Skips entirely while the worker
         is still processing the previous scan, so scan_data is never overwritten
-        mid-process (which also self-throttles scans to the worker's throughput)."""
+        mid-process (which also self-throttles scans to the worker's throughput).
+
+        sim_time is the sim time THIS scan actually ran at -- recorded here (main
+        thread, at the moment scan() succeeds), not when the worker later finishes
+        processing it. _async_capture_time is only written here and only read by
+        the worker after this same call sets _async_busy=True, so it can't be
+        overwritten mid-cycle without going through the busy-gate above."""
         if self._async_busy:
             return
         if not self.scan():
             return
         self._async_params = params
+        self._async_capture_time = sim_time
         self._async_busy = True
         self._async_scan_evt.set()
 
@@ -879,27 +907,33 @@ class ImagingSonarSensor(Camera):
             if self._async_stop:
                 break
             try:
+                capture_time = self._async_capture_time
                 with wp.ScopedDevice(self._device):
                     self.make_sonar_data(_skip_scan=True, **self._async_params)
                     grid = self.sonar_map.numpy()
                 with self._async_lock:
-                    self._async_result = grid
+                    self._async_result = (capture_time, grid)
             except Exception as exc:  # noqa: BLE001
                 print(f"[{self._name}] async sonar worker error ({exc!r})", flush=True)
             finally:
                 self._async_busy = False
 
     def get_sonar_map_np(self):
-        """Host-side (n_range, n_azimuth, 3) sonar_map for the publisher. Async mode
-        returns the worker's latest readback (no GPU sync on the caller); sync mode
-        reads the device sonar_map directly. None if nothing has been produced yet."""
+        """(capture_sim_time, grid) for the publisher, where grid is the host-side
+        (n_range, n_azimuth, 3) sonar_map. Async mode returns the worker's latest
+        readback (no GPU sync on the caller) paired with the sim time THAT scan
+        was captured at -- which can lag the caller's current sim time if the
+        worker is still catching up. Sync mode reads the device sonar_map
+        directly, paired with the sim time of the scan that produced it. Returns
+        None if nothing has been produced yet."""
         if getattr(self, 'async_compute', False):
             with self._async_lock:
                 return self._async_result
         sm = getattr(self, 'sonar_map', None)
         if sm is None:
             return None
-        return sm.numpy() if hasattr(sm, 'numpy') else np.asarray(sm)
+        grid = sm.numpy() if hasattr(sm, 'numpy') else np.asarray(sm)
+        return (self._last_sync_capture_time, grid)
 
     def set_render_enabled(self, enabled: bool):
         """Enable/disable this sonar camera's render-product updates. The sonar

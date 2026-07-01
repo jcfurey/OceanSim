@@ -109,6 +109,12 @@ def load_config(args):
         "physics_dt": 1.0 / 60.0,
         "rendering_dt": 1.0 / 60.0,
         "control_mode": "ROS control",
+        # Optional clamps on incoming ROS2 vel/force commands (magnitude,
+        # direction-preserving). None = unbounded. No repo-documented
+        # physical limits exist yet for this vehicle -- set real numbers
+        # here once they're known.
+        "control_params": {"max_linear_vel": None, "max_angular_vel": None,
+                           "max_force": None, "max_torque": None},
         "scene_usd": "",
         "asset_path": "",
         # Vehicle platform (utils.platforms). Its spec provides the USD, mass,
@@ -530,7 +536,8 @@ def main(argv):
     world.reset()
     scenario = MHL_Sensor_Example_Scenario()
     scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"],
-                            sensor_viewports=bool(cfg.get("sensor_viewports", True)))
+                            sensor_viewports=bool(cfg.get("sensor_viewports", True)),
+                            control_params=cfg.get("control_params"))
     # Throttle the heavy sensor compute to sensor_compute_rate (0 = every step).
     _scr = float(cfg.get("sensor_compute_rate", 0.0) or 0.0)
     scenario._sensor_update_period = (1.0 / _scr) if _scr > 0 else 0.0
@@ -629,7 +636,17 @@ def main(argv):
     # does NOT force it on.
     _sonar_render_rate = float(cfg.get("sonar_params", {}).get("render_rate", 0.0) or 0.0)
     _sonar_render_period = (1.0 / _sonar_render_rate) if _sonar_render_rate > 0 else 0.0
-    _sonar_gating = sonar is not None and _sonar_render_period > 0.0
+    # render_rate/gating only applies to the "oceansim" backend's sonar CAMERA
+    # (ready_for_scan()/set_render_enabled() are ImagingSonarSensor-only methods
+    # that RtxAcousticSensor does not implement -- calling them on that backend
+    # raises AttributeError). Warn instead of crashing if the config combo is set.
+    _sonar_backend = cfg.get("sonar_backend", "oceansim")
+    if _sonar_render_period > 0.0 and _sonar_backend != "oceansim":
+        print(f"[oceansim_ros2] sonar_params.render_rate is ignored for "
+              f"sonar_backend={_sonar_backend!r} (only the 'oceansim' backend "
+              f"supports render gating)")
+    _sonar_gating = (sonar is not None and _sonar_render_period > 0.0
+                      and _sonar_backend == "oceansim")
     _last_sonar_scan = -1e9
     print("[oceansim_ros2] simulation running; publishing ROS2 sensor data"
           + (f" (sonar render gated, cap={_sonar_render_rate or 'worker'} Hz)"
