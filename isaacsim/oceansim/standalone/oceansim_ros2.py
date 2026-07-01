@@ -494,6 +494,16 @@ def main(argv):
             print(f"[oceansim_ros2] sonar backend: rtx_acoustic (native, experimental), "
                   f"n_elements={_n_el} receivers, center_frequency={_cf:.3g} Hz")
             sonar = RtxAcousticSensor(
+                # The sensor's own physics caps real range at ~6.05 m (see
+                # RtxAcousticSensor's meters_per_sample/range_offset comment) --
+                # RtxAcousticSensor's class default max_range=10.0 m is sized for
+                # the geometric `oceansim` backend and, applied here, pads ~40%
+                # of the (n_range, n_beams) grid with always-zero rows. That
+                # bloats drawn_sonar to ~21 MB/frame (1980x3590 rgb8), which is
+                # what was overrunning foxglove_bridge's send buffer. Default to
+                # the physical ceiling here; still overridable via sonar_params.
+                min_range=_sp.get("min_range", 0.1),
+                max_range=_sp.get("max_range", 6.2),
                 range_res=_sp.get("range_res", 0.005),
                 angular_res=_sp.get("angular_res", 0.25),
                 hori_fov=_sp.get("hori_fov_deg", 130.0),

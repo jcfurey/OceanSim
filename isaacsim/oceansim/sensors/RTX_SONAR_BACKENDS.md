@@ -22,6 +22,14 @@ the full GUI on**. So the odom ceiling was the sonar camera render, not the GUI.
 The RTX backends are the performance path; their remaining work is **calibration /
 fidelity, not speed**. (`OCEANSIM_SONAR_BACKEND=rtx_acoustic` reproduces this.)
 
+> **CAVEAT: the 84 Hz / 6.4 Hz `rtx_acoustic` row above was measured with the
+> acoustic sensor effectively IDLE** (capture was broken at the time — see the
+> SOLVED block below). With capture + calibration actually working, measured
+> throughput (headless, full DeepTrekker + camera + sonar pipeline, 2026-07-01)
+> is **odom ~22 Hz, sonar/drawn_sonar ~1.9 Hz** — still well above `oceansim`'s
+> ~16 Hz / ~1.3 Hz, but nowhere near the idle-sensor numbers. Re-measure GPU
+> util once a proper before/after comparison matters.
+
 ## Selection + shared interface
 
 Pick via `sonar_backend: oceansim | rtx_acoustic | rtx_lidar` in scenario.json,
@@ -223,21 +231,132 @@ Calibration gaps (all in `RtxAcousticSensor._build_acoustic_attributes` +
    meters_per_sample).
    ===========================================================================
 
-1. **Receiver array / azimuth source** — per-element x/y/z (tx/rx/ch ids) are
-   UNRELIABLE at BASIC (y was mostly 0 with sparse 1s), so azimuth currently comes
-   from the signal-way INDEX (linear spread), not per-element rx. The sensor FOV is
-   `azSpanDeg=elSpanDeg=90` (+-45deg), NOT the 130deg OceanSim sets. Replace the 8
-   placeholder mounts with the real Oculus receiver geometry to set azimuth resolution.
-2. **Beamforming (the core gap)** — azimuth resolution == number of signal ways, so
-   only that many of the 520 beams are lit. Need delay-and-sum beamforming across the
-   receiver elements to synthesize the 520 beams — or configure the `AcousticSensor`
-   to emit beam-resolved GMO directly (check `rxGroup` / firingSeq semantics).
-3. **Intensity** — map GMO amplitude → sonar-intensity scale (vs the reflectivity
-   model the `oceansim` backend uses).
-4. **Validation** — compare range/azimuth/intensity vs `oceansim` on the same scene,
-   and vs real Oculus pings (rosbag via `oculus_sonar_driver`) if available.
+   ===========================================================================
+   *** M300D CALIBRATION + PROJECTEDSONARIMAGE FORMAT ALIGNED (2026-06-30). ***
+   Items 1 and 3 below are DONE, and item 2 (beamforming) is DIAGNOSED AS NOT
+   ACHIEVABLE with this sensor's data — not a remaining task, an accepted physical
+   limit. Details:
+   - **Receiver array capped, FOV corrected.** `azSpanDeg`/`elSpanDeg` are real
+     settable acoustic attrs (schema default 90) — set to the Oculus M300d LF FOV
+     130x20 deg. Receiver-mount count has a **hard cap <256**: 256/512 mounts fail
+     with RTXMemUtil "buffer with size 0" (no data); 128 is the usable max. So
+     azimuth resolution is fixed at **128 signal ways -> 128 of the 520 output
+     beams lit**, one per receiver (not per-element rx ids, which stay unreliable
+     at BASIC).
+   - **True delay-and-sum beamforming is NOT possible**: the GMO `scalar` is an
+     all-positive ENVELOPE (min = noiseMin, no phase information), and the
+     receivers are directional elements on a ~2cm array. Without phase you cannot
+     synthesize additional beams from the 128 physical receivers — more beams
+     would require more receiver mounts, which are capped at 128. **For a full
+     520-beam image, use the `oceansim` backend.** This closes item 2 as a known
+     limitation rather than an open task.
+   - **ProjectedSonarImage format aligned** to `oculus_sonar_driver/
+     ping_to_sonar_image.h`: `ranges` are bin CENTRES `(i+0.5)*range_res`;
+     `rx_beamwidths`/`tx_beamwidths` are the real per-frequency Oculus values
+     (`ros2_math.oculus_beamwidths()`) — 0.6 deg az / 20 deg el @ 1.2 MHz — instead
+     of beam spacing. `beam_directions` and range-major uint8 layout already
+     matched. This closes item 3.
+   - **KNOWN GAP (not yet touched):** `ping_info.sound_speed` is always published
+     from the scenario's general `publisher.sound_speed` (1500.0, underwater), but
+     `rtx_acoustic`'s actual range mapping uses `sensor_sound_speed=343` (air —
+     the sensor has no underwater acoustic model). No current consumer
+     (`sonar_image_proc`, `erdc_sensor_fusion`) reads `ping_info.sound_speed` yet
+     (even `oculus_sonar_driver`'s own field is an unset TODO), so this is latent,
+     not a live bug — but fix it before anything downstream starts trusting that
+     field.
+   ===========================================================================
+   *** LIVE END-TO-END VERIFICATION (2026-07-01), full `oceansim.launch.py` stack,
+   DeepTrekker Revolution platform. *** Confirmed exactly per the calibration
+   above: `RtxAcousticSonar` log = `128 receiver mounts ... grid 520 beams x 1980
+   range`, `FOLDED grid: 40960 lit cells, range bins [66,1186] = [0.43,6.03] m,
+   beams hit=128/520`. `/oceansim/robot/sonar` (`ProjectedSonarImage`): `ranges`
+   len 1980, `beam_directions`/`tx_beamwidths`/`rx_beamwidths` len 520,
+   `rx_beamwidths`=0.010472 rad (0.6 deg), `tx_beamwidths`=0.349066 rad (20 deg) —
+   matches the M300d LF beamwidths exactly. `drawn_sonar` renders a real (sparse)
+   fan image, 1980x3590 rgb8, ~21% nonzero pixels (consistent with 128/520 beams
+   lit). Perf with the full DeepTrekker + camera + sonar pipeline: odom ~22 Hz,
+   sonar/drawn_sonar ~1.9 Hz — matches the 2026-06-30 M300d-calibration figures,
+   no regression from the later capture/watchdog/safety commits. Not yet done:
+   item 4 (formal side-by-side numeric comparison vs the `oceansim` backend on an
+   identical scene, and vs a real Oculus rosbag).
 
-Effort: **high** (acoustic beamforming). Highest physical fidelity (multipath, TOF).
+   ===========================================================================
+   *** TWO MORE REAL BUGS FOUND + FIXED, PLUS A HARD GPU-MEMORY CEILING
+   DISCOVERED (2026-07-01, live interactive debugging — rotating the vehicle in
+   the GUI and cross-checking the raw ProjectedSonarImage grid, not just the
+   rendered image). The "beams hit=128/520" log line above is misleading: it
+   counts any nonzero cell, including noise-floor residue (amplitude ~1), so it
+   looked fine even when only 2 of 128 elements had a real echo (amplitude
+   200+). ***
+
+   **Bug A — mount pose was a one-time WORLD-frame teleport with no orientation,
+   in `RtxAcousticSensor.sonar_initialize`.** `set_world_poses(positions=
+   self._translation...)` fed a small LOCAL mount-offset vector (e.g. (0.06, 0,
+   0.04)) into a WORLD-frame position setter, once, and never set orientation at
+   all. Symptom: rotating the vehicle 90 deg in the GUI did not change which
+   beams saw a return. Fix: `set_local_poses(translations=..., orientations=...)`
+   — LOCAL-frame xformOps relative to the parent, exactly like `UW_Camera`'s
+   constructor args — so the sensor now rotates/translates with the robot body
+   via ordinary USD parenting. Verified: after a confirmed 90 deg body yaw
+   (odom-tracked), the sonar's active beams follow.
+
+   **Bug B — no `firingSeq` was ever authored, so only the schema's own default
+   single event (`txSensorId=[0]`, `rxGroupId=[0]`) ever fired.** `sensorMount`
+   and `rxGroup` only DEFINE the array geometry; a separate `firingSeq`
+   multi-apply schema (`omni:sensor:WpmAcoustic:firingSeq:*`, arrays
+   `eventTimeNs`/`txSensorId`/`rxGroupId`/`channel`) enumerates which (tx
+   element, rx group) pairs actually fire each cycle. `Acoustic._create_prim()`'s
+   auto-apply table (in the installed `isaacsim.sensors.experimental.rtx`
+   package) only recognises the `sensorMount:`/`rxGroup:` prefixes, not
+   `firingSeq:`, so it has to be applied and populated by hand after
+   construction (`prim.ApplyAPI("OmniSensorWpmAcousticFiringSeqAPI", "seq1")` +
+   setting the four array attrs). Without it, 126 of 128 configured elements
+   were never actually pinged — confirmed by amplitude, not just cell count:
+   with 128 elements, only columns 0 and 4 (mount indices 0 and 1) ever showed
+   amplitude >1; all other "hit" columns were noise floor. After authoring one
+   event per rxGroup pair (element g -> rxGroup [g,g+1]), ALL configured
+   elements produce real amplitude data.
+
+   **New hard constraint found while fixing B: each concurrent firing event
+   costs roughly ~1.1-1.2 GB of GPU VRAM** (measured on a 24 GB RTX 3090,
+   headless, isolating the variable by re-running with only `sonar_params.
+   n_elements` changed): 8 elements (7 events) -> ~10.3 GB total, clean; 12
+   elements (11 events) -> ~17.4 GB, clean but close to the ceiling; 16 elements
+   (15 events) and 32 elements (31 events) both blow past available VRAM --
+   `ERROR_OUT_OF_DEVICE_MEMORY`/`vkAllocateMemory failed`, and/or a
+   `cudaErrorIllegalAddress` crash that can occur even before VRAM is fully
+   exhausted. GPU memory fully releases when the container stops (confirmed, not
+   a leak) -- this is real per-run cost, apparently because each firing event
+   allocates something render-product-sized rather than a lightweight scalar
+   buffer. **This revises the earlier "128 receiver mounts is the usable max"
+   finding down substantially**: 128 was the ceiling for a DIFFERENT failure
+   ("buffer with size 0" at 256/512 mounts); the GPU-memory ceiling found today
+   is far more restrictive in practice (~12 elements on this GPU) and was masked
+   before today because bug B meant only 1 event ever actually fired regardless
+   of how many elements were configured. Not yet investigated: whether a
+   different `aux_output_level`, resolution, or other per-event setting reduces
+   the per-event memory cost; whether newer/bigger GPUs raise the practical
+   ceiling proportionally with more VRAM.
+   ===========================================================================
+
+1. ~~Receiver array / azimuth source~~ — DONE (see M300D CALIBRATION above).
+2. ~~Beamforming (the core gap)~~ — DIAGNOSED AS NOT ACHIEVABLE with the envelope-
+   only GMO. Additionally (2026-07-01): even setting aside beamforming, the
+   practical element/beam ceiling on a 24 GB GPU is now ~12 (GPU-memory bound
+   per firing event), not the previously-assumed 128 -- see the 2026-07-01 block
+   above.
+3. ~~Intensity~~ — DONE (ProjectedSonarImage format alignment above).
+4. **Validation (remaining)** — formal side-by-side comparison of range/azimuth/
+   intensity vs `oceansim` on the same scene/target placement, and vs real Oculus
+   pings (rosbag via `oculus_sonar_driver`) if available. Live functional
+   verification (2026-07-01 above) confirms the pipeline produces sane, correctly-
+   shaped, correctly-calibrated output — but no numeric ground-truth comparison
+   has been run yet.
+
+Effort: **medium** remaining (just validation — the beamforming ceiling means this
+backend caps out at 128/520 beams; if 520-beam resolution matters, use `oceansim`
+instead). Highest physical fidelity of the three backends (multipath, TOF) within
+that beam-count ceiling.
 
 ## Backend 3 — `rtx_lidar` (RTX Lidar → grid)  [FAST, simplest to make correct, NEW]
 

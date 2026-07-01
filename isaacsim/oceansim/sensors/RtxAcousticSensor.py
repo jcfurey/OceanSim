@@ -244,9 +244,24 @@ class RtxAcousticSensor:
             tick_rate=self.tick_rate,
             attributes=self._build_acoustic_attributes(),
         )
-        if self._translation is not None:
+        # Mount the sensor as a LOCAL offset from its parent (the robot body), not a
+        # one-time WORLD-frame teleport: set_world_poses() was being fed
+        # self._translation -- a small mount-relative vector like (0.06, 0, 0.04) --
+        # as if it were an absolute world coordinate, and orientation was never set
+        # at all. Both together left the acoustic prim sitting near-identity pose
+        # at whatever its parent's pose was AT INIT TIME, never actually pointed in
+        # the mount's intended direction, and (because it was a world-frame teleport,
+        # not a local xformOp) not guaranteed to keep tracking the parent's motion
+        # the way a normal local-frame child transform does. set_local_poses() sets
+        # the LOCAL translate/orient xformOps relative to the parent once, exactly
+        # like UW_Camera's translation/orientation constructor args, so the sensor
+        # then rotates and translates with the robot body via ordinary USD parenting.
+        if self._translation is not None or self._orientation is not None:
             try:
-                self._acoustic.set_world_poses(positions=self._translation.reshape(1, 3))
+                self._acoustic.set_local_poses(
+                    translations=None if self._translation is None else self._translation.reshape(1, 3),
+                    orientations=None if self._orientation is None else self._orientation.reshape(1, 4),
+                )
             except Exception:  # noqa: BLE001
                 pass
 
@@ -259,6 +274,45 @@ class RtxAcousticSensor:
             from pxr import Usd  # noqa: F401
             stage = omni.usd.get_context().get_stage()
             prim = stage.GetPrimAtPath(str(self._acoustic.paths[0]))
+
+            # The WpmAcoustic schema needs an explicit "firingSeq" enumerating which
+            # (tx element, rx group) pairs actually fire each cycle -- sensorMount and
+            # rxGroup only DEFINE the array geometry, they don't make anything fire.
+            # Acoustic._create_prim()'s auto-apply table (in the installed
+            # isaacsim.sensors.experimental.rtx package) only recognises the
+            # sensorMount:/rxGroup: attribute prefixes, not firingSeq:, so it's applied
+            # + populated here by hand rather than via the `attributes=` dict passed to
+            # Acoustic(). Confirmed empirically: with NO firingSeq authored, only the
+            # schema's own default single event (txSensorId=[0], rxGroupId=[0]) ever
+            # fires -- exactly elements 0 and its paired rxGroup [0,1] -- while all
+            # other 126 configured mounts/groups sit unused (measured amplitude ~1,
+            # i.e. noise floor). One event per rxGroup pair fires element g into the
+            # rxGroup covering [g, g+1], matching how fold_gmo_to_grid already expects
+            # n_sgw == n_elements-1 contiguous signal ways.
+            try:
+                n_events = self._n_elements - 1
+                prim.ApplyAPI("OmniSensorWpmAcousticFiringSeqAPI", "seq1")
+                fs_prefix = "omni:sensor:WpmAcoustic:firingSeq:seq1:"
+                # Stagger events across the tick period instead of firing all 127 at
+                # eventTimeNs=0: with every event at the same nominal time the renderer
+                # apparently treats them as one giant simultaneous multi-emitter batch
+                # and blows through GPU memory (measured: ERROR_OUT_OF_DEVICE_MEMORY /
+                # vkAllocateMemory failures within seconds of boot on a 24 GB RTX 3090).
+                # Spreading them across the cycle (mirroring how a real scanning array
+                # fires elements sequentially) keeps each render pass small.
+                cycle_ns = 1.0e9 / self.tick_rate if self.tick_rate > 0 else 33_333_333.0
+                event_times = [i * cycle_ns / n_events for i in range(n_events)]
+                prim.GetAttribute(fs_prefix + "txSensorId").Set(list(range(n_events)))
+                prim.GetAttribute(fs_prefix + "rxGroupId").Set(list(range(n_events)))
+                prim.GetAttribute(fs_prefix + "channel").Set([0] * n_events)
+                prim.GetAttribute(fs_prefix + "eventTimeNs").Set(event_times)
+                print(f"[{self._name}] firingSeq authored: {n_events} tx/rx events staggered "
+                      f"over {cycle_ns:.0f} ns (element g -> rxGroup [g,g+1] for g in 0..{n_events - 1})",
+                      flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self._name}] could not author firingSeq -- falling back to "
+                      f"the schema's default single event: {exc}", flush=True)
+
             sd = prim.GetAttribute("omni:sensor:WpmAcoustic:sampleDuration")
             pd = prim.GetAttribute("omni:sensor:WpmAcoustic:pulseDuration")
             if sd and sd.IsValid() and sd.Get():
