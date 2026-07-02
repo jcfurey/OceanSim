@@ -180,21 +180,30 @@ class MHL_Sensor_Example_Scenario():
         
     def teardown_scenario(self):
 
+        # Per-resource guards: one close() raising must not skip the remaining
+        # teardown (e.g. a sonar annotator-detach failure used to leak the
+        # camera's rclpy context AND the control receiver's nodes).
+        def _safe_teardown(fn, name):
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                print(f'[Scenario] {name} teardown warning: {e}')
+
         # Because these two sensors create annotator cache in GPU,
         # close() will detach annotator from render product and clear the cache.
         if self._sonar is not None:
-            self._sonar.close()
+            _safe_teardown(self._sonar.close, "sonar")
         if self._cam is not None:
-            self._cam.close()
+            _safe_teardown(self._cam.close, "camera")
 
         # clear the keyboard subscription
         if self._ctrl_mode=="Manual control":
-            self._force_cmd.cleanup()
-            self._torque_cmd.cleanup()
+            _safe_teardown(self._force_cmd.cleanup, "keyboard force cmd")
+            _safe_teardown(self._torque_cmd.cleanup, "keyboard torque cmd")
 
         # clear the ROS2 control receiver
         if self._ros2_control_receiver is not None:
-            self._ros2_control_receiver.close()
+            _safe_teardown(self._ros2_control_receiver.close, "ROS2 control receiver")
 
         self._rob = None
         self._sonar = None
@@ -239,16 +248,31 @@ class MHL_Sensor_Example_Scenario():
             self._safe_call(self._sonar.make_sonar_data, sim_time=sim_time,
                             name="sonar make_sonar_data")
         if do_sensors:
-            self._sensor_accum = 0.0
+            if self._sensor_update_period > 0.0:
+                # Subtract the period instead of resetting to zero: a reset
+                # discards the overshoot every cycle and quantises the effective
+                # rate down by up to one physics step per fire. Cap the residual
+                # so a long stall doesn't queue a burst of catch-up fires.
+                self._sensor_accum = min(self._sensor_accum - self._sensor_update_period,
+                                         self._sensor_update_period)
+            else:
+                self._sensor_accum = 0.0
             if self._cam is not None:
                 # Pass the authoritative sim time (headless runner) so the camera
                 # rate-gates + stamps on the same clock as the other publishers;
                 # None (GUI) keeps the camera's wall-clock gate.
                 self._safe_call(self._cam.render, sim_time, name="camera render")
-            if self._DVL is not None:
-                self._DVL_reading = self._DVL.get_linear_vel()
-            if self._baro is not None:
-                self._baro_reading = self._baro.get_pressure()
+            # DVL/baro polled here ONLY for the GUI extension's readout plots --
+            # the ROS publisher does its own reads. The runner sets
+            # _poll_gui_readings False so headless runs skip this dead compute
+            # (the DVL read is 4 beam queries + pose + noise per tick). Shielded
+            # by _safe_call like the other sensor compute (a transient physics-
+            # view error here used to escape update_scenario entirely).
+            if getattr(self, "_poll_gui_readings", True):
+                if self._DVL is not None:
+                    self._safe_call(self._read_dvl, name="DVL read")
+                if self._baro is not None:
+                    self._safe_call(self._read_baro, name="baro read")
 
         if self._ctrl_mode=="Manual control":
             force_cmd = Gf.Vec3f(*self._force_cmd._base_command)
@@ -270,8 +294,16 @@ class MHL_Sensor_Example_Scenario():
         elif self._ctrl_mode=="ROS control":
             if self._ros2_control_receiver is not None:
                 self._ros2_control_receiver.update_control()
-            else:
+            elif not getattr(self, "_warned_no_receiver", False):
+                # Once, not every physics step (60 Hz of identical lines).
+                self._warned_no_receiver = True
                 print("[Scenario] ROS2 Control receiver is not initialized, skipping update.")
+
+    def _read_dvl(self):
+        self._DVL_reading = self._DVL.get_linear_vel()
+
+    def _read_baro(self):
+        self._baro_reading = self._baro.get_pressure()
 
 
 

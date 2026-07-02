@@ -38,10 +38,16 @@ def _import_via_converter(urdf_path, fix_base, merge_fixed_joints, self_collisio
     except Exception:  # noqa: BLE001 - not this Isaac build
         return None
 
+    import atexit
     import os
+    import shutil
     import tempfile
 
     out_dir = tempfile.mkdtemp(prefix="oceansim_urdf_usd_")
+    # The converted USD is referenced by the live stage for the whole session, so
+    # it can only be removed at process exit -- but without this, every run left
+    # a multi-MB converted-USD directory in $TMPDIR forever.
+    atexit.register(shutil.rmtree, out_dir, ignore_errors=True)
     cfg = URDFImporterConfig(
         urdf_path=urdf_path,
         usd_path=out_dir,

@@ -126,8 +126,12 @@ def load_config(args):
         "sensors": {"sonar": True, "camera": True, "dvl": True, "baro": True},
         # Per-sensor GUI windows (sonar + UW camera viewports). False also skips
         # their per-frame set_bytes_data_from_gpu readback; AOVs still render for ROS
-        # and the main Isaac viewport stays. (Default True preserves prior behavior.)
-        "sensor_viewports": True,
+        # and the main Isaac viewport stays. None = auto (on with a GUI, off when
+        # headless -- headless paid the readback for windows nobody can see).
+        "sensor_viewports": None,
+        # Waypoint file for control_mode "Waypoints" (one x y z qw qx qy qz per
+        # line); required in that mode, unused otherwise.
+        "waypoints_file": "",
         # Sonar backend: "oceansim" = custom imaging sonar (Camera + pointcloud
         # annotator); "rtx_acoustic" = Isaac native RTX acoustic sensor
         # (experimental, avoids the 6.0.1 pointcloud-annotator crash).
@@ -257,6 +261,26 @@ def main(argv):
         "headless": bool(cfg["headless"]),
         "renderer": cfg["renderer"],
     })
+
+    # Ensure the kit process is closed on ANY exit. The run loop's finally
+    # covers the loop, but an exception in the ~200 setup lines between here and
+    # the loop (asset resolution, robot import, sensor init, publisher init)
+    # used to leave the SimulationApp -- a full kit process with a GPU context --
+    # hanging. The idempotent guard means the normal finally-path close and this
+    # atexit hook can't double-close.
+    import atexit
+
+    _app_closed = {"done": False}
+
+    def _close_sim_app():
+        if not _app_closed["done"]:
+            _app_closed["done"] = True
+            try:
+                sim_app.close()
+            except Exception as _e:  # noqa: BLE001
+                print(f"[oceansim_ros2] sim_app.close warning: {_e}")
+
+    atexit.register(_close_sim_app)
 
     # 2) ROS2 bridge must be enabled before OceanSim imports rclpy.
     from isaacsim.core.utils.extensions import enable_extension
@@ -519,6 +543,13 @@ def main(argv):
             print("[oceansim_ros2] sonar backend: oceansim (custom imaging sonar) "
                   f"hori_res={_hori_res} gpu_point_filter={_gpu_filter} async_compute={_async}")
             sonar = ImagingSonarSensor(
+                # min/max_range + FOV were documented sonar_params keys but were
+                # only plumbed to the rtx_acoustic branch -- on this (default)
+                # backend they were silently ignored. Defaults preserved.
+                min_range=sp.get("min_range", 0.2),
+                max_range=sp.get("max_range", 3.0),
+                hori_fov=sp.get("hori_fov_deg", 130.0),
+                vert_fov=sp.get("vert_fov_deg", 20.0),
                 range_res=sp.get("range_res", 0.005),
                 angular_res=sp.get("angular_res", 0.25),
                 hori_res=_hori_res,
@@ -545,12 +576,33 @@ def main(argv):
     # ---- scenario + sensor publisher --------------------------------------
     world.reset()
     scenario = MHL_Sensor_Example_Scenario()
+    # sensor_viewports: None (default) = auto -- per-sensor GUI windows only make
+    # sense with a GUI, and in headless mode they still paid the per-frame
+    # set_bytes_data_from_gpu readback for windows nobody can see.
+    _sv = cfg.get("sensor_viewports")
+    _sv = (not cfg["headless"]) if _sv is None else bool(_sv)
     scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"],
-                            sensor_viewports=bool(cfg.get("sensor_viewports", True)),
+                            sensor_viewports=_sv,
                             control_params=cfg.get("control_params"))
     # Throttle the heavy sensor compute to sensor_compute_rate (0 = every step).
     _scr = float(cfg.get("sensor_compute_rate", 0.0) or 0.0)
     scenario._sensor_update_period = (1.0 / _scr) if _scr > 0 else 0.0
+    # The headless pipeline consumes DVL/baro via the ROS publisher; the
+    # scenario's own per-tick reads only feed the GUI extension's plots.
+    scenario._poll_gui_readings = False
+
+    # Waypoints mode needs a waypoint file wired in: the GUI loads one via its
+    # file picker, but the runner never called setup_waypoints, so the first
+    # update_scenario step crashed on the missing self.waypoints. Load it from
+    # cfg["waypoints_file"], or fail at startup with an actionable message
+    # instead of a mid-run AttributeError.
+    if cfg["control_mode"] == "Waypoints":
+        _wp = cfg.get("waypoints_file", "")
+        if not _wp or not os.path.isfile(_wp):
+            raise SystemExit(
+                "[oceansim_ros2] control_mode 'Waypoints' requires config key "
+                f"'waypoints_file' pointing at an existing waypoint file (got {_wp!r}).")
+        scenario.setup_waypoints(_wp, _wp)
 
     pub_cfg = dict(cfg.get("publisher", {}))
 
@@ -664,10 +716,14 @@ def main(argv):
     try:
         while sim_app.is_running() and running["flag"]:
             # Decide -- before the step that would render it -- whether to render +
-            # scan the sonar this iteration.
+            # scan the sonar this iteration. Gated on is_playing so a PAUSED sim
+            # doesn't keep force-enabling the sonar render (paying the raytrace)
+            # for scans that never run.
             sonar_tick = None
+            _decision_time = prev_time
             if _sonar_gating:
-                sonar_tick = ((prev_time - _last_sonar_scan) >= _sonar_render_period
+                sonar_tick = (world.is_playing()
+                              and (_decision_time - _last_sonar_scan) >= _sonar_render_period
                               and sonar.ready_for_scan())
                 sonar.set_render_enabled(sonar_tick)
             world.step(render=need_render)
@@ -681,7 +737,10 @@ def main(argv):
                     step = fixed_dt    # first tick / after a reset
                 prev_time = now
                 if sonar_tick:
-                    _last_sonar_scan = now
+                    # Record on the SAME clock the decision compares against
+                    # (pre-step time): recording the post-step `now` stretched
+                    # the effective period to period + one step per scan.
+                    _last_sonar_scan = _decision_time
                 scenario.update_scenario(step, now, sonar_tick=sonar_tick)
                 publisher.publish(now)
     finally:
@@ -696,7 +755,7 @@ def main(argv):
                 _fn()
             except Exception as _e:  # noqa: BLE001
                 print(f"[oceansim_ros2] {_what} warning: {_e}")
-        sim_app.close()
+        _close_sim_app()   # idempotent; also registered atexit for setup-phase failures
 
 
 if __name__ == "__main__":

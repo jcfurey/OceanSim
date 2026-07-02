@@ -210,6 +210,13 @@ class ImagingSonarSensor(Camera):
         # block the sim loop (and thus odom/imu). The worker only touches device
         # buffers the main thread isn't using -- scan() is gated on _async_busy so
         # it never overwrites scan_data mid-process.
+        # Re-init guard: if sonar_initialize() is called again without close()
+        # (which joins the worker via stop_async), the old worker thread would
+        # survive, pick up the NEW event object on its next self-lookup, and run
+        # make_sonar_data concurrently with the new worker on the same device
+        # buffers. Stop any previous worker before rebuilding the async state.
+        if getattr(self, "_async_thread", None) is not None:
+            self.stop_async()
         self.async_compute = self._async_compute_init
         self._async_busy = False
         # (capture_sim_time, grid) -- capture_sim_time is the sim time scan()
@@ -727,7 +734,13 @@ class ImagingSonarSensor(Camera):
                   ]
                   )
         
-        # Process intensity data by either sum as it is or averaging
+        # Process intensity data by either sum as it is or averaging. Use a
+        # LOCAL binding for the downstream kernels: the old code REBOUND
+        # self.binned_intensity to self.bin_sum in "sum" mode, permanently
+        # aliasing the two attributes -- every later zero_() then cleared the
+        # same buffer twice, the dedicated binned_intensity allocation was
+        # orphaned, and a subsequent "mean"-mode call wrote the average INTO
+        # bin_sum through the alias.
         if binning_method == "mean":
             wp.launch(
                 kernel=average,
@@ -740,9 +753,9 @@ class ImagingSonarSensor(Camera):
                     self.binned_intensity,
                 ]
                 )
-        
-        if binning_method == "sum":
-            self.binned_intensity = self.bin_sum
+            binned = self.binned_intensity
+        else:  # "sum" (default)
+            binned = self.bin_sum
 
 
         # gau_noise / range_dependent_ray_noise are fully overwritten every frame
@@ -797,7 +810,7 @@ class ImagingSonarSensor(Camera):
                 dim=self.bin_sum.shape,
                 kernel=all_max,
                 inputs=[
-                    self.binned_intensity,
+                    binned,
                 ],
                 outputs=[
                     maximum # wp.array of shape (1,), max value is stored at maximum[0]
@@ -811,7 +824,7 @@ class ImagingSonarSensor(Camera):
                   inputs=[
                       self.r,
                       self.azi,
-                      self.binned_intensity,
+                      binned,
                       maximum,
                       self.gau_noise,
                       self.range_dependent_ray_noise,
@@ -831,7 +844,7 @@ class ImagingSonarSensor(Camera):
                 dim=self.bin_sum.shape,
                 kernel=range_max,
                 inputs=[
-                    self.binned_intensity,
+                    binned,
                 ],
                 outputs=[
                     maximum      # wp.array of shape (number of range bins, )
@@ -844,7 +857,7 @@ class ImagingSonarSensor(Camera):
                   inputs=[
                       self.r,
                       self.azi, 
-                      self.binned_intensity,
+                      binned,
                       maximum,
                       self.gau_noise,
                       self.range_dependent_ray_noise,
