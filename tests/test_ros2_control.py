@@ -76,3 +76,27 @@ def test_exactly_at_timeout_is_not_yet_stale(m):
     # (>, not >=) -- a command that just barely lands at the timeout boundary
     # is not treated as a dropped link.
     assert m.is_command_stale(now=12.0, last_command_time=10.0, timeout=2.0) is False
+
+
+# ------------------------------------------------- non-finite command rejection
+
+def test_clamp_rejects_infinite_command(m):
+    # inf command used to become NaN via arr * (max_mag / inf): 0*inf = NaN.
+    out = m.clamp_magnitude([float("inf"), 1.0, 0.0], max_mag=5.0)
+    assert out == [0.0, 0.0, 0.0]
+
+
+def test_clamp_rejects_nan_command_even_unclamped(m):
+    # NaN norm made norm > max_mag False, so NaN passed through "unclamped";
+    # and the None (unbounded) path must reject it too -- garbage must never
+    # reach the thrusters.
+    assert m.clamp_magnitude([float("nan"), 0.0, 0.0], max_mag=5.0) == [0.0, 0.0, 0.0]
+    assert m.clamp_magnitude([0.0, float("nan"), 0.0], None) == [0.0, 0.0, 0.0]
+    assert m.clamp_magnitude([0.0, 0.0, float("-inf")], None) == [0.0, 0.0, 0.0]
+
+
+def test_clamp_finite_paths_unchanged(m):
+    # regression: finite behavior identical after the non-finite guard.
+    assert m.clamp_magnitude([3.0, 4.0, 0.0], max_mag=5.0) == pytest.approx([3.0, 4.0, 0.0])
+    out = m.clamp_magnitude([6.0, 8.0, 0.0], max_mag=5.0)
+    assert out == pytest.approx([3.0, 4.0, 0.0])   # scaled to mag 5, direction kept

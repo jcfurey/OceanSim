@@ -116,3 +116,27 @@ def test_sonar_intensity_uint8_range_major(m):
     # range-major: element (r,b) at r*n_beams + b
     assert flat[0 * n_beams + 2] == 255   # (range0, beam2) == 1.0
     assert flat[1 * n_beams + 0] == int(0.25 * 255)   # uint8 cast truncates (63)
+
+
+def test_rategate_harmonic_rate_not_halved(m):
+    # A 60 Hz gate driven by a 60 Hz sim: accumulating t += 1/60 lands the
+    # elapsed interval a few ULPs below the period on some ticks; the strict >=
+    # comparison then skipped every other publish (halving the rate). With the
+    # tolerance, EVERY tick must fire.
+    gate = m.RateGate(60.0)
+    t, dt = 0.0, 1.0 / 60.0
+    fired = 0
+    for _ in range(600):
+        if gate.ready(t):
+            fired += 1
+        t += dt
+    assert fired == 600, f"gate fired {fired}/600 at the harmonic rate"
+
+
+def test_rategate_still_throttles(m):
+    # tolerance must not break sub-harmonic throttling: 10 Hz gate on a 60 Hz sim
+    # fires on every 6th tick.
+    gate = m.RateGate(10.0)
+    t, dt = 0.0, 1.0 / 60.0
+    fired = sum(1 for i in range(600) if gate.ready(t + i * dt))
+    assert 99 <= fired <= 101

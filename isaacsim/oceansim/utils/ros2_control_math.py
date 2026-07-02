@@ -12,12 +12,21 @@ import numpy as np
 def clamp_magnitude(vec, max_mag):
     """Clamp a 3-vector's magnitude to max_mag, preserving direction.
 
-    max_mag=None disables clamping -- vec is returned unchanged (as a plain
-    list of floats, matching the clamped-path return shape).
+    max_mag=None disables clamping -- a finite vec is returned unchanged (as a
+    plain list of floats, matching the clamped-path return shape).
+
+    A non-finite command (any NaN/inf component) is rejected to zeros in BOTH
+    modes: with clamping on, ``norm=inf`` made ``max_mag/norm`` collapse the
+    finite components and turn the infinite one into ``0*inf=NaN``, and a NaN
+    component made ``norm > max_mag`` False so NaN passed through "unclamped"
+    -- either way garbage reached the thrusters. Zero (the dead-man behavior)
+    is the only safe output for an invalid command.
     """
-    if max_mag is None:
-        return [float(vec[0]), float(vec[1]), float(vec[2])]
     arr = np.asarray(vec, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        return [0.0, 0.0, 0.0]
+    if max_mag is None:
+        return [float(arr[0]), float(arr[1]), float(arr[2])]
     norm = np.linalg.norm(arr)
     if norm > max_mag and norm > 0.0:
         arr = arr * (max_mag / norm)

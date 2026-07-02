@@ -35,18 +35,28 @@ def fold_gmo_to_grid(amp, num_samples_per_sgw, meters_per_sample, range_offset,
     are no samples in range).
     """
     amp = np.abs(np.asarray(amp, dtype=np.float64))
-    grid = np.zeros((n_range, n_beams), dtype=np.float32)
+    n_range = int(n_range)
+    n_beams = int(n_beams)
+    grid = np.zeros((max(n_range, 0), max(n_beams, 0)), dtype=np.float32)
     nspg = int(num_samples_per_sgw)
-    if amp.size == 0 or nspg <= 0 or amp.size < nspg:
+    # grid.size == 0 also guards the peak-normalise below: grid.max() on a
+    # zero-size array raises ValueError instead of returning the empty grid.
+    if amp.size == 0 or nspg <= 0 or amp.size < nspg or grid.size == 0:
         return grid
 
     n_sgw = amp.size // nspg
     a2 = amp[:n_sgw * nspg].reshape(n_sgw, nspg)
 
-    # sample index -> range bin (shared across all signal ways)
+    # sample index -> range bin (shared across all signal ways). FLOOR binning
+    # (bin i covers [min + i*res, min + (i+1)*res)) so the published bin CENTRES
+    # (i + 0.5)*res (ros2_math.sonar_ranges, the Oculus convention) are zero-mean
+    # about the true range -- round() binning put every centre a systematic
+    # +res/2 above the return. The epsilon (1e-6 of a bin, physically
+    # nanometres) absorbs float error at exact bin boundaries (0.5/0.01 ->
+    # 49.999... must land in bin 50, not 49).
     k = np.arange(nspg)
     rng = range_offset + k * meters_per_sample
-    rbin = np.round((rng - min_range) / range_res).astype(np.int64)
+    rbin = np.floor((rng - min_range) / range_res + 1e-6).astype(np.int64)
     kv = (rbin >= 0) & (rbin < n_range)
     if not np.any(kv):
         return grid
@@ -54,11 +64,18 @@ def fold_gmo_to_grid(amp, num_samples_per_sgw, meters_per_sample, range_offset,
 
     # signal-way index -> azimuth beam (linear spread across the fan)
     beams = np.round(np.arange(n_sgw) / max(n_sgw - 1, 1) * (n_beams - 1)).astype(np.int64)
+    bv = (beams >= 0) & (beams < n_beams)
+    if not np.any(bv):
+        return grid
 
-    for s in range(n_sgw):
-        b = int(beams[s])
-        if 0 <= b < n_beams:
-            np.add.at(grid[:, b], rbin_v, a2[s, kv])
+    # Single vectorised scatter-add over flattened (range_bin, beam) indices --
+    # replaces the per-signal-way Python loop of np.add.at (an unbuffered ufunc,
+    # ~10x slower) on this per-frame path. Duplicate (bin, beam) cells (several
+    # samples per bin, several signal ways per beam) accumulate, same as before.
+    flat = (rbin_v[None, :] * n_beams + beams[bv][:, None]).ravel()
+    acc = np.bincount(flat, weights=a2[bv][:, kv].ravel(),
+                      minlength=n_range * n_beams)
+    grid[:] = acc.reshape(n_range, n_beams)
 
     peak = float(grid.max())
     if peak > 0.0:

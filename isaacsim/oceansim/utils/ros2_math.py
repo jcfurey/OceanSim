@@ -75,7 +75,12 @@ class RateGate:
         if self._period <= 0.0:
             return True
         # Reset if sim time jumped backward (world reset) so publishing resumes.
-        if self._last is None or now < self._last or (now - self._last) >= self._period:
+        # The period comparison carries a small relative tolerance: at harmonic
+        # configs (e.g. a 60 Hz gate on a 60 Hz sim) float error can land the
+        # elapsed (now - last) a few ULPs BELOW the period on alternating ticks,
+        # and a strict >= then skips every other publish -- halving the rate.
+        tol = self._period * 1e-6
+        if self._last is None or now < self._last or (now - self._last) >= self._period - tol:
             self._last = now
             return True
         return False
