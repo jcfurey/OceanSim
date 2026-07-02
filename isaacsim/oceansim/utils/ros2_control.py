@@ -84,12 +84,25 @@ class ROS2ControlReceiver:
         self.torque_cmd = [0.0, 0.0, 0.0]
         self.linear_vel = [0.0, 0.0, 0.0]
         self.angular_vel = [0.0, 0.0, 0.0]
-        self.last_command_time = time.time()
+        # Watchdog clock: time.monotonic(), NOT time.time() -- a wall-clock step
+        # (NTP correction, DST, manual clock set) must not spuriously trip or
+        # indefinitely defer the dead-man timeout.
+        self.last_command_time = time.monotonic()
         self.command_timeout = 2.0
         # Set once we've warned about a stale command, so the watchdog logs a
         # single message per disconnect instead of spamming every tick; reset
         # as soon as a fresh command arrives.
         self._stale_warned = False
+        # While True, incoming command callbacks are DISCARDED (used to flush
+        # messages queued for the inactive mode's node at a mode switch, so an
+        # arbitrarily old queued command is not replayed as "fresh").
+        self._discard_commands = False
+        # Incremented by every accepted command; lets update_control's drain
+        # loop stop as soon as a spin delivers nothing instead of guessing.
+        self._rx_count = 0
+        # Per-message receive prints (2 per command) run on the sim thread at
+        # teleop rate; keep the scaffolding available but off by default.
+        self.verbose = False
         self._update_count = 0
         
         # Physics API - using scenario.py created instance
@@ -202,62 +215,100 @@ class ROS2ControlReceiver:
             print(f'[{self._name}] ROS2 subscriber setup failed: {e}')
 
     def _setup_ros2_control_mode(self, ctrl_mode):
+        new_mode = None
         if ctrl_mode == "velocity control":
-            self._ros2_control_mode = ROS2_CONTROL_MODE.VEL
+            new_mode = ROS2_CONTROL_MODE.VEL
         elif ctrl_mode == "force control":
-            self._ros2_control_mode = ROS2_CONTROL_MODE.FORCE
+            new_mode = ROS2_CONTROL_MODE.FORCE
+        if new_mode is None or new_mode == self._ros2_control_mode:
+            return
+        # Mode switch safety:
+        # 1. Flush both nodes' queues with callbacks discarding, so a command
+        #    queued while the OTHER mode was active (up to depth 10, arbitrarily
+        #    old) is not delivered right after the switch, stamped "now", and
+        #    replayed as a fresh command -- defeating the dead-man watchdog.
+        # 2. Zero the cached commands and mark them stale, so nothing actuates
+        #    until a genuinely fresh post-switch command arrives.
+        # 3. Clear any residual PhysxForceAPI force/torque: the attrs persist on
+        #    the prim, so leaving force mode used to keep the last wrench
+        #    applied forever underneath the new velocity control.
+        self._discard_commands = True
+        try:
+            for node in (self._ros2_vel_node, self._ros2_force_node):
+                if node is None:
+                    continue
+                for _ in range(16):
+                    rclpy.spin_once(node, timeout_sec=0.0)
+        finally:
+            self._discard_commands = False
+        self.linear_vel = [0.0, 0.0, 0.0]
+        self.angular_vel = [0.0, 0.0, 0.0]
+        self.force_cmd = [0.0, 0.0, 0.0]
+        self.torque_cmd = [0.0, 0.0, 0.0]
+        self.last_command_time = time.monotonic() - (self.command_timeout + 1.0)
+        if PXR_AVAILABLE and self._force_api:
+            try:
+                self._force_api.CreateForceAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+                self._force_api.CreateTorqueAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            except Exception as e:  # noqa: BLE001
+                print(f'[{self._name}] could not clear residual force on mode switch: {e}')
+        self._ros2_control_mode = new_mode
     
     def _vel_callback(self, msg):
         """
         msg type: geometry_msgs/Twist
-        
+
         include linear and angular velocity
         """
-        print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, linear: {msg.linear}, angular: {msg.angular}')
-        
-        if not self._enable_ros2:
-            print(f'[{self._name}] ROS2 is not enabled, ignore msg')
-            return
-        
-        try:
-            current_time = time.time()
+        if self._discard_commands:
+            return  # mode-switch queue flush in progress
+        if self.verbose:
+            print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, linear: {msg.linear}, angular: {msg.angular}')
 
+        if not self._enable_ros2:
+            return
+
+        try:
             self.linear_vel = self._clamp_magnitude(
                 [msg.linear.x, msg.linear.y, msg.linear.z], self._max_linear_vel)
             self.angular_vel = self._clamp_magnitude(
                 [msg.angular.x, msg.angular.y, msg.angular.z], self._max_angular_vel)
-            self.last_command_time = current_time
+            self.last_command_time = time.monotonic()
             self._stale_warned = False  # fresh command -- watchdog can warn again next time it goes stale
+            self._rx_count += 1
 
-            print(f'Received velocity - Linear: {self.linear_vel}, Angular: {self.angular_vel}')
+            if self.verbose:
+                print(f'Received velocity - Linear: {self.linear_vel}, Angular: {self.angular_vel}')
             # self._update_receive_stats(current_time)
 
         except Exception as e:
             print(f'[{self._name}] Vel Receive Failed: {e}')
-        
+
     def _force_callback(self, msg):
         """
         msg type: geometry_msgs/Wrench
-        
+
         include force and torque
         """
-        print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, force: {msg.force}, torque: {msg.torque}')
+        if self._discard_commands:
+            return  # mode-switch queue flush in progress
+        if self.verbose:
+            print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, force: {msg.force}, torque: {msg.torque}')
 
         if not self._enable_ros2:
-            print(f'[{self._name}] ROS2 is not enabled, ignore msg')
             return
 
         try:
-            current_time = time.time()
-
             self.force_cmd = self._clamp_magnitude(
                 [msg.force.x, msg.force.y, msg.force.z], self._max_force)
             self.torque_cmd = self._clamp_magnitude(
                 [msg.torque.x, msg.torque.y, msg.torque.z], self._max_torque)
-            self.last_command_time = current_time
+            self.last_command_time = time.monotonic()
             self._stale_warned = False  # fresh command -- watchdog can warn again next time it goes stale
+            self._rx_count += 1
 
-            print(f'Received force - Force: {self.force_cmd}, Torque: {self.torque_cmd}')
+            if self.verbose:
+                print(f'Received force - Force: {self.force_cmd}, Torque: {self.torque_cmd}')
 
         except Exception as e:
             print(f'[{self._name}] force Receive Failed: {e}')
@@ -282,23 +333,20 @@ class ROS2ControlReceiver:
             return
         
         try:
-            # Dead-man's-switch: if the ROS2 link that feeds this receiver has
-            # dropped (teleop crash, network partition, lost zenoh session),
-            # do not keep actuating the last command received forever -- zero
-            # it out once command_timeout has elapsed with no fresh message.
-            stale = self._is_command_stale()
-
             if self._ros2_control_mode == ROS2_CONTROL_MODE.VEL: # velocity mode
-                # Drain the cmd_vel queue every step with a non-blocking spin --
-                # the same pattern the sensor publisher (ros2_sensors) and camera
-                # (UW_Camera) already use, so it cannot "block the scene". The old
-                # `% 10` gate spun (and applied the command) only every 10th step,
-                # adding up to ~10 physics-steps of teleop latency; and because it
-                # re-applies the commanded velocity only intermittently, other
-                # forces (drag/gravity) perturbed the body in between. Spinning and
-                # holding the commanded velocity every step is the standard
-                # velocity-control behaviour.
-                rclpy.spin_once(self._ros2_vel_node, timeout_sec=0.0)
+                # DRAIN the cmd_vel queue every step: rclpy.spin_once dispatches at
+                # most ONE callback per call, so with a KEEP_LAST depth-10 queue a
+                # publisher faster than the physics tick built a backlog and the
+                # vehicle actuated commands up to 10 messages old. The bounded loop
+                # stops as soon as a spin delivers nothing (_rx_count unchanged), so
+                # the idle cost stays one no-op spin per tick.
+                self._drain_node(self._ros2_vel_node)
+                # Dead-man's-switch, evaluated AFTER the drain: if the link has
+                # dropped, zero the command instead of actuating the last one
+                # forever. Checking before the spin (the old order) zeroed a
+                # command that had already arrived in the queue this tick -- a
+                # one-tick false dropout on every reconnect.
+                stale = self._is_command_stale()
 
                 if self._rigid_prim is None:
                     self._rigid_prim = SingleRigidPrim(prim_path=get_prim_path(self._robot_prim))
@@ -314,7 +362,8 @@ class ROS2ControlReceiver:
             elif self._ros2_control_mode == ROS2_CONTROL_MODE.FORCE: # force mode
                 # using PXR API to control
                 if PXR_AVAILABLE:
-                    rclpy.spin_once(self._ros2_force_node, timeout_sec=0.0)
+                    self._drain_node(self._ros2_force_node)
+                    stale = self._is_command_stale()
 
                     force_cmd = [0.0, 0.0, 0.0] if stale else self.force_cmd
                     torque_cmd = [0.0, 0.0, 0.0] if stale else self.torque_cmd
@@ -331,6 +380,17 @@ class ROS2ControlReceiver:
         except Exception as e:
             print(f'[{self._name}] Control Update Failed: {e}')
 
+    def _drain_node(self, node, max_msgs: int = 16):
+        """Dispatch every queued callback on ``node`` (bounded), stopping as soon
+        as a spin delivers nothing. One no-op spin per tick when idle."""
+        if node is None:
+            return
+        for _ in range(max_msgs):
+            before = self._rx_count
+            rclpy.spin_once(node, timeout_sec=0.0)
+            if self._rx_count == before:
+                break
+
     def _is_command_stale(self):
         """True if no vel/force command has arrived within command_timeout.
 
@@ -340,7 +400,7 @@ class ROS2ControlReceiver:
         fresh command arrives.
         """
         stale = ros2_control_math.is_command_stale(
-            time.time(), self.last_command_time, self.command_timeout)
+            time.monotonic(), self.last_command_time, self.command_timeout)
         if stale and not self._stale_warned:
             print(f'[{self._name}] no command received for over '
                   f'{self.command_timeout}s -- zeroing command (watchdog)')
