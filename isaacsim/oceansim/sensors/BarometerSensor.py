@@ -73,7 +73,11 @@ class BarometerSensor(BaseSensor):
     
         physics_context = PhysicsContext()
         g_dir, scene_g = physics_context.get_gravity()
-        if np.abs(self._g - np.abs(scene_g)) > 0.1:
+        # OceanSim models neutral buoyancy by zeroing scene gravity globally (the
+        # IMU uses a synthetic g), so scene_g == 0 is the EXPECTED configuration
+        # -- warning on it fired on every single run. Only warn when the scene
+        # carries a real, different gravity (a genuine configuration mismatch).
+        if np.abs(scene_g) > 0.1 and np.abs(self._g - np.abs(scene_g)) > 0.1:
             # get_pressure() always uses self._g; nothing is reconciled, so don't
             # claim a correction was applied.
             carb.log_warn(f'[{self._name}] USD scene gravity ({np.abs(scene_g):.3f}) '

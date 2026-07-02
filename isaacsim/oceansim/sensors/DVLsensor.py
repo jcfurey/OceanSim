@@ -80,11 +80,15 @@ class DVLsensor:
             self._freq_dependent_range_bound = freq_dependenet_range_bound
             self._sound_speed = sound_speed
 
-        # Initialization 
+        # Initialization
         self._rigid_body_path = None
         self._beam_paths = []
         self._elapsed_time_vel = 0.0
         self._elapsed_time_depth = 0.0
+        # True while the last get_linear_vel() had no bottom lock (>= threshold
+        # beams missed); consumers use it to distinguish dropout zeros from a
+        # genuine zero velocity.
+        self.last_dropout = False
 
         
         
@@ -116,6 +120,10 @@ class DVLsensor:
 
         """
         self._rigid_body_path = rigid_body_path
+        # Re-entrancy: a second attachDVL used to APPEND four more beam paths to
+        # the existing list, corrupting the depth/noise indexing (loops assume
+        # exactly 4 beams at fixed indices).
+        self._beam_paths = []
         self._rigid_body_prim = SingleRigidPrim(prim_path=self._rigid_body_path)
         sensor_prim_path = rigid_body_path + "/" + self._name
         self._DVL = BaseSensor(prim_path=sensor_prim_path,
@@ -313,7 +321,12 @@ class DVLsensor:
             if_hit.append(self._DVL_interface.get_beam_hit_data(beam_path)[0])
         if if_hit.count(False) >= self._num_beams_out_range_threshold:
             carb.log_warn(f'[{self._name}] Measurement is dropped out')
+            # Flag the dropout so consumers (the ROS publisher) can tell "no
+            # bottom lock" from a genuine zero velocity -- publishing these
+            # zeros as a valid low-covariance twist poisons any EKF fusing them.
+            self.last_dropout = True
             return np.zeros(3)
+        self.last_dropout = False
 
         world_vel = self._rigid_body_prim.get_linear_velocity()
         _, world_orient = self._rigid_body_prim.get_world_pose()
@@ -335,16 +348,25 @@ class DVLsensor:
         Returns:
             Union[np.ndarray, float]: Velocity vector if update is due, otherwise NaN.
         """
-        # Evaluate the (possibly adaptive) period once: in adaptive mode get_dt()
-        # runs a full get_depth() sweep of physics-view queries, so calling it
-        # twice per step doubled that cost.
-        sensor_dt = self.get_dt()
+        # In adaptive mode get_dt() runs a FULL get_depth() sweep (4 noisy beam
+        # queries + dropout check) -- doing that every physics step to decide
+        # whether a measurement is due costs more than the measurement. Reuse
+        # the last computed period between measurements and refresh it only when
+        # one actually fires (the ping rate is a slowly-varying function of
+        # altitude; a one-measurement lag in the period is physically fine).
+        sensor_dt = self._dt if getattr(self, '_dt', None) else self.get_dt()
         if sensor_dt < physics_dt:
             carb.log_warn(f'[{self._name}] Simulation physics_dt is larger than sensor_dt. Reduced to get_linear_vel().')
         self._elapsed_time_vel += physics_dt
         if self._elapsed_time_vel >= sensor_dt:
-            self._elapsed_time_vel = 0.0
-            return self.get_linear_vel()
+            # Subtract the period instead of resetting to zero: a reset discards
+            # the overshoot every cycle and quantises the effective rate DOWN by
+            # up to one physics step per measurement.
+            self._elapsed_time_vel -= sensor_dt
+            vel = self.get_linear_vel()
+            if not self._user_static_freq_flag:
+                self.get_dt()   # refresh the adaptive period for the next cycle
+            return vel
         else:
             return float('nan')
 
@@ -357,14 +379,18 @@ class DVLsensor:
         Returns:
             Union[list[float], float]: Depth measurements if update is due, otherwise NaN.
         """
-        # Evaluate the (possibly adaptive) period once -- see get_linear_vel_fd.
-        sensor_dt = self.get_dt()
+        # Reuse the cached adaptive period between measurements and subtract the
+        # period on fire -- see get_linear_vel_fd for both rationales.
+        sensor_dt = self._dt if getattr(self, '_dt', None) else self.get_dt()
         if sensor_dt < physics_dt:
             carb.log_warn(f'[{self._name}] Simulation physics_dt is larger than sensor_dt. Reduced to get_depth().')
         self._elapsed_time_depth += physics_dt
         if self._elapsed_time_depth >= sensor_dt:
-            self._elapsed_time_depth = 0.0
-            return self.get_depth()
+            self._elapsed_time_depth -= sensor_dt
+            depth = self.get_depth()
+            if not self._user_static_freq_flag:
+                self.get_dt()   # refresh the adaptive period for the next cycle
+            return depth
         else:
             return float('nan')
         

@@ -200,6 +200,8 @@ class OceanSimSensorPublisher:
         self._joint_cmd_sub = None     # joint position-command subscription
         self._articulation = None      # lazily-resolved Isaac articulation (if any)
         self._joint_names = None       # articulation dof order (cached)
+        self._joint_targets = None     # last commanded joint targets (seeded on first command)
+        self._robot_state_cache = None # per-publish-tick robot state memo (odom + IMU share it)
 
         # rate gates
         self._odom_gate = _RateGate(self._cfg["odom_rate"])
@@ -413,6 +415,8 @@ class OceanSimSensorPublisher:
         if self._node is None:
             return
         stamp = self._stamp(sim_time)
+        # Invalidate the per-tick robot-state memo (odom + IMU share one fetch).
+        self._robot_state_cache = None
 
         if self._clock_pub is not None:
             self._safe(self._publish_clock, sim_time)
@@ -466,18 +470,28 @@ class OceanSimSensorPublisher:
         """Apply an incoming sensor_msgs/JointState position command to the
         articulation. The command may be a subset / reordered / contain unknown
         joints -- joint_control.map_named_command reconciles it against the DOF
-        order, holding the current target for any joint the command omits."""
+        order, holding the last commanded TARGET for any joint the command omits.
+
+        Holding the last target (not the instantaneous position) matters when
+        commands interleave: joint A is commanded to 1.0 and still moving; a
+        second command naming only joint B used to re-target A to wherever it
+        happened to be mid-swing -- silently cancelling A's in-flight motion.
+        The first command seeds the targets from the current positions."""
         if self._articulation is None or not msg.name:
             return
         try:
             from isaacsim.core.utils.types import ArticulationAction
-            current = np.asarray(self._articulation.get_joint_positions(), dtype=float).reshape(-1)
+            if self._joint_targets is None:
+                self._joint_targets = np.asarray(
+                    self._articulation.get_joint_positions(), dtype=float).reshape(-1)
             targets, ignored = joint_control.map_named_command(
-                list(msg.name), list(msg.position), self._joint_names, current=current)
+                list(msg.name), list(msg.position), self._joint_names,
+                current=self._joint_targets)
             if ignored:
                 self._node.get_logger().warn(
                     f"joint command names not on this robot, ignored: {ignored}",
                     throttle_duration_sec=5.0)
+            self._joint_targets = np.asarray(targets, dtype=float)
             self._articulation.apply_action(ArticulationAction(joint_positions=targets))
         except Exception as e:  # keep the sim alive on a malformed command / API change
             self._node.get_logger().warn(
@@ -505,12 +519,21 @@ class OceanSimSensorPublisher:
         return self._rigid_prim
 
     def _robot_state(self):
-        """Return (pos, quat_wxyz, lin_vel_world, ang_vel_world) as numpy arrays."""
+        """Return (pos, quat_wxyz, lin_vel_world, ang_vel_world) as numpy arrays.
+
+        Memoised per publish() tick: odom and IMU both call this on the same
+        step, and each call is four physics-tensor backend readbacks -- the
+        second was pure duplicate cost (the state cannot change between them;
+        physics only advances in world.step)."""
+        if self._robot_state_cache is not None:
+            return self._robot_state_cache
         rp = self._ensure_rigid_prim()
         pos, quat = rp.get_world_pose()
         lin_vel = np.asarray(rp.get_linear_velocity(), dtype=float)
         ang_vel = np.asarray(rp.get_angular_velocity(), dtype=float)
-        return np.asarray(pos, dtype=float), np.asarray(quat, dtype=float), lin_vel, ang_vel
+        self._robot_state_cache = (np.asarray(pos, dtype=float),
+                                   np.asarray(quat, dtype=float), lin_vel, ang_vel)
+        return self._robot_state_cache
 
     def _publish_odom(self, stamp):
         from nav_msgs.msg import Odometry
@@ -595,6 +618,12 @@ class OceanSimSensorPublisher:
     def _publish_dvl(self, stamp):
         from geometry_msgs.msg import TwistWithCovarianceStamped
         vel = np.asarray(self._dvl.get_linear_vel(), dtype=float)  # body frame
+        # No bottom lock -> no measurement. get_linear_vel returns hard zeros on
+        # dropout; publishing those as a valid low-covariance twist would drag
+        # any EKF fusing this topic toward zero velocity. A real DVL driver
+        # publishes nothing (or an invalid flag) without lock -- skip.
+        if getattr(self._dvl, "last_dropout", False):
+            return
         msg = TwistWithCovarianceStamped()
         msg.header.stamp = stamp
         msg.header.frame_id = self._cfg["dvl_frame_id"]

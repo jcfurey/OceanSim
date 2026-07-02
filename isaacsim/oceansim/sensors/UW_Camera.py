@@ -283,7 +283,11 @@ class UW_Camera(Camera):
                 stamp = Time(sec=sec, nanosec=nanosec)
             else:
                 current_time = time.time()
-                if current_time - self._last_publish_time < (1.0 / self._ros2_pub_frequency):
+                # hz <= 0 means "publish every frame" (matching the sim-time
+                # RateGate's convention) -- the bare division raised
+                # ZeroDivisionError every frame for ros2_pub_frequency=0.
+                if (self._ros2_pub_frequency and self._ros2_pub_frequency > 0
+                        and current_time - self._last_publish_time < (1.0 / self._ros2_pub_frequency)):
                     return
                 self._last_publish_time = current_time
                 stamp = node.get_clock().now().to_msg()
@@ -370,7 +374,12 @@ class UW_Camera(Camera):
                 self._uw_image_buf = wp.empty_like(raw_rgba)
             uw_image = self._uw_image_buf
             wp.launch(
-                dim=np.flip(self.get_resolution()),
+                # Launch over the ACTUAL annotator image shape, not
+                # get_resolution(): if the configured resolution and the
+                # delivered AOV ever disagree (resolution changed mid-run,
+                # renderer clamping), a resolution-derived dim reads/writes out
+                # of bounds in the kernel.
+                dim=raw_rgba.shape[:2],
                 kernel=UW_render,
                 inputs=[
                     raw_rgba,
@@ -387,7 +396,13 @@ class UW_Camera(Camera):
             if self._viewport:
                 self._provider.set_bytes_data_from_gpu(uw_image.ptr, self.get_resolution())
             if self._writing:
-                self._writing_backend.schedule(write_image, path=f'UW_image_{self._id}.png', data=uw_image)
+                # Snapshot to host BEFORE scheduling: the backend writes
+                # asynchronously, and uw_image is the REUSED render buffer that
+                # the next frame's UW_render kernel overwrites in place -- handing
+                # it live raced the PNG encode against the next frame (torn frames
+                # on disk).
+                self._writing_backend.schedule(write_image, path=f'UW_image_{self._id}.png',
+                                               data=uw_image.numpy())
                 print(f'[{self._name}] [{self._id}] Rendered image saved to {self._writing_backend.output_dir}')
             if self._enable_ros2_pub:
                 self._ros2_publish_camera(uw_image, depth, sim_time)
@@ -426,6 +441,13 @@ class UW_Camera(Camera):
             - Required for proper shutdown when done using the sensor
             - Also closes viewport window if one was created
         """
+        # Flush any scheduled-but-unwritten frames first -- the dispatch backend
+        # writes asynchronously and dropped trailing frames at shutdown.
+        if getattr(self, "_writing", False) and getattr(self, "_writing_backend", None) is not None:
+            try:
+                self._writing_backend.wait_until_done()
+            except Exception as exc:  # noqa: BLE001
+                print(f'[{self._name}] write-backend flush warning: {exc}')
         # Detach is best-effort: a detach/clear failure on an invalidated render
         # product (or a close() before initialize() ever ran -> the annotator
         # attrs may not exist) must NOT skip the rclpy context release in the

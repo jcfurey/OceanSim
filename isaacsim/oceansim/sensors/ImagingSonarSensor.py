@@ -861,7 +861,12 @@ class ImagingSonarSensor(Camera):
         if self.writing:
             # self.backend.schedule(write_np, f"intensity_{self.id}.npy", data=intensity)
             # self.backend.schedule(write_np, f'pcl_local_{self.id}.npy', data=pcl_local)
-            self.backend.schedule(write_np, f'sonar_data_{self.id}.npy', data=self.sonar_map)
+            # Snapshot to host BEFORE scheduling: the backend writes
+            # asynchronously, and handing it the live reused device sonar_map --
+            # which the next frame zeroes and overwrites -- raced the disk write
+            # against the next frame's kernels (torn/corrupted .npy contents).
+            self.backend.schedule(write_np, f'sonar_data_{self.id}.npy',
+                                  data=self.sonar_map.numpy())
             print(f"[{self._name}] [{self.id}] Writing sonar data to {self.backend.output_dir}")
         
         if self._viewport and not self.async_compute:
@@ -1069,6 +1074,13 @@ class ImagingSonarSensor(Camera):
         # Stop the async worker first so it isn't mid-kernel when the annotators /
         # render product it reads through scan_data get torn down below.
         self.stop_async()
+        # Flush any scheduled-but-unwritten frames before teardown -- the dispatch
+        # backend writes asynchronously and dropped trailing frames at shutdown.
+        if getattr(self, "writing", False) and getattr(self, "backend", None) is not None:
+            try:
+                self.backend.wait_until_done()
+            except Exception as exc:  # noqa: BLE001
+                print(f'[{self._name}] write-backend flush warning: {exc}')
         # If sonar_initialize() never ran (or raised mid-way), cameraParams_annot
         # won't exist; guard so close() on a half-initialized sensor doesn't raise
         # an AttributeError that masks the rest of the scenario teardown.
