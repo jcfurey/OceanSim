@@ -60,14 +60,16 @@ _GMO_WRITER_NAME = "OceanSimAcousticGmoSink"
 _gmo_writer_registered = False
 
 
-def _gmo_field(field, n):
+def _gmo_field(field, n, dtype=None):
     """Copy an n-length GMO field to numpy, tolerating slice-able array-likes
-    (``scalar``/``timeOffsetNs``) or raw ctypes pointers (``x``/``y``/``z``)."""
+    (``scalar``/``timeOffsetNs``) or raw ctypes pointers (``x``/``y``/``z``).
+    ``dtype`` converts in the same single copy (an ``np.array(...)`` followed by
+    ``.astype(...)`` copied the buffer twice per rendered frame)."""
     try:
-        return np.array(field[:n])
+        return np.array(field[:n], dtype=dtype)
     except Exception:  # noqa: BLE001
         import numpy.ctypeslib as npct
-        return np.array(npct.as_array(field, shape=(n,)))
+        return np.array(npct.as_array(field, shape=(n,)), dtype=dtype)
 
 
 def _ensure_gmo_writer():
@@ -104,10 +106,15 @@ def _ensure_gmo_writer():
                     # numSamplesPerSgw is the A-scan length: numElements = numSgws *
                     # numSamplesPerSgw, the 640/2560/... samples laid out as numSgws
                     # contiguous A-scan blocks. ONLY populated at aux_output_level=BASIC.
+                    # "frame" is a monotonic capture id so the reader can tell a NEW
+                    # capture from the same frame it already folded -- without it a
+                    # stalled SDG pipeline froze `latest` and the fold kept re-running
+                    # (and republishing) the dead frame indistinguishably forever.
                     self.latest = {
                         "n": n,
                         "nspg": int(getattr(gmo, "numSamplesPerSgw", 0) or 0),
-                        "amp": _gmo_field(gmo.scalar, n).astype(np.float32),
+                        "amp": _gmo_field(gmo.scalar, n, dtype=np.float32),
+                        "frame": self.frame_count,
                     }
             except Exception as exc:  # noqa: BLE001 - never throw inside the SDG pipeline
                 print(f"[{_GMO_WRITER_NAME}] write error: {exc}", flush=True)
@@ -176,6 +183,13 @@ class RtxAcousticSensor:
         self._frame_i = 0
         self._logged_valid = False
         self._logged_fold = False
+        # Writer-frame id of the last GMO actually folded + the sim time it was
+        # folded at: lets make_sonar_data skip re-folding an unchanged frame and
+        # lets get_sonar_map_np() report a real capture time to the publisher
+        # (so a stalled writer's header stamps stop advancing instead of the
+        # dead frame being republished "fresh" forever).
+        self._last_folded_frame = None
+        self._last_capture_time = None
         self._map_np = np.zeros((self.n_range, self.n_beams, 3), dtype=np.float32)
         self.sonar_map = self._map_np  # reuse the buffer (publisher accepts numpy); no per-frame GPU alloc
 
@@ -262,8 +276,15 @@ class RtxAcousticSensor:
                     translations=None if self._translation is None else self._translation.reshape(1, 3),
                     orientations=None if self._orientation is None else self._orientation.reshape(1, 4),
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # Do NOT swallow silently: a failed mount pose leaves the sensor at
+                # the parent-origin identity pose -- exactly the historical
+                # mis-registration failure described above -- and the downstream
+                # amplitude/fold sanity logs cannot detect a wrong pose.
+                print(f"[{self._name}] set_local_poses FAILED ({exc}); sensor left at "
+                      f"parent-origin identity pose (intended translation="
+                      f"{self._translation}, orientation={self._orientation}) -- "
+                      f"returns will be mis-registered", flush=True)
 
         # Read the acoustic timing from the prim so the sample->range mapping tracks
         # the real sensor config: range(k) = range_offset + k * meters_per_sample,
@@ -359,6 +380,19 @@ class RtxAcousticSensor:
         if latest is None:
             return
 
+        # Skip re-folding a frame we already folded: the writer refreshes `latest`
+        # every rendered frame in normal operation, but if the SDG pipeline stalls
+        # (or the fold cadence outruns the tick rate) this method used to re-run
+        # the full numpy fold on identical data every call -- pure waste -- and,
+        # worse, kept the dead frame looking freshly produced. The frame id makes
+        # "no new capture" explicit; the publisher's capture-time stamp (below)
+        # makes it diagnosable.
+        frame_id = latest.get("frame")
+        if frame_id is not None and frame_id == self._last_folded_frame:
+            return
+        self._last_folded_frame = frame_id
+        self._last_capture_time = kwargs.get("sim_time")
+
         n = int(latest["n"])
         amp = latest["amp"]
         nspg = int(latest.get("nspg", 0) or 0)
@@ -374,8 +408,11 @@ class RtxAcousticSensor:
 
         # Fold the signal-way A-scans into the (n_range, n_beams) intensity grid:
         # range(k) = range_offset + k * meters_per_sample (sample index = range axis;
-        # the per-element timeOffsetNs is always 0 for acoustic). Pure numpy + unit tested.
-        self._map_np[:] = 0.0
+        # the per-element timeOffsetNs is always 0 for acoustic). Pure numpy + unit
+        # tested. Only channel 2 is written: channels 0/1 are zeroed at init and
+        # never touched again, so the previous full-map memset re-zeroed 2/3 of a
+        # 7+ MB buffer every fold for nothing; the fold's returned grid fully
+        # overwrites channel 2 (it contains the zeros).
         self._map_np[:, :, 2] = rtx_acoustic_math.fold_gmo_to_grid(
             amp, nspg, self.meters_per_sample, self.range_offset,
             self.min_range, self.range_res, self.n_range, self.n_beams)
@@ -396,6 +433,18 @@ class RtxAcousticSensor:
                       f"beams hit={np.unique(beams).size}/{self.n_beams}", flush=True)
             else:
                 print(f"[{self._name}] FOLDED grid is EMPTY (collapsed!) -- check calibration", flush=True)
+
+    def get_sonar_map_np(self):
+        """(capture_sim_time, grid) for the publisher -- the same contract as
+        ImagingSonarSensor.get_sonar_map_np(), so OceanSimSensorPublisher stamps
+        sonar messages with the sim time the folded GMO frame was captured at
+        instead of the ambient publish time. A stalled writer is then visible as
+        a frozen header stamp rather than a dead frame republished "fresh".
+        capture_sim_time is None until the first fold (publisher falls back to
+        the ambient stamp)."""
+        if self._last_folded_frame is None:
+            return None
+        return (self._last_capture_time, self._map_np)
 
     def close(self):
         try:
