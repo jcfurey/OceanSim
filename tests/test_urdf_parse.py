@@ -191,3 +191,74 @@ def test_root_link_prefers_connected_over_isolated(u):
         <origin xyz="0 0 0" rpy="0 0 0"/></joint>
     </robot>"""
     assert u.root_link(urdf) == "base_link"
+
+
+# DeepTrekker-shaped rig: a revolute pivot_head sits between base_link and the
+# sonar/camera frames (a chain of fixed joints), mirroring the real vehicle.
+PIVOT_URDF = """<?xml version="1.0"?>
+<robot name="pivotbot">
+  <link name="base_link"/>
+  <link name="pivot_head"/>
+  <link name="sonar0/connection_link"/>
+  <link name="sonar0/optical_frame"/>
+  <link name="dvl0/connection_link"/>
+  <joint name="pivot_head_joint" type="revolute">
+    <parent link="base_link"/><child link="pivot_head"/>
+    <origin xyz="0.2 0.0 0.05" rpy="0 0 0"/>
+  </joint>
+  <joint name="sonar0/connection_joint" type="fixed">
+    <parent link="pivot_head"/><child link="sonar0/connection_link"/>
+    <origin xyz="0.05 0.0 0.02" rpy="0 0 0"/>
+  </joint>
+  <joint name="sonar0/optical_joint" type="fixed">
+    <parent link="sonar0/connection_link"/><child link="sonar0/optical_frame"/>
+    <origin xyz="0.01 0.0 0.0" rpy="0 0.5235987756 0"/>
+  </joint>
+  <joint name="dvl0/connection_joint" type="fixed">
+    <parent link="base_link"/><child link="dvl0/connection_link"/>
+    <origin xyz="-0.2 0.0 -0.06" rpy="0 0 0"/>
+  </joint>
+</robot>
+"""
+
+
+def test_mount_anchor_stops_at_revolute_joint(u):
+    # sonar0/optical_frame hangs off pivot_head via two FIXED hops; the anchor
+    # must be pivot_head (not base_link), with the pose LOCAL to pivot_head
+    # (i.e. NOT including pivot_head_joint's own 0.2/0.0/0.05 offset).
+    anchor, tr, rpy = u.mount_anchor(PIVOT_URDF, "sonar0/optical_frame")
+    assert anchor == "pivot_head"
+    assert np.allclose(tr, [0.06, 0.0, 0.02])
+    assert np.allclose(rpy, [0.0, 30.0, 0.0], atol=1e-4)
+
+
+def test_mount_anchor_all_fixed_chain_is_root(u):
+    # dvl0/connection_link hangs off base_link via one FIXED joint only -> the
+    # anchor is base_link, identical to link_pose_in_base (no regression for
+    # rigidly-mounted sensors).
+    anchor, tr, rpy = u.mount_anchor(PIVOT_URDF, "dvl0/connection_link")
+    assert anchor == "base_link"
+    assert np.allclose(tr, [-0.2, 0.0, -0.06])
+
+
+def test_mount_anchor_link_is_base_returns_identity(u):
+    anchor, tr, rpy = u.mount_anchor(PIVOT_URDF, "base_link")
+    assert anchor == "base_link"
+    assert np.allclose(tr, [0.0, 0.0, 0.0])
+    assert np.allclose(rpy, [0.0, 0.0, 0.0])
+
+
+def test_mount_anchor_missing_link_returns_none(u):
+    assert u.mount_anchor(PIVOT_URDF, "no_such_link") is None
+
+
+def test_sensor_mount_anchor_resolves_optical_frame_candidate(u):
+    # "optical_frame" is a DEFAULT_SENSOR_LINKS candidate for "sonar", so this
+    # should resolve the same live link find_link would.
+    anchor, tr, rpy = u.sensor_mount_anchor(PIVOT_URDF, "sonar")
+    assert anchor == "pivot_head"
+    assert np.allclose(tr, [0.06, 0.0, 0.02])
+
+
+def test_sensor_mount_anchor_missing_sensor_returns_none(u):
+    assert u.sensor_mount_anchor(PIVOT_URDF, "baro") is None

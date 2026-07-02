@@ -484,25 +484,67 @@ def main(argv):
         except Exception as e:  # noqa: BLE001
             print(f"[oceansim_ros2] could not read URDF for sensor mounts: {e}")
 
+    def _resolve_link_prim(link_name):
+        """USD prim path of URDF link ``link_name`` within the imported robot,
+        or None if no matching prim exists (e.g. merge_fixed_joints folded a
+        purely-structural link into its rigid-body ancestor on import -- the
+        default, see the gravity-disable loop above where only the REAL rigid
+        bodies, e.g. base_link + pivot_head, survive as distinct prims)."""
+        direct = robot_path + "/" + link_name
+        if get_prim_at_path(direct).IsValid():
+            return direct
+        from pxr import Usd as _Usd
+        target = link_name.rsplit("/", 1)[-1].lower()
+        for _p in _Usd.PrimRange(robot_prim):
+            if _p.GetName().lower() == target:
+                return _p.GetPath().pathString
+        return None
+
     def _mount(kind, fallback_mount):
+        """Resolve sensor ``kind``'s USD parent prim + LOCAL mount pose.
+
+        Prefers the URDF's own sensor frame, anchored at the nearest ancestor
+        link reachable via only FIXED joints (urdf_parse.mount_anchor) -- e.g.
+        the DeepTrekker's sonar/camera hang off the revolute pivot_head via a
+        chain of fixed sub-frames. Parenting the sensor prim there (instead of
+        always at the rigid-body root) lets USD's ordinary parent/child
+        transform composition carry the sensor as PhysX animates that joint,
+        rather than baking a stale zero-angle snapshot that never updates
+        (previously EVERY sensor was parented at the root regardless of which
+        link its URDF mount was read from -- correct only when the whole
+        chain to the root is fixed, e.g. the DVL). Falls back to the old
+        static, root-relative behaviour when the URDF has no matching sensor
+        link, or the resolved anchor link has no prim in the imported stage.
+        """
+        anchored = urdf_parse.sensor_mount_anchor(urdf_text, kind) if urdf_text is not None else None
+        if anchored is not None:
+            anchor_link, tr, rpy = anchored
+            parent_path = (robot_path if anchor_link == urdf_parse.root_link(urdf_text)
+                           else _resolve_link_prim(anchor_link))
+            if parent_path is not None:
+                print(f"[oceansim_ros2] {kind} mount from URDF link -> {tr} "
+                      f"(anchored to {parent_path})")
+                return parent_path, np.array(tr, dtype=float), np.array(rpy, dtype=float)
+            print(f"[oceansim_ros2] {kind} mount anchor '{anchor_link}' has no prim "
+                  f"in the imported stage -- falling back to a static root-relative mount")
         # Parse the URDF once (sensor_mount_or also parses, so the old extra
         # sensor_mount() call just to gate the log re-parsed the whole URDF).
         m = urdf_parse.sensor_mount(urdf_text, kind) if urdf_text is not None else None
         if m is not None:
             tr, rpy = m
-            print(f"[oceansim_ros2] {kind} mount from URDF link -> {tr}")
+            print(f"[oceansim_ros2] {kind} mount from URDF link -> {tr} (static, root-relative)")
         else:
             tr, rpy = fallback_mount.translation, fallback_mount.rpy_deg
-        return np.array(tr, dtype=float), np.array(rpy, dtype=float)
+        return robot_path, np.array(tr, dtype=float), np.array(rpy, dtype=float)
 
     # ---- sensors (mounts from the URDF if present, else the platform spec) -
     sensors = cfg["sensors"]
     sonar = cam = dvl = baro = None
     if sensors.get("sonar"):
         sonar_backend = cfg.get("sonar_backend", "oceansim")
-        _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
+        _sonar_parent, _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
         _sonar_xform = dict(
-            prim_path=robot_path + "/sonar",
+            prim_path=_sonar_parent + "/sonar",
             translation=_sonar_tr,
             orientation=euler_angles_to_quat(_sonar_rpy, degrees=True))
         if sonar_backend == "rtx_acoustic":
@@ -558,16 +600,16 @@ def main(argv):
                 **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
-        _cam_translation, _ = _mount("camera", spec.camera_mount)
-        cam = UW_Camera(prim_path=robot_path + "/UW_camera",
+        _cam_parent, _cam_translation, _ = _mount("camera", spec.camera_mount)
+        cam = UW_Camera(prim_path=_cam_parent + "/UW_camera",
                         resolution=[1920, 1080], translation=_cam_translation)
         cam.set_focal_length(0.1 * 21)
         cam.set_clipping_range(0.1, 100)
     if sensors.get("dvl"):
         from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
-        _dvl_translation, _ = _mount("dvl", spec.dvl_mount)
+        _dvl_parent, _dvl_translation, _ = _mount("dvl", spec.dvl_mount)
         dvl = DVLsensor(max_range=10)
-        dvl.attachDVL(rigid_body_path=robot_path, translation=_dvl_translation)
+        dvl.attachDVL(rigid_body_path=_dvl_parent, translation=_dvl_translation)
     if sensors.get("baro"):
         from isaacsim.oceansim.sensors.BarometerSensor import BarometerSensor
         baro = BarometerSensor(prim_path=robot_path + "/Baro",

@@ -17,7 +17,8 @@ import numpy as np
 
 # Conventional URDF link names per sensor kind (matched case-insensitively).
 DEFAULT_SENSOR_LINKS = {
-    "sonar": ["sonar", "sonar_link", "imaging_sonar", "oculus", "sonar0", "forward_sonar"],
+    "sonar": ["sonar", "sonar_link", "imaging_sonar", "oculus", "sonar0", "forward_sonar",
+              "optical_frame"],
     "camera": ["camera", "camera_link", "cam", "uw_camera", "camera0", "front_camera"],
     "dvl": ["dvl", "dvl_link", "dvl0", "doppler"],
     "baro": ["baro", "barometer", "pressure", "pressure_sensor", "depth"],
@@ -63,7 +64,9 @@ def _homog(xyz, rpy):
 
 def _parse(urdf_text):
     """Return (joints_by_child, link_names). joints_by_child[child] =
-    (parent, xyz, rpy) for the fixed/articulated joint whose child is `child`."""
+    (parent, xyz, rpy, joint_type) for the joint whose child is `child`.
+    joint_type is the URDF ``type`` attribute (e.g. ``fixed``, ``revolute``),
+    defaulting to ``fixed`` if unspecified (invalid URDF, but harmless here)."""
     root = ET.fromstring(urdf_text)
     joints_by_child = {}
     links = set()
@@ -80,7 +83,8 @@ def _parse(urdf_text):
         origin = joint.find("origin")
         xyz = _floats(origin.get("xyz") if origin is not None else None, 3)
         rpy = _floats(origin.get("rpy") if origin is not None else None, 3)
-        joints_by_child[child] = (parent, xyz, rpy)
+        jtype = joint.get("type", "fixed")
+        joints_by_child[child] = (parent, xyz, rpy, jtype)
         links.add(parent)
         links.add(child)
     return joints_by_child, links
@@ -97,14 +101,14 @@ def _root_link(joints_by_child, links):
     that single child, so frames/mounts come out relative to the base, not world.
     """
     children = set(joints_by_child)
-    parents = {p for (p, _, _) in joints_by_child.values()}
+    parents = {p for (p, _, _, _) in joints_by_child.values()}
     roots = sorted(l for l in links if l not in children)
     if not roots:
         return None
     connected = [r for r in roots if r in parents]
     root = connected[0] if connected else roots[0]
     if root == "world":
-        world_children = sorted(c for c, (p, _, _) in joints_by_child.items() if p == "world")
+        world_children = sorted(c for c, (p, _, _, _) in joints_by_child.items() if p == "world")
         if len(world_children) == 1:
             return world_children[0]
     return root
@@ -131,7 +135,7 @@ def link_pose_in_base(urdf_text, link_name, base_link=None):
         if node not in joints_by_child or node in seen:
             return None  # reached a different root, or a cycle
         seen.add(node)
-        parent, xyz, rpy = joints_by_child[node]
+        parent, xyz, rpy, _jtype = joints_by_child[node]
         chain.append((xyz, rpy))
         node = parent
 
@@ -142,6 +146,60 @@ def link_pose_in_base(urdf_text, link_name, base_link=None):
     translation = tuple(float(v) for v in T[:3, 3])
     rpy_deg = tuple(float(np.degrees(a)) for a in _matrix_to_rpy(T[:3, :3]))
     return translation, rpy_deg
+
+
+def mount_anchor(urdf_text, link_name, base_link=None):
+    """Nearest ancestor of ``link_name`` suitable as a USD parent for a sensor
+    mount, plus the sensor's pose LOCAL to that anchor: ``(anchor_link,
+    translation, rpy_deg)``, or None if ``link_name`` doesn't exist / isn't
+    connected to base.
+
+    :func:`link_pose_in_base` flattens the *entire* chain back to the
+    kinematic root into one static transform -- correct only if every joint
+    along the way is fixed. When a non-fixed joint (e.g. a revolute pivot)
+    sits between the sensor and the root, that flattened pose silently bakes
+    in whatever angle the URDF happens to rest at and never updates again.
+
+    This instead climbs from ``link_name`` toward ``base_link`` (the
+    kinematic root if None), folding only FIXED-joint origins, and stops at
+    the link reached just before crossing the first non-fixed joint --
+    returning that link as the anchor. Parenting the sensor's USD prim under
+    the anchor's own prim (rather than the root) lets ordinary USD
+    parent/child transform composition carry the sensor along as PhysX
+    animates that joint, instead of it staying frozen at a stale pose. If the
+    whole chain to ``base_link`` is fixed, the anchor IS ``base_link`` --
+    identical to :func:`link_pose_in_base` (e.g. a DVL bolted straight to the
+    hull), so existing rigidly-mounted sensors are unaffected.
+    """
+    joints_by_child, links = _parse(urdf_text)
+    if link_name not in links:
+        return None
+    if base_link is None:
+        base_link = _root_link(joints_by_child, links)
+    if link_name == base_link:
+        return base_link, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
+
+    chain = []
+    node = link_name
+    seen = set()
+    anchor = base_link
+    while node != base_link:
+        if node not in joints_by_child or node in seen:
+            return None  # reached a different root, or a cycle
+        seen.add(node)
+        parent, xyz, rpy, jtype = joints_by_child[node]
+        if jtype != "fixed":
+            anchor = node
+            break
+        chain.append((xyz, rpy))
+        node = parent
+
+    T = np.eye(4)
+    for xyz, rpy in reversed(chain):
+        T = T @ _homog(xyz, rpy)
+    translation = tuple(float(v) for v in T[:3, 3])
+    rpy_deg = tuple(float(np.degrees(a)) for a in _matrix_to_rpy(T[:3, :3]))
+    return anchor, translation, rpy_deg
 
 
 def root_link(urdf_text):
@@ -201,6 +259,20 @@ def sensor_mount(urdf_text, kind, candidates=None):
         if link is None:
             return None
         return link_pose_in_base(urdf_text, link)
+    except (ET.ParseError, ValueError):
+        return None
+
+
+def sensor_mount_anchor(urdf_text, kind, candidates=None):
+    """``(anchor_link, translation, rpy_deg)`` for sensor ``kind``'s USD mount
+    point (see :func:`mount_anchor`), or None if the URDF has no matching
+    sensor link (or can't be parsed)."""
+    try:
+        cands = candidates if candidates is not None else DEFAULT_SENSOR_LINKS.get(kind, [])
+        link = find_link(urdf_text, cands)
+        if link is None:
+            return None
+        return mount_anchor(urdf_text, link)
     except (ET.ParseError, ValueError):
         return None
 
