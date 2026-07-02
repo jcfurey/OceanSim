@@ -26,6 +26,14 @@ def map_named_command(cmd_names, cmd_values, joint_order, current=None):
         ``joint_order``; ``ignored`` is the list of command names that are not
         joints of this robot (silently dropped from ``targets``).
     """
+    # A malformed command (len(position) != len(name) -- easy to produce with a
+    # hand-typed `ros2 topic pub`) used to be silently truncated by zip(): the
+    # extra names were dropped without a trace, or trailing values ignored.
+    # Refuse it outright; the ROS callback wraps this in a warn-and-continue.
+    if len(cmd_names) != len(cmd_values):
+        raise ValueError(
+            f"joint command has {len(cmd_names)} names but {len(cmd_values)} "
+            f"values; refusing a silently-truncated command.")
     index = {n: i for i, n in enumerate(joint_order)}
     n = len(joint_order)
     if current is not None:

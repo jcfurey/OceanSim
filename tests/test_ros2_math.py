@@ -140,3 +140,24 @@ def test_rategate_still_throttles(m):
     t, dt = 0.0, 1.0 / 60.0
     fired = sum(1 for i in range(600) if gate.ready(t + i * dt))
     assert 99 <= fired <= 101
+
+
+def test_single_beam_points_forward(m):
+    # n_beams=1 used to put the sole beam at -fov/2 (the fan edge) via
+    # linspace(-h, h, 1); a single beam must point straight ahead (+z).
+    (d,) = m.sonar_beam_directions(130.0, 1)
+    assert d[1] == pytest.approx(0.0)   # -sin(0)
+    assert d[2] == pytest.approx(1.0)   # cos(0)
+
+
+def test_oculus_beamwidths_bands(m):
+    import math
+    az, el = m.oculus_beamwidths(1.2e6)     # M300d/M1200d LF
+    assert az == pytest.approx(math.radians(0.6))
+    assert el == pytest.approx(math.radians(20.0))
+    az, _ = m.oculus_beamwidths(2.1e6)      # M1200d HF
+    assert az == pytest.approx(math.radians(0.4))
+    az, _ = m.oculus_beamwidths(3.0e6)      # M300d HF
+    assert az == pytest.approx(math.radians(0.4))
+    az, el = m.oculus_beamwidths(999.0)     # unrecognised -> 1.2 MHz defaults
+    assert az == pytest.approx(math.radians(0.6))

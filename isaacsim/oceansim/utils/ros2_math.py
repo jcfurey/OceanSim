@@ -93,7 +93,12 @@ def sonar_beam_directions(hori_fov_deg, n_beams):
     real Oculus driver / sonar_image_proc / sonar_proc.
     """
     half = math.radians(hori_fov_deg) / 2.0
-    bearings = np.linspace(-half, half, n_beams)
+    # n_beams == 1: a single beam points straight ahead (bearing 0), not at the
+    # fan edge -- np.linspace(-half, half, 1) returns [-half].
+    if int(n_beams) <= 1:
+        bearings = np.array([0.0])
+    else:
+        bearings = np.linspace(-half, half, n_beams)
     return [(0.0, float(-math.sin(b)), float(math.cos(b))) for b in bearings]
 
 

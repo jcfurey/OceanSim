@@ -79,3 +79,12 @@ def test_clamp_one_sided_infinite_lower(jc):
     t = jc.clamp_to_limits([-100.0, 100.0], lower=[-np.inf, -np.inf],
                            upper=[5.0, 5.0])
     assert t[0] == -100.0 and t[1] == 5.0
+
+
+def test_mismatched_name_value_lengths_rejected(jc):
+    # zip() used to silently truncate a malformed command (len(position) !=
+    # len(name)); it must be refused so the caller can warn.
+    with pytest.raises(ValueError):
+        jc.map_named_command(["arm_base", "gripper"], [1.0], ORDER)
+    with pytest.raises(ValueError):
+        jc.map_named_command(["arm_base"], [1.0, 2.0], ORDER)

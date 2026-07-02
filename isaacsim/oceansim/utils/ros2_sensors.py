@@ -201,6 +201,7 @@ class OceanSimSensorPublisher:
         self._articulation = None      # lazily-resolved Isaac articulation (if any)
         self._joint_names = None       # articulation dof order (cached)
         self._joint_targets = None     # last commanded joint targets (seeded on first command)
+        self._joint_limits = None      # cached (lower, upper) DOF limits, or "unavailable"
         self._robot_state_cache = None # per-publish-tick robot state memo (odom + IMU share it)
 
         # rate gates
@@ -491,6 +492,13 @@ class OceanSimSensorPublisher:
                 self._node.get_logger().warn(
                     f"joint command names not on this robot, ignored: {ignored}",
                     throttle_duration_sec=5.0)
+            # Clamp to the articulation's joint limits (fetched once): a command
+            # beyond the URDF limits used to go straight to apply_action, leaving
+            # the drive fighting the limit. joint_control.clamp_to_limits keeps
+            # NaN ("no change") entries and honours infinite (continuous) limits.
+            limits = self._get_joint_limits()
+            if limits is not None:
+                targets = joint_control.clamp_to_limits(targets, limits[0], limits[1])
             self._joint_targets = np.asarray(targets, dtype=float)
             self._articulation.apply_action(ArticulationAction(joint_positions=targets))
         except Exception as e:  # keep the sim alive on a malformed command / API change
@@ -502,6 +510,21 @@ class OceanSimSensorPublisher:
         msg = Clock()
         msg.clock = self._stamp(sim_time)
         self._clock_pub.publish(msg)
+
+    def _get_joint_limits(self):
+        """(lower, upper) arrays for the articulation's DOFs, fetched once.
+        None if the API is unavailable (no clamping -- same as before)."""
+        if self._joint_limits is not None:
+            return self._joint_limits if self._joint_limits != "unavailable" else None
+        try:
+            lim = np.asarray(self._articulation.get_dof_limits(), dtype=float)
+            lim = lim.reshape(-1, 2)   # (num_dof, 2): lower, upper
+            self._joint_limits = (lim[:, 0].copy(), lim[:, 1].copy())
+        except Exception as e:  # noqa: BLE001 - API drift / no limits authored
+            self._node.get_logger().warn(f"joint limits unavailable (no clamping): {e}")
+            self._joint_limits = "unavailable"
+            return None
+        return self._joint_limits
 
     def _ensure_rigid_prim(self):
         """Wrap the robot prim once the physics backend is live (lazy).

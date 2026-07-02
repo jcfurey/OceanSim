@@ -214,17 +214,27 @@ class MHL_Sensor_Example_Scenario():
         self._time = 0.0
 
 
+    _safe_call_fail_counts = {}
+
     @staticmethod
     def _safe_call(fn, *args, name, **kwargs):
         """Run fn(*args, **kwargs), logging and swallowing any exception instead
         of letting it propagate. A single transient GPU/CUDA hiccup in sonar or
         camera compute must not tear down the whole simulation -- every
         publish call in ros2_sensors.py already gets this same treatment via
-        its _safe() helper; this mirrors it for the compute side."""
+        its _safe() helper; this mirrors it for the compute side.
+
+        Log throttled per call-site: a PERSISTENTLY failing sensor otherwise
+        prints identical lines at the full sensor-tick rate (15-60 Hz)."""
         try:
             fn(*args, **kwargs)
+            MHL_Sensor_Example_Scenario._safe_call_fail_counts.pop(name, None)
         except Exception as e:  # noqa: BLE001 -- keep sim alive on compute error
-            print(f'[Scenario] {name} failed: {e}')
+            counts = MHL_Sensor_Example_Scenario._safe_call_fail_counts
+            n = counts.get(name, 0)
+            counts[name] = n + 1
+            if n == 0 or (n + 1) % 100 == 0:
+                print(f'[Scenario] {name} failed ({n + 1}x): {e}')
 
     def update_scenario(self, step: float, sim_time: float = None, sonar_tick: bool = None):
 
