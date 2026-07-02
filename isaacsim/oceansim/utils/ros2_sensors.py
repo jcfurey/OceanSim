@@ -198,6 +198,7 @@ class OceanSimSensorPublisher:
         self._robot_desc_pub = None    # latched /robot_description (URDF)
         self._joint_state_pub = None   # /joint_states from the articulation
         self._joint_cmd_sub = None     # joint position-command subscription
+        self._has_articulation = False # USD-only probe result (see _setup_joints)
         self._articulation = None      # lazily-resolved Isaac articulation (if any)
         self._joint_names = None       # articulation dof order (cached)
         self._joint_targets = None     # last commanded joint targets (seeded on first command)
@@ -295,9 +296,24 @@ class OceanSimSensorPublisher:
             self._node.get_logger().warn(f"robot_description publisher disabled: {e}")
 
     def _setup_joints(self):
-        """Resolve the robot's articulation (if any) and set up joint state
-        publishing + the optional joint-command subscription. All a no-op when
-        the robot prim is a plain rigid body with no DOFs."""
+        """Set up joint-state publishing + the optional joint-command
+        subscription for the robot's articulation (if any). All a no-op when
+        the robot prim is a plain rigid body with no DOFs.
+
+        Only a cheap USD-only probe runs here: this method is called from
+        initialize(), which ALWAYS runs before world.play(). The actual
+        isaacsim.core.prims.SingleArticulation wrapper -- and the DOF query
+        and PD-gain setup that depend on it -- are deferred to
+        _ensure_articulation(), built lazily on first real use (after play).
+        Building them here used to hit the same tensor-view-invalidation bug
+        already fixed for the rigid body (see _ensure_rigid_prim()):
+        world.play() rebuilds the physics scene and invalidates any tensor
+        view created before it, so a joint command issued through a pre-play
+        view silently went nowhere even though reads limped along on
+        stale/cached state -- and the PD gains set on that same pre-play view
+        were lost with it, which is why a "driven" joint free-drifted instead
+        of holding its commanded position.
+        """
         # GUARD: only touch an articulation when the robot prim actually IS one.
         # Constructing a SingleArticulation on a plain rigid hull fails *and* deletes
         # that prim's physics tensor view ("prim '/World/rob' was deleted ... the
@@ -314,18 +330,39 @@ class OceanSimSensorPublisher:
                 f"articulation probe failed ({e}); skipping joint I/O")
             return
 
+        self._has_articulation = True
+        from sensor_msgs.msg import JointState
+        self._joint_state_pub = self._node.create_publisher(
+            JointState, self._cfg["joint_states_topic"], _reliable_state_qos())
+        if self._cfg.get("enable_joint_command"):
+            self._joint_cmd_sub = self._node.create_subscription(
+                JointState, self._cfg["joint_command_topic"], self._on_joint_command,
+                _sensor_qos())
+        self._node.get_logger().info(
+            "joint I/O ROS endpoints ready (articulation itself resolves "
+            f"lazily after world.play()): states -> {self._cfg['joint_states_topic']}"
+            f"{', commands <- ' + self._cfg['joint_command_topic'] if self._joint_cmd_sub else ''}")
+
+    def _ensure_articulation(self):
+        """Build (once) the SingleArticulation wrapper + DOF names + PD gains,
+        AFTER world.play() so the tensor view it wraps survives (see
+        _setup_joints's docstring for why pre-play construction is unsafe).
+        Returns the wrapper, or None if this robot turns out to have no DOFs
+        after all (USD said ArticulationRootAPI, but e.g. every joint got
+        merged away on import) or the articulation is still unavailable."""
+        if self._articulation is not None:
+            return self._articulation
+        if not self._has_articulation:
+            return None
         try:
             from isaacsim.core.prims import SingleArticulation
             from isaacsim.core.utils.prims import get_prim_path
             art = SingleArticulation(prim_path=get_prim_path(self._robot_prim))
-            try:
-                art.initialize()
-            except Exception:  # pragma: no cover - may already be initialized
-                pass
+            art.initialize()
             dof_names = list(getattr(art, "dof_names", None) or [])
             if not dof_names:
-                return  # not an articulation / no joints -> nothing to manipulate
-            self._articulation = art
+                self._has_articulation = False  # no DOFs -> stop retrying every tick
+                return None
             self._joint_names = dof_names
             # Give the joints a real position drive: the staged URDFs import with
             # zero-stiffness actuators, so apply_action(joint_positions) otherwise
@@ -344,21 +381,15 @@ class OceanSimSensorPublisher:
                         f"joint drive gains set: stiffness={kp}, damping={kd}")
                 except Exception as e:  # noqa: BLE001
                     self._node.get_logger().warn(f"could not set joint drive gains: {e}")
+            self._articulation = art
+            self._node.get_logger().info(
+                f"articulation ready (post-play): {len(dof_names)} DOFs {dof_names}")
         except Exception as e:  # pragma: no cover
-            self._node.get_logger().warn(f"articulation unavailable (no joint I/O): {e}")
-            return
-
-        from sensor_msgs.msg import JointState
-        self._joint_state_pub = self._node.create_publisher(
-            JointState, self._cfg["joint_states_topic"], _reliable_state_qos())
-        if self._cfg.get("enable_joint_command"):
-            self._joint_cmd_sub = self._node.create_subscription(
-                JointState, self._cfg["joint_command_topic"], self._on_joint_command,
-                _sensor_qos())
-        self._node.get_logger().info(
-            f"joint manipulation ready: {len(self._joint_names)} DOFs "
-            f"{self._joint_names} (states -> {self._cfg['joint_states_topic']}"
-            f"{', commands <- ' + self._cfg['joint_command_topic'] if self._joint_cmd_sub else ''})")
+            self._node.get_logger().warn(
+                f"articulation unavailable (no joint I/O): {e}", throttle_duration_sec=5.0)
+            self._has_articulation = False
+            return None
+        return self._articulation
 
     def _setup_static_tf(self):
         """Broadcast base_link->{sensor} static transforms (latched /tf_static).
@@ -454,10 +485,13 @@ class OceanSimSensorPublisher:
         """Publish the articulation's joint positions/velocities as
         sensor_msgs/JointState (the input robot_state_publisher needs, together
         with the latched /robot_description, to broadcast the moving TF tree)."""
+        art = self._ensure_articulation()
+        if art is None:
+            return
         from sensor_msgs.msg import JointState
-        pos = np.asarray(self._articulation.get_joint_positions(), dtype=float).reshape(-1)
+        pos = np.asarray(art.get_joint_positions(), dtype=float).reshape(-1)
         try:
-            vel = np.asarray(self._articulation.get_joint_velocities(), dtype=float).reshape(-1)
+            vel = np.asarray(art.get_joint_velocities(), dtype=float).reshape(-1)
         except Exception:  # pragma: no cover - velocity optional
             vel = np.zeros_like(pos)
         msg = JointState()
@@ -478,13 +512,14 @@ class OceanSimSensorPublisher:
         second command naming only joint B used to re-target A to wherever it
         happened to be mid-swing -- silently cancelling A's in-flight motion.
         The first command seeds the targets from the current positions."""
-        if self._articulation is None or not msg.name:
+        art = self._ensure_articulation()
+        if art is None or not msg.name:
             return
         try:
             from isaacsim.core.utils.types import ArticulationAction
             if self._joint_targets is None:
                 self._joint_targets = np.asarray(
-                    self._articulation.get_joint_positions(), dtype=float).reshape(-1)
+                    art.get_joint_positions(), dtype=float).reshape(-1)
             targets, ignored = joint_control.map_named_command(
                 list(msg.name), list(msg.position), self._joint_names,
                 current=self._joint_targets)
@@ -496,11 +531,11 @@ class OceanSimSensorPublisher:
             # beyond the URDF limits used to go straight to apply_action, leaving
             # the drive fighting the limit. joint_control.clamp_to_limits keeps
             # NaN ("no change") entries and honours infinite (continuous) limits.
-            limits = self._get_joint_limits()
+            limits = self._get_joint_limits(art)
             if limits is not None:
                 targets = joint_control.clamp_to_limits(targets, limits[0], limits[1])
             self._joint_targets = np.asarray(targets, dtype=float)
-            self._articulation.apply_action(ArticulationAction(joint_positions=targets))
+            art.apply_action(ArticulationAction(joint_positions=targets))
         except Exception as e:  # keep the sim alive on a malformed command / API change
             self._node.get_logger().warn(
                 f"joint command failed: {e}", throttle_duration_sec=5.0)
@@ -511,15 +546,23 @@ class OceanSimSensorPublisher:
         msg.clock = self._stamp(sim_time)
         self._clock_pub.publish(msg)
 
-    def _get_joint_limits(self):
+    def _get_joint_limits(self, art):
         """(lower, upper) arrays for the articulation's DOFs, fetched once.
         None if the API is unavailable (no clamping -- same as before)."""
         if self._joint_limits is not None:
             return self._joint_limits if self._joint_limits != "unavailable" else None
         try:
-            lim = np.asarray(self._articulation.get_dof_limits(), dtype=float)
-            lim = lim.reshape(-1, 2)   # (num_dof, 2): lower, upper
-            self._joint_limits = (lim[:, 0].copy(), lim[:, 1].copy())
+            # SingleArticulation has no get_dof_limits(); limits live in the
+            # named dof_properties structured array (hasLimits/lower/upper/...).
+            props = art.dof_properties
+            lower = np.asarray(props["lower"], dtype=float)
+            upper = np.asarray(props["upper"], dtype=float)
+            has_limits = np.asarray(props["hasLimits"], dtype=bool)
+            # DOFs without authored limits clamp to +/-inf, i.e. a no-op (see
+            # joint_control.clamp_to_limits).
+            lower = np.where(has_limits, lower, -np.inf)
+            upper = np.where(has_limits, upper, np.inf)
+            self._joint_limits = (lower, upper)
         except Exception as e:  # noqa: BLE001 - API drift / no limits authored
             self._node.get_logger().warn(f"joint limits unavailable (no clamping): {e}")
             self._joint_limits = "unavailable"
