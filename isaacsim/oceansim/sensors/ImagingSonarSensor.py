@@ -378,8 +378,30 @@ class ImagingSonarSensor(Camera):
         # Due to the time to load annotators to cuda, the first few simulation ticks give no annotation in memory.
         # This is also the case when no mesh is within the sonar fov.
         # Semantic labels double as the warmup gate.
-        sem_data = self._custom_annotators["semantic_segmentation"].get_data()
-        id_to_labels = self._annot_get(sem_data, ('info', 'idToLabels'), 'semantic_segmentation')
+        sem_annot = self._custom_annotators["semantic_segmentation"]
+
+        # On the GPU fast path (the runner default) fetch semantics straight to
+        # the device and reuse that same dict both for the idToLabels gate here
+        # and for the compaction kernel in _scan_gpu_compact. The old code always
+        # did a full-image HOST get_data() here purely to read idToLabels, then
+        # _scan_gpu_compact re-fetched the array on-device -- so every default
+        # scan paid a wasted HxW device->host readback that was immediately
+        # discarded. idToLabels is host-computed annotator metadata that get_data()
+        # returns regardless of device; if a build ever omits `info` from the
+        # device dict, fall back to a host fetch for the labels (the proven path)
+        # so the warmup/empty-FOV gate is never wrongly tripped.
+        if self.gpu_point_filter:
+            sem_data = sem_annot.get_data(device=self._device)
+            try:
+                id_to_labels = self._annot_get(sem_data, ('info', 'idToLabels'),
+                                               'semantic_segmentation')
+            except KeyError:
+                id_to_labels = self._annot_get(sem_annot.get_data(),
+                                               ('info', 'idToLabels'), 'semantic_segmentation')
+        else:
+            sem_data = sem_annot.get_data()
+            id_to_labels = self._annot_get(sem_data, ('info', 'idToLabels'),
+                                           'semantic_segmentation')
 
         # No labels yet (CUDA warmup) or nothing in the FOV -> skip this frame.
         if len(id_to_labels) == 0:
@@ -391,18 +413,25 @@ class ImagingSonarSensor(Camera):
         # or None if it cannot run on-device (in which case it disables itself
         # and we drop through to the numpy path). See sonar_initialize().
         if self.gpu_point_filter:
-            result = self._scan_gpu_compact(id_to_labels)
+            result = self._scan_gpu_compact(id_to_labels, sem_data)
             if result is not None:
                 return result
             self.gpu_point_filter = False
             print(f"[{self._name}] gpu_point_filter unavailable (annotator outputs "
                   f"not Warp arrays on '{self._device}'); using numpy scan path.",
                   flush=True)
+            # The numpy path needs HOST-resident semantics; the device dict above
+            # isn't it, so fetch the host copy for the fallback.
+            sem_data = sem_annot.get_data()
 
         return self._scan_numpy(sem_data, id_to_labels)
 
-    def _scan_gpu_compact(self, id_to_labels):
+    def _scan_gpu_compact(self, id_to_labels, sem_dict):
         """On-device point selection via the compact_in_range kernel.
+
+        ``sem_dict`` is the semantic-segmentation annotator's already-fetched
+        on-device get_data() dict (fetched once in scan(), reused here) so this
+        method doesn't re-issue the device get_data() for it.
 
         Keeps the depth / point-cloud / normals / semantics AOVs on
         ``self._device`` and appends the in-range, finite points into reusable
@@ -420,7 +449,6 @@ class ImagingSonarSensor(Camera):
             depth = self._custom_annotators["distance_to_image_plane"].get_data(device=self._device)
             pcl = self.get_pointcloud(device=self._device, world_frame=True)
             normals = self._custom_annotators["normals"].get_data(device=self._device)
-            sem_dict = self._custom_annotators["semantic_segmentation"].get_data(device=self._device)
             sem = self._annot_get(sem_dict, ('data',), 'semantic_segmentation')
 
             # The fast path only engages when every AOV is genuinely a Warp array
