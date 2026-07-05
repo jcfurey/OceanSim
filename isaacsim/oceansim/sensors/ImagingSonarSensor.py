@@ -217,6 +217,36 @@ class ImagingSonarSensor(Camera):
         # buffers. Stop any previous worker before rebuilding the async state.
         if getattr(self, "_async_thread", None) is not None:
             self.stop_async()
+        # Same re-init concern for the render annotators: a second
+        # sonar_initialize() without an intervening close() would recreate
+        # cameraParams_annot and re-add the depth/normals/semantics AOVs below,
+        # leaking the previous annotator (still attached to the old render
+        # product and held in AnnotatorCache) and double-adding the AOVs to the
+        # SDG graph (growing per-frame render cost each re-init). Tear the
+        # previous ones down first -- mirroring close() -- while the OLD render
+        # product is still current (self.initialize() below rebuilds it). Guard
+        # the hydra-texture updates the same way close() does (detaching mutates
+        # the SDG graph). Defensive: a cleanup hiccup must never abort re-init.
+        if getattr(self, "cameraParams_annot", None) is not None:
+            _old_rp = getattr(self, "_render_product", None)
+            if _old_rp is not None:
+                try:
+                    _old_rp.hydra_texture.set_updates_enabled(False)
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self.remove_distance_to_image_plane_from_frame()
+                self.remove_normals_from_frame()
+                self.remove_semantic_segmentation_from_frame()
+                self.cameraParams_annot.detach(self._render_product_path)
+                rep.AnnotatorCache.clear(self.cameraParams_annot)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self._name}] re-init annotator cleanup warning: {exc}", flush=True)
+            if _old_rp is not None:
+                try:
+                    _old_rp.hydra_texture.set_updates_enabled(True)
+                except Exception:  # noqa: BLE001
+                    pass
         self.async_compute = self._async_compute_init
         self._async_busy = False
         # (capture_sim_time, grid) -- capture_sim_time is the sim time scan()
@@ -981,6 +1011,15 @@ class ImagingSonarSensor(Camera):
         self._async_stop = True
         self._async_scan_evt.set()
         self._async_thread.join(timeout=2.0)
+        if self._async_thread.is_alive():
+            # Still mid-scan after the grace period (e.g. a very large grid on a
+            # busy GPU taking >2 s). Don't null the handle: a daemon that keeps
+            # running would still write sonar_map/_async_result after teardown
+            # began, and nulling would silently orphan it. Keeping it set lets a
+            # later stop_async()/close() join it again, and surfaces the stall.
+            print(f"[{self._name}] async sonar worker did not stop within 2s; "
+                  f"leaving the handle for a later join", flush=True)
+            return
         self._async_thread = None
 
     def make_sonar_image(self):

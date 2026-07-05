@@ -102,10 +102,12 @@ _BLUEROV2 = PlatformSpec(
 #   dvl:    Waterlinked A50 at (-0.209,0,-0.06).
 #   camera: child of the sonar connection link, ~(0.2675,0,0.0227).
 # These act as FALLBACKS: when the robot is imported from revolution.urdf the
-# runner reads each mount from the URDF directly (urdf_parse). The "camera" link
-# matches by name so it is read live; the sonar/dvl frames are slashed
-# (sonar0/..., dvl0/...) and don't match urdf_parse's bare-name lookup, so those
-# two use the values below.
+# runner reads each mount from the URDF directly (urdf_parse). The sonar/dvl
+# frames are slashed (sonar0/..., dvl0/...); urdf_parse.find_link resolves them
+# live via namespaced-leaf matching (e.g. the "optical_frame" sonar candidate ->
+# sonar0/optical_frame), and the sonar additionally anchors under its real
+# articulated parent (pivot_head). These values are used only when a live match
+# is missing or ambiguous.
 _DEEPTREKKER_REVOLUTION = PlatformSpec(
     name="deeptrekker_revolution",
     usd_subpath=os.path.join("DeepTrekker", "revolution.usd"),

@@ -600,9 +600,14 @@ def main(argv):
                 **_sonar_xform)
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
-        _cam_parent, _cam_translation, _ = _mount("camera", spec.camera_mount)
+        _cam_parent, _cam_translation, _cam_rpy = _mount("camera", spec.camera_mount)
+        # Apply the URDF/spec mount rotation too (a tilted, e.g. down-looking,
+        # camera): dropping the rpy rendered the camera body-aligned, so its
+        # image orientation no longer matched the robot_state_publisher TF frame
+        # consumers reproject against. UW_Camera takes a quaternion orientation.
         cam = UW_Camera(prim_path=_cam_parent + "/UW_camera",
-                        resolution=[1920, 1080], translation=_cam_translation)
+                        resolution=[1920, 1080], translation=_cam_translation,
+                        orientation=euler_angles_to_quat(_cam_rpy, degrees=True))
         cam.set_focal_length(0.1 * 21)
         cam.set_clipping_range(0.1, 100)
     if sensors.get("dvl"):

@@ -385,9 +385,16 @@ class OceanSimSensorPublisher:
             self._node.get_logger().info(
                 f"articulation ready (post-play): {len(dof_names)} DOFs {dof_names}")
         except Exception as e:  # pragma: no cover
+            # A transient failure here (e.g. the physics tensor view isn't fully
+            # live on the very first post-play tick -- exactly the pre-readiness
+            # this deferral dodges) must NOT permanently disable joint I/O: leave
+            # _has_articulation True so the next tick retries, the same way
+            # _ensure_rigid_prim does. (The throttle on this warning only makes
+            # sense because it's expected to recur until the view comes up.) The
+            # definitive "no DOFs after all" case above is the only one that
+            # latches _has_articulation False.
             self._node.get_logger().warn(
                 f"articulation unavailable (no joint I/O): {e}", throttle_duration_sec=5.0)
-            self._has_articulation = False
             return None
         return self._articulation
 

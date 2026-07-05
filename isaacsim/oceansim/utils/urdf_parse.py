@@ -247,6 +247,19 @@ def find_link(urdf_text, candidates):
                  if "/" in l and l.rsplit("/", 1)[-1].lower() in cset]
     if len(leaf_hits) == 1:
         return leaf_hits[0]
+    if len(leaf_hits) > 1:
+        # A bare leaf like "optical_frame" is a generic ROS convention shared
+        # across sensors -- a robot with both sonar0/optical_frame AND
+        # camera0/optical_frame yields two hits, so a leaf match alone is
+        # ambiguous. Disambiguate by the namespace: prefer a hit whose own
+        # prefix segment(s) also match a candidate (the sonar candidate set
+        # includes "sonar0", so sonar0/optical_frame wins over camera0/... ).
+        # Only when exactly one hit is namespace-qualified -- otherwise still
+        # ambiguous, so fall back rather than guess the wrong frame.
+        qualified = [l for l in leaf_hits
+                     if any(seg.lower() in cset for seg in l.split("/")[:-1])]
+        if len(qualified) == 1:
+            return qualified[0]
     return None
 
 

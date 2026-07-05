@@ -182,6 +182,38 @@ def test_find_link_exact_still_wins(u):
     assert u.find_link(URDF, ["sonar_link"]) == "sonar_link"
 
 
+def test_find_link_generic_leaf_disambiguated_by_namespace(u):
+    # "optical_frame" is a generic ROS leaf shared by sonar and camera. Two links
+    # share it, so the leaf match alone is ambiguous -- but the sonar candidate
+    # set also contains "sonar0", so the sonar0/-namespaced frame is chosen and
+    # the camera0/-namespaced one is not mis-picked.
+    urdf = """<robot name="r">
+      <link name="base_link"/><link name="sonar0/optical_frame"/><link name="camera0/optical_frame"/>
+      <joint name="js" type="fixed"><parent link="base_link"/><child link="sonar0/optical_frame"/>
+        <origin xyz="0.2 0 0" rpy="0 0 0"/></joint>
+      <joint name="jc" type="fixed"><parent link="base_link"/><child link="camera0/optical_frame"/>
+        <origin xyz="0.3 0 0" rpy="0 0 0"/></joint>
+    </robot>"""
+    # Full sonar candidate set (includes "sonar0" and "optical_frame").
+    assert u.sensor_link(urdf, "sonar") == "sonar0/optical_frame"
+    # camera candidates ("camera0", ...) don't include "optical_frame", so the
+    # camera side isn't resolved from an optical_frame leaf at all.
+    assert u.find_link(urdf, ["optical_frame"]) is None      # no namespace hint -> ambiguous
+
+
+def test_find_link_ambiguous_leaf_no_namespace_hint_falls_back(u):
+    # Two namespaced hits, neither namespace matching a candidate -> still
+    # ambiguous, still falls back (the disambiguation must not over-reach).
+    urdf = """<robot name="r">
+      <link name="base_link"/><link name="a0/optical_frame"/><link name="b0/optical_frame"/>
+      <joint name="ja" type="fixed"><parent link="base_link"/><child link="a0/optical_frame"/>
+        <origin xyz="0.2 0 0" rpy="0 0 0"/></joint>
+      <joint name="jb" type="fixed"><parent link="base_link"/><child link="b0/optical_frame"/>
+        <origin xyz="0.3 0 0" rpy="0 0 0"/></joint>
+    </robot>"""
+    assert u.find_link(urdf, ["optical_frame"]) is None
+
+
 def test_root_link_prefers_connected_over_isolated(u):
     # A stray decorative link is also "childless"; the kinematic root (one that
     # parents a joint) must be chosen deterministically.
