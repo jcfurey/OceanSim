@@ -672,8 +672,11 @@ class ImagingSonarSensor(Camera):
                         ray_noise_param: float = 0.05, # additive noise parameter
                         intensity_offset: float = 0.0, # offset intensity after normalization
                         intensity_gain: float = 1.0, # scale intensity after normalization
-                        central_peak: float = 2, # control the strength of the streak
-                        central_std: float = 0.001, # control the spread of the streak
+                        central_peak: float = 0.0, # boresight "streak" strength; 0 = OFF.
+                                      # A real Oculus has no persistent full-range centre
+                                      # stripe, so this is off by default. Set >0 (e.g. 2)
+                                      # only to deliberately model a sensor that shows one.
+                        central_std: float = 0.001, # spread of the streak (unused when central_peak=0)
                         sim_time: float = None, # sim time this scan is captured at (for
                                       # publisher header stamps); None if unknown/unused.
                         _skip_scan: bool = False, # internal: worker has already run scan() on

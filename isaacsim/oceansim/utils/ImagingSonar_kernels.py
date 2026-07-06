@@ -149,8 +149,14 @@ def range_dependent_rayleigh_2d(seed: int,
     
     # Transform to Rayleigh distribution
     rayleigh = rayleigh_scale * wp.sqrt(n1*n1 + n2*n2)
-    # Apply range dependency
-    output[i,j] = wp.pow(r[i,j]/max_range, 2.0) * (1.0 + central_peak * wp.exp(-wp.pow(azi[i,j] - wp.PI/2.0, 2.0) / central_std)) * rayleigh
+    # Flat reverberation floor (range-independent). A real TVG-corrected sonar
+    # image has a roughly UNIFORM noise floor at all ranges, near range included.
+    # The old wp.pow(r/max_range, 2.0) factor made the floor grow with range^2
+    # (dead black at near range, brightest at max_range) -- backwards, and it left
+    # near range with no floor at all. central_peak optionally re-adds a boresight
+    # streak (OFF by default; see make_sonar_data). r / max_range are retained in
+    # the signature for callers/back-compat but no longer scale the floor.
+    output[i,j] = (1.0 + central_peak * wp.exp(-wp.pow(azi[i,j] - wp.PI/2.0, 2.0) / central_std)) * rayleigh
 
 
 

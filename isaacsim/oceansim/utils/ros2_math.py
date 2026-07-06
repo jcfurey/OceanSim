@@ -123,6 +123,8 @@ def oculus_beamwidths(frequency_hz):
     low-freq) values for an unrecognised frequency.
     """
     f = float(frequency_hz)
+    if 3.5e5 < f < 4.0e5:        # 375 kHz (Oculus M370s): az 2.0 deg, el 20 deg
+        return math.radians(2.0), math.radians(20.0)
     if 1.1e6 < f < 1.3e6:        # 1.2 MHz (M300d/M1200d LF): az 0.6 deg, el 20 deg
         return math.radians(0.6), math.radians(20.0)
     if 2.0e6 < f < 2.2e6:        # 2.1 MHz (M1200d): az 0.4 deg, el 20 deg
