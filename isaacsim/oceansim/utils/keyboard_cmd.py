@@ -60,6 +60,16 @@ class keyboard_cmd:
 
 
     def cleanup(self):
+        # Actually release the carb subscription: just nulling the Python refs
+        # left the callback registered in carb's input system, so it kept firing
+        # after cleanup (and kept `self` alive). A second keyboard_cmd created
+        # after cleanup() then received every key press TWICE (both callbacks
+        # increment their _base_command), doubling the teleop command.
+        if self._input is not None and self._sub_keyboard is not None:
+            try:
+                self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub_keyboard)
+            except Exception:  # noqa: BLE001 - teardown must not raise mid-shutdown
+                pass
         self._appwindow = None
         self._input = None
         self._keyboard = None

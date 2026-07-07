@@ -89,6 +89,20 @@ def test_uniform_bounds_and_exponential_mean(MVU):
     assert e.mean() == pytest.approx(2.0, rel=0.05)
 
 
+def test_uniform_exponential_finite_at_rng_zero(MVU):
+    """uniform(0,1) is half-open [0,1): a draw of exactly 0 used to hit log(0)
+    and return +inf. With the 1-x form the worst case is a finite 0.0 sample."""
+    u = MVU(1)
+    u.init_bounds(2.0)
+
+    class _ZeroRng:
+        def uniform(self, lo, hi):
+            return 0.0
+    u.rng = _ZeroRng()
+    val = u.sample_exponential()
+    assert np.isfinite(val) and val == pytest.approx(0.0)
+
+
 # --- zero-covariance "certain" fast path -----------------------------------
 # init_sigma / init_cov should only mark the sensor "uncertain" when the
 # covariance is actually nonzero. A zero covariance (the default for every

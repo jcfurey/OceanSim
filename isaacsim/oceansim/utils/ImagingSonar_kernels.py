@@ -80,9 +80,14 @@ def bin_intensity(pcl: wp.array(dtype=wp.vec3),
     x = pcl[tid][0]
     y = pcl[tid][1]
 
-    # Calculate the bin indices for range and azimuth
-    x_bin_idx = wp.int32((x - x_offset) / x_res)
-    y_bin_idx = wp.int32((y - y_offset) / y_res)
+    # Calculate the bin indices for range and azimuth. FLOOR, not a bare int
+    # cast: the cast truncates toward zero, so a point just below the grid
+    # origin -- (coord - offset) in (-res, 0), e.g. an azimuth a fraction of a
+    # beam outside the FOV or a range a hair under min_range -- truncated to 0,
+    # passed the >= 0 bounds check below, and was folded into bin 0 as a
+    # spurious bright return. floor() sends it to -1, which the check drops.
+    x_bin_idx = wp.int32(wp.floor((x - x_offset) / x_res))
+    y_bin_idx = wp.int32(wp.floor((y - y_offset) / y_res))
     # Drop points that fall outside the binning grid. Points at the camera far
     # clip (== max_range) or at the FOV edges land one index past the grid, and
     # Warp does no bounds checking in release mode, so an unchecked atomic_add
@@ -171,10 +176,16 @@ def make_sonar_map_all(r: wp.array(ndim=2, dtype=wp.float32),
     # per-range guard in make_sonar_map_range.
     if max_intensity[0] != 0.0:
         intensity[i,j] = intensity[i,j]/max_intensity[0]
-    intensity[i,j] += offset
-    intensity[i,j] *= gain
+    # Same op order as make_sonar_map_range: noise on the normalized signal
+    # first, display offset/gain last. The two modes used to differ ("all"
+    # applied offset/gain BEFORE the noise, so gain scaled the noise in one
+    # mode and not the other) -- switching normalizing_method then changed the
+    # image beyond just the normalization. Identical at the default
+    # offset=0/gain=1.
     intensity[i,j] *= (0.5 + gau_noise[i,j])
     intensity[i,j] += range_ray_noise[i,j]
+    intensity[i,j] += offset
+    intensity[i,j] *= gain
     intensity[i,j] = wp.clamp(intensity[i,j], wp.float32(0.0), wp.float32(1.0))
 
     result[i,j] = wp.vec3(r[i,j] * wp.cos(azi[i,j]),
