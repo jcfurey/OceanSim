@@ -255,7 +255,13 @@ class UIBuilder():
         # spawns, chosen via the "Vehicle Platform" dropdown. The selected
         # platform's spec supplies the USD, mass/damping, collision, spawn pose
         # and the sensor mount poses below.
-        self._platform = platforms.DEFAULT_PLATFORM
+        # PRESERVE an existing selection across _on_init(): _reset_extension()
+        # re-runs this on every stage OPENED event, but the dropdown widget is
+        # NOT rebuilt -- resetting to the default here desynced the state from
+        # the UI (dropdown still shows "Deep Trekker REVOLUTION", Load silently
+        # spawns a BlueROV2). Same reason _ctrl_mode lives in __init__ only.
+        if not hasattr(self, "_platform"):
+            self._platform = platforms.DEFAULT_PLATFORM
 
         # Sensor
         self._sonar = None

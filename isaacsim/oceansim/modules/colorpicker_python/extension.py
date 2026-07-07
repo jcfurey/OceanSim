@@ -84,7 +84,10 @@ class Extension(omni.ext.IExt):
 
     def on_shutdown(self):
         self._models = {}
-        remove_menu_items(self._menu_items, EXTENSION_TITLE)
+        # Must match the menu name used at add_menu_items() time ("OceanSim");
+        # removing under EXTENSION_TITLE never matched, leaking a duplicate
+        # menu entry on every disable/re-enable (see SensorExample extension).
+        remove_menu_items(self._menu_items, "OceanSim")
 
         action_registry = omni.kit.actions.core.get_action_registry()
         action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")

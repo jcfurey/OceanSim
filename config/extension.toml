@@ -16,10 +16,18 @@ preview_image = "data/preview.png"
 icon = "data/icon.png"
 
 
+# Dependencies use the Isaac Sim 6.x extension ids the code actually imports
+# (isaacsim.gui.components / isaacsim.core.* / isaacsim.examples.extension);
+# omni.isaac.ui / omni.isaac.core were the pre-6.0 names of these extensions.
+# NEEDS A GUI LOAD TEST on the Isaac 6.0.1 host: a wrong extension id fails
+# dependency resolution at enable time (the old ids may only resolve through
+# deprecation shims, if at all).
 [dependencies]
 "omni.kit.uiapp" = {}
-"omni.isaac.ui" = {}
-"omni.isaac.core" = {}
+"isaacsim.gui.components" = {}
+"isaacsim.core.prims" = {}
+"isaacsim.core.utils" = {}
+"isaacsim.examples.extension" = {}
 
 
 [[python.module]]

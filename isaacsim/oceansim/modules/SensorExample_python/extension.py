@@ -93,7 +93,12 @@ class Extension(omni.ext.IExt):
 
     def on_shutdown(self):
         self._models = {}
-        remove_menu_items(self._menu_items, EXTENSION_TITLE)
+        # Must match the menu name used at add_menu_items() time ("OceanSim").
+        # Removing under EXTENSION_TITLE targeted a menu root that doesn't
+        # exist, so the entry was never removed -- every disable/re-enable (or
+        # dev hot-reload) stacked a duplicate item in the OceanSim menu with a
+        # stale weakref callback.
+        remove_menu_items(self._menu_items, "OceanSim")
 
         action_registry = omni.kit.actions.core.get_action_registry()
         action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")
