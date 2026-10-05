@@ -122,6 +122,30 @@ class UIBuilder():
         self.frames.append(sensor_choosing_frame)
         with sensor_choosing_frame:
             with ui.VStack(style=get_style(), spacing=5, height=0):
+                # Upstream OceanSim's OmniGraph ROS2 publishers (the *_ROS sensor
+                # classes). OFF by default: this fork's rclpy bridge (UW_Camera
+                # publisher, ROS control mode, headless runner) is the primary
+                # ROS path. When ON, the camera's rclpy publisher is turned off
+                # so topics aren't published twice.
+                omnigraph_ros_check_box = CheckBox(
+                    "OmniGraph ROS",
+                    default_value=False,
+                    tooltip="Publish the selected sensors through upstream OceanSim's OmniGraph "
+                            "ROS 2 publishers (isaacsim.ros2.bridge) and subscribe /cmd_vel",
+                    on_click_fn=self._on_omnigraph_ros_checkbox_click_fn,
+                )
+                self._use_omnigraph_ros = False
+                self.wrapped_ui_elements.append(omnigraph_ros_check_box)
+
+                imu_check_box = CheckBox(
+                    "Imu",
+                    default_value=False,
+                    tooltip=" Click this checkbox to activate Imu",
+                    on_click_fn=self._on_imu_checkbox_click_fn,
+                )
+                self._use_imu = False
+                self.wrapped_ui_elements.append(imu_check_box)
+
                 sonar_check_box = CheckBox(
                     "Imaging Sonar",
                     default_value=False,
@@ -264,6 +288,7 @@ class UIBuilder():
             self._platform = platforms.DEFAULT_PLATFORM
 
         # Sensor
+        self._imu = None
         self._sonar = None
         self._cam = None
         self._cam_focal_length = 21
@@ -383,8 +408,25 @@ class UIBuilder():
                 _urdf_text, kind, fallback_mount.translation, fallback_mount.rpy_deg)
             return np.array(tr, dtype=float), np.array(rpy, dtype=float)
 
+        use_og_ros = getattr(self, "_use_omnigraph_ros", False)
+
+        if getattr(self, "_use_imu", False):
+            if use_og_ros:
+                from isaacsim.oceansim.sensors.ImuSensor_ROS import ImuSensor_ROS as imu_cls
+            else:
+                from isaacsim.sensors.physics import IMUSensor as imu_cls
+            self._imu = imu_cls(prim_path=robot_prim_path + "/imu",
+                                name="Imu",
+                                frequency=60,
+                                translation=np.array([0, 0, 0]))
+
         if self._use_sonar:
-            from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+            if use_og_ros:
+                from isaacsim.oceansim.sensors.ImagingSonarSensor_ROS import (
+                    ImagingSonarSensor_ROS as ImagingSonarSensor,
+                )
+            else:
+                from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
             _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
             self._sonar = ImagingSonarSensor(prim_path=robot_prim_path + '/sonar',
                                             translation=_sonar_tr,
@@ -395,7 +437,10 @@ class UIBuilder():
                                             )
 
         if self._use_camera:
-            from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
+            if use_og_ros:
+                from isaacsim.oceansim.sensors.UW_Camera_ROS import UW_Camera_ROS as UW_Camera
+            else:
+                from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
 
             _cam_tr, _ = _mount("camera", spec.camera_mount)
             self._cam = UW_Camera(prim_path=robot_prim_path + '/UW_camera',
@@ -405,7 +450,10 @@ class UIBuilder():
             self._cam.set_clipping_range(0.1, 100)
 
         if self._use_DVL:
-            from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
+            if use_og_ros:
+                from isaacsim.oceansim.sensors.DVLSensor_ROS import DVLSensor_ROS as DVLsensor
+            else:
+                from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
 
             _dvl_tr, _ = _mount("dvl", spec.dvl_mount)
             self._DVL = DVLsensor(max_range=10)
@@ -414,7 +462,12 @@ class UIBuilder():
             self._DVL.add_debug_lines()
             
         if self._use_baro:
-            from isaacsim.oceansim.sensors.BarometerSensor import BarometerSensor
+            if use_og_ros:
+                from isaacsim.oceansim.sensors.BarometerSensor_ROS import (
+                    BarometerSensor_ROS as BarometerSensor,
+                )
+            else:
+                from isaacsim.oceansim.sensors.BarometerSensor import BarometerSensor
 
             self._baro = BarometerSensor(prim_path=robot_prim_path + '/Baro',
                                         water_surface_z=self._water_surface)
@@ -437,7 +490,9 @@ class UIBuilder():
 
     def _reset_scenario(self):
         self._scenario.teardown_scenario()
-        self._scenario.setup_scenario(self._rob, self._sonar, self._cam, self._DVL, self._baro, self._ctrl_mode)
+        self._scenario.setup_scenario(self._rob, self._sonar, self._cam, self._DVL, self._baro, self._ctrl_mode,
+                                      imu=self._imu,
+                                      use_omnigraph_ros=getattr(self, "_use_omnigraph_ros", False))
     def _on_post_reset_btn(self):
         """
         This function is attached to the Reset Button as the post_reset_fn callback.
@@ -512,6 +567,14 @@ class UIBuilder():
         self._scenario_state_btn.enabled = False
         self._reset_btn.enabled = False
 
+
+    def _on_omnigraph_ros_checkbox_click_fn(self, model):
+        self._use_omnigraph_ros = model
+        print("Reload the scene for changes to take effect.")
+
+    def _on_imu_checkbox_click_fn(self, model):
+        self._use_imu = model
+        print("Reload the scene for changes to take effect.")
 
     def _on_sonar_checkbox_click_fn(self, model):
         self._use_sonar = model

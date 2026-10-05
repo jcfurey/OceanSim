@@ -6,7 +6,10 @@ OceanSim provides an example also formatted as an extension to demonstrate the u
 
 Navigate to `OceanSim - Examples - Sensor Example` to open the module. Select the sensors you wish to simulate and point the "Path to USD" to your own USD scene or the example MHL scene in the `OceanSim_assets` directory.
 
-The module provides self-explanatory UI in which you can choose which sensor to use and corresponding data visualization will be automatically available. User may test this module in their own USD scenes otherwise a default one is used. 
+The module provides self-explanatory UI in which you can choose which sensor to use and corresponding data visualization will be automatically available. User may test this module in their own USD scenes otherwise a default one is used.
+
+`Enable ROS` publishes selected sensors and enables control of the robot over ROS. 
+When using ROS, ensure you have build and sourced [Oceansim_msgs](https://github.com/umfieldrobotics/oceansim_ros_msgs) prior to starting the simulator. [Refer to the ROS instructions](ros2.md) for more information.
 
 We do not recommend user to perform digital twin experiments on this extension. This is example involves boilerplate code which is only for demonstration purposes.
 ### Instructions
@@ -96,10 +99,3 @@ And the corresponding demo video is provided below:
 
 <!-- (../../media/caustics.gif) -->
 ![How to turn on Caustics](../../media/caustics.gif)
-
-
-
-
-
-
-

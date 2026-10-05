@@ -11,7 +11,10 @@ import yaml
 import carb
 
 # Custom import
-from isaacsim.oceansim.utils.UWrenderer_utils import UW_render
+from isaacsim.oceansim.utils.UWrenderer_utils import (
+    UW_depth_turbidity_attenuator,
+    UW_render,
+)
 
 '''
 Attention:
@@ -47,6 +50,12 @@ def _camera_qos(depth: int = 1) -> QoSProfile:
     )
 
 class UW_Camera(Camera):
+
+    # When True, render() also runs the depth-degradation kernel and keeps host
+    # copies of the frame (_uw_frame / _degraded_depth_frame) for a subclass to
+    # publish (UW_Camera_ROS). Off by default: that is two extra full-frame
+    # device->host readbacks per render the rclpy publisher doesn't need.
+    _capture_host_frames = False
 
     def __init__(self, 
                  prim_path, 
@@ -88,11 +97,16 @@ class UW_Camera(Camera):
         self._prim_path = prim_path
         self._res = resolution
         self._writing = False
+        self._uw_frame = None
+        self._degraded_depth_frame = None
+        self._camera_k = None
 
         super().__init__(prim_path, name, frequency, dt, resolution, position, orientation, translation, render_product_path)
 
     def initialize(self, 
                    UW_param: np.ndarray = np.array([0.0, 0.31, 0.24, 0.05, 0.05, 0.2, 0.05, 0.05, 0.05 ]),
+                   depth_noise_sigma: float = 0.01,
+                   max_range: float = 20.0,
                    viewport: bool = True,
                    writing_dir: str = None,
                    UW_yaml_path: str = None,
@@ -112,6 +126,11 @@ class UW_Camera(Camera):
                 [3:6] - Backscatter coefficients (RGB)
                 [6:9] - Attenuation coefficients (RGB)
                 Defaults to typical coastal water values.
+            depth_noise_sigma (float, optional): Standard deviation of Gaussian
+                depth noise applied after turbidity attenuation. Defaults to 0.01.
+                Only used when host frames are captured (UW_Camera_ROS).
+            max_range (float, optional): Maximum depth range for turbidity
+                attenuation. Defaults to 20.0.
             viewport (bool, optional): Enable viewport visualization. Defaults to True.
             writing_dir (str, optional): Directory to save rendered images. Defaults to None.
             UW_yaml_path (str, optional): Path to YAML file with water properties. Defaults to None.
@@ -124,8 +143,11 @@ class UW_Camera(Camera):
         """
         self._id = 0
         self._uw_image_buf = None  # reused output buffer for UW_render (resolution is fixed)
+        self._degraded_depth_buf = None  # reused output buffer for UW_depth_turbidity_attenuator
         self._viewport = viewport
         self._device = wp.get_preferred_device()
+        self._depth_noise_sigma = wp.float32(depth_noise_sigma)
+        self._max_range = max_range
         super().initialize(physics_sim_view)
 
         if UW_yaml_path is not None:
@@ -392,6 +414,9 @@ class UW_Camera(Camera):
                     uw_image
                 ]
             )  
+
+            if self._capture_host_frames:
+                self._capture_frames(raw_rgba, depth, uw_image)
             
             if self._viewport:
                 self._provider.set_bytes_data_from_gpu(uw_image.ptr, self.get_resolution())
@@ -408,6 +433,72 @@ class UW_Camera(Camera):
                 self._ros2_publish_camera(uw_image, depth, sim_time)
 
             self._id += 1
+
+    def _capture_frames(self, raw_rgba, depth, uw_image):
+        """Depth degradation (upstream OceanSim 0.2): attenuate depth by turbidity
+        (pixels too dark to observe -> 0) plus Gaussian noise, and keep host
+        copies of the rendered frame and degraded depth for publishing."""
+        if (self._degraded_depth_buf is None
+                or self._degraded_depth_buf.shape != depth.shape
+                or self._degraded_depth_buf.dtype != depth.dtype):
+            self._degraded_depth_buf = wp.empty_like(depth)
+        wp.launch(
+            dim=raw_rgba.shape[:2],
+            kernel=UW_depth_turbidity_attenuator,
+            inputs=[
+                raw_rgba,
+                depth,
+                self._max_range,
+                self._backscatter_value,
+                self._atten_coeff,
+                self._backscatter_coeff,
+                self._depth_noise_sigma,
+                int(self._id),
+            ],
+            outputs=[self._degraded_depth_buf],
+        )
+        self._uw_frame = uw_image.numpy()
+        self._degraded_depth_frame = np.ascontiguousarray(
+            self._degraded_depth_buf.numpy(), dtype=np.float32
+        )
+
+    def _build_pointcloud(self, stride: int = 4) -> np.ndarray:
+        """Build a downsampled XYZ point cloud from the degraded depth frame.
+
+        Returns:
+            np.ndarray: Contiguous float32 array of shape (N, 3), or empty (0, 3)
+            if intrinsics or depth are unavailable.
+        """
+        if self._camera_k is None or self._degraded_depth_frame is None:
+            return np.empty((0, 3), dtype=np.float32)
+
+        fx = self._camera_k[0, 0]
+        fy = self._camera_k[1, 1]
+        cx = self._camera_k[0, 2]
+        cy = self._camera_k[1, 2]
+        height, width = self._degraded_depth_frame.shape
+        sampled_depth = self._degraded_depth_frame[::stride, ::stride]
+        u, v = np.meshgrid(
+            np.arange(0, width, stride, dtype=np.float32),
+            np.arange(0, height, stride, dtype=np.float32),
+        )
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+        norm = np.sqrt(x * x + y * y + 1.0)
+        valid = np.isfinite(sampled_depth) & (sampled_depth > 0.0)
+        if not np.any(valid):
+            return np.empty((0, 3), dtype=np.float32)
+
+        scale = sampled_depth[valid] / norm[valid]
+        return np.ascontiguousarray(
+            np.column_stack(
+                (
+                    x[valid] * scale,
+                    y[valid] * scale,
+                    scale,
+                )
+            ).astype(np.float32)
+        )
 
     def make_viewport(self):
         """Create a viewport window for real-time visualization.

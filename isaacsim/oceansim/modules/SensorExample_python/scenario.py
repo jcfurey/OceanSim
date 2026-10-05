@@ -3,7 +3,7 @@ import numpy as np
 from pxr import Gf, PhysxSchema
 
 # Isaac sim import
-from isaacsim.core.prims import SingleRigidPrim
+from isaacsim.core.prims import RigidPrim, SingleRigidPrim
 from isaacsim.core.utils.prims import get_prim_path
 
 # ROS Control import
@@ -20,6 +20,8 @@ class MHL_Sensor_Example_Scenario():
     def __init__(self):
         self._rob = None
         self._rob_rigid = None
+        self._rob_view = None
+        self._imu = None
         self._sonar = None
         self._cam = None
         self._DVL = None
@@ -44,8 +46,20 @@ class MHL_Sensor_Example_Scenario():
         self._enable_ros2_control = True
         self._ros2_control_mode = "velocity control"
 
+        # Upstream OmniGraph ROS2 publishers (opt-in, see setup_scenario)
+        self._use_omnigraph_ros = False
+        self.omni_ros = None
+        self._cmd_vel_controller = None
+
     def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode, sensor_viewports=True,
-                       control_params=None):
+                       control_params=None, imu=None, use_omnigraph_ros=False):
+        """use_omnigraph_ros=True wires upstream OceanSim's OmniGraph ROS2
+        publishers (ros2_helpers.OmniHandler + the *_ROS sensor classes, which
+        the caller must have constructed) and a /cmd_vel subscriber. The
+        default (False) keeps this fork's rclpy bridge: UW_Camera's own
+        publisher, ROS control mode and the headless runner's ros2_sensors."""
+        self._use_omnigraph_ros = use_omnigraph_ros
+        self._imu = imu
         self._rob = rob
         # The rigid-body wrapper is created LAZILY on first use in update_scenario
         # (after world.play()), NOT here. A SingleRigidPrim (physics tensor view)
@@ -57,6 +71,8 @@ class MHL_Sensor_Example_Scenario():
         # odom/IMU publisher). It's still cached after the first lazy creation, so
         # it is not rebuilt per physics step.
         self._rob_rigid = None
+        # Same lazy rule for the manual-control RigidPrim view (see update_scenario).
+        self._rob_view = None
         self._sonar = sonar
         self._cam = cam
         self._DVL = DVL
@@ -67,21 +83,34 @@ class MHL_Sensor_Example_Scenario():
         # the AOVs for ROS publishing and keeping the main Isaac viewport. (Manually
         # closing the windows in the UI does NOT stop the readback -- the _viewport
         # flag stays set -- so this is the way to actually drop that GPU work.)
-        if self._sonar is not None:
-            self._sonar.sonar_initialize(include_unlabelled=True, viewport=sensor_viewports)
-        if self._cam is not None:
-            self._cam.initialize(viewport=sensor_viewports)
+        if self._use_omnigraph_ros:
+            self._setup_omnigraph_ros(sensor_viewports)
+        else:
+            self.omni_ros = None
+            if self._imu is not None and hasattr(self._imu, "initialize"):
+                self._imu.initialize()
+            if self._sonar is not None:
+                self._sonar.sonar_initialize(include_unlabelled=True, viewport=sensor_viewports)
+            if self._cam is not None:
+                self._cam.initialize(viewport=sensor_viewports)
         if self._DVL is not None:
             self._DVL_reading = [0.0, 0.0, 0.0]
         if self._baro is not None:
             self._baro_reading = 101325.0 # atmospheric pressure (Pa)
-        
-        
-        # Apply the physx force schema if manual control
+
+        # Upstream's /cmd_vel subscriber rides with the OmniGraph publishers. Not
+        # in Manual control (keyboard drives) or ROS control (the rclpy receiver
+        # drives), so two command sources never fight over the same body.
+        if self._use_omnigraph_ros and ctrl_mode not in ("Manual control", "ROS control"):
+            from ...utils.cmd_vel_subscriber import CmdVelController
+            self._cmd_vel_controller = CmdVelController(robot_prim_path=get_prim_path(self._rob))
+
+        # Manual control applies forces through a RigidPrim tensor view (upstream
+        # moved off PhysxForceAPI because it stopped the IMU updating). The view
+        # is built lazily in update_scenario, after world.play().
         if ctrl_mode == "Manual control":
             from ...utils.keyboard_cmd import keyboard_cmd
 
-            self._rob_forceAPI = PhysxSchema.PhysxForceAPI.Apply(self._rob)
             self._force_cmd = keyboard_cmd(base_command=np.array([0.0, 0.0, 0.0]),
                                       input_keyboard_mapping={
                                         # forward command
@@ -119,6 +148,51 @@ class MHL_Sensor_Example_Scenario():
             self._setup_ros2_control(control_params)
 
         self._running_scenario = True
+
+    def _setup_omnigraph_ros(self, sensor_viewports=True):
+        """Upstream OceanSim's OmniGraph ROS2 publishing: one OmniHandler graph
+        plus the og_node each *_ROS sensor writes its frames into."""
+        from isaacsim.oceansim.sensors import ros2_helpers
+
+        self.omni_ros = ros2_helpers.OmniHandler(
+            name="SensorExample",
+            use_camera=self._cam is not None,
+            use_sonar=self._sonar is not None,
+            use_imu=self._imu is not None,
+            use_dvl=self._DVL is not None,
+            use_baro=self._baro is not None,
+        )
+        approx_freq = 30
+
+        if self._imu is not None:
+            self._imu.initialize(og_node=self.omni_ros._imu_node)
+
+        if self._sonar is not None:
+            self._sonar.sonar_initialize(
+                include_unlabelled=True, viewport=sensor_viewports,
+                og_node=self.omni_ros._sonar_node
+            )
+            ros2_helpers.publish_camera_info(self._sonar, approx_freq)
+            ros2_helpers.publish_depth(self._sonar, approx_freq)
+            ros2_helpers.publish_pointcloud_from_depth(self._sonar, approx_freq)
+            ros2_helpers.publish_camera_tf(self._sonar)
+
+        if self._cam is not None:
+            self._cam.initialize(
+                viewport=sensor_viewports,
+                og_node=self.omni_ros._rgb_node,
+                depth_og_node=self.omni_ros._depth_node,
+                pointcloud_og_node=self.omni_ros._pointcloud_node,
+            )
+            ros2_helpers.publish_camera_info(self._cam, approx_freq)
+            ros2_helpers.publish_rgb(self._cam, approx_freq)
+            ros2_helpers.publish_camera_tf(self._cam)
+
+        if self._DVL is not None:
+            self._DVL.initialize(og_node=self.omni_ros._dvl_node)
+
+        if self._baro is not None:
+            self._baro.initialize(og_node=self.omni_ros._baro_node)
 
     def _setup_ros2_control(self, control_params=None):
         """setup ROS2 control receiver"""
@@ -196,6 +270,11 @@ class MHL_Sensor_Example_Scenario():
         if self._cam is not None:
             _safe_teardown(self._cam.close, "camera")
 
+        # Clear cmd_vel controller
+        if self._cmd_vel_controller is not None:
+            _safe_teardown(self._cmd_vel_controller.cleanup, "cmd_vel controller")
+            self._cmd_vel_controller = None
+
         # clear the keyboard subscription
         if self._ctrl_mode=="Manual control":
             _safe_teardown(self._force_cmd.cleanup, "keyboard force cmd")
@@ -206,10 +285,14 @@ class MHL_Sensor_Example_Scenario():
             _safe_teardown(self._ros2_control_receiver.close, "ROS2 control receiver")
 
         self._rob = None
+        self._rob_rigid = None
+        self._rob_view = None
+        self._imu = None
         self._sonar = None
         self._cam = None
         self._DVL = None
         self._baro = None
+        self.omni_ros = None
         self._running_scenario = False
         self._time = 0.0
 
@@ -243,6 +326,14 @@ class MHL_Sensor_Example_Scenario():
             return
 
         self._time += step
+
+        # IMU is cheap and high-rate: read (and, in OmniGraph mode, publish)
+        # every step, outside the heavy-sensor throttle below.
+        if self._imu is not None:
+            if self._use_omnigraph_ros:
+                self._safe_call(self._imu.read, name="IMU read")
+            else:
+                self._safe_call(self._imu.get_current_frame, name="IMU read")
 
         # Throttle the heavy sensor compute (sonar scan + camera UW_render) to
         # _sensor_update_period; 0 means every step. Control below is unaffected.
@@ -278,17 +369,28 @@ class MHL_Sensor_Example_Scenario():
             # (the DVL read is 4 beam queries + pose + noise per tick). Shielded
             # by _safe_call like the other sensor compute (a transient physics-
             # view error here used to escape update_scenario entirely).
-            if getattr(self, "_poll_gui_readings", True):
+            # In OmniGraph mode these reads are also what publishes the DVL /
+            # barometer messages, so they run regardless of _poll_gui_readings.
+            if self._use_omnigraph_ros or getattr(self, "_poll_gui_readings", True):
                 if self._DVL is not None:
                     self._safe_call(self._read_dvl, name="DVL read")
                 if self._baro is not None:
                     self._safe_call(self._read_baro, name="baro read")
 
+        # Upstream /cmd_vel subscriber (OmniGraph mode only; see setup_scenario)
+        if self._cmd_vel_controller is not None:
+            self._safe_call(self._cmd_vel_controller.update, self._rob, name="cmd_vel update")
+
         if self._ctrl_mode=="Manual control":
-            force_cmd = Gf.Vec3f(*self._force_cmd._base_command)
-            torque_cmd = Gf.Vec3f(*self._torque_cmd._base_command)
-            self._rob_forceAPI.CreateForceAttr().Set(force_cmd)
-            self._rob_forceAPI.CreateTorqueAttr().Set(torque_cmd)
+            # Built here, after world.play(), for the same reason as _rob_rigid.
+            if self._rob_view is None and self._rob is not None:
+                self._rob_view = RigidPrim(prim_paths_expr=get_prim_path(self._rob))
+                self._rob_view.initialize()
+            force = np.asarray(self._force_cmd._base_command, dtype=np.float32).reshape(1, 3)
+            torque = np.asarray(self._torque_cmd._base_command, dtype=np.float32).reshape(1, 3)
+            self._rob_view.apply_forces_and_torques_at_pos(
+                forces=force, torques=torque, is_global=False
+            )
         elif self._ctrl_mode=="Waypoints":
             if len(self.waypoints) > 0:
                 waypoints = self.waypoints[0]
@@ -310,10 +412,16 @@ class MHL_Sensor_Example_Scenario():
                 print("[Scenario] ROS2 Control receiver is not initialized, skipping update.")
 
     def _read_dvl(self):
-        self._DVL_reading = self._DVL.get_linear_vel()
+        if self._use_omnigraph_ros:
+            self._DVL_reading = self._DVL.read()
+        else:
+            self._DVL_reading = self._DVL.get_linear_vel()
 
     def _read_baro(self):
-        self._baro_reading = self._baro.get_pressure()
+        if self._use_omnigraph_ros:
+            self._baro_reading = float(self._baro.read())
+        else:
+            self._baro_reading = self._baro.get_pressure()
 
 
 

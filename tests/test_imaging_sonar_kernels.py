@@ -287,7 +287,7 @@ def test_compact_in_range_wiring_matches_numpy_path(kern, seed):
 
 # --- make_sonar_data work-buffer reuse -------------------------------------
 # ImagingSonarSensor.make_sonar_data reuses grow-on-demand work buffers
-# (intensity / pcl_local / pcl_spher) sliced to [:num_points] instead of
+# (intensity / pcl_spher) sliced to [:num_points] instead of
 # allocating fresh arrays each frame, and re-zeroes a kept normalization-max
 # buffer. The risk is stale data leaking when a later frame has fewer points
 # than the buffer's high-water capacity. These run the real pipeline kernels and
@@ -298,9 +298,9 @@ def _pipeline_bins(kern, pcl, normals, sem, refl, vt, n_range, n_beams,
                    x_off, y_off, x_res, y_res, bufs):
     """Run compute_intensity -> world2local -> bin_intensity for one frame and
     return (bin_sum, bin_count) as numpy. ``bufs`` supplies the intensity /
-    pcl_local / pcl_spher arrays (fresh or reused-and-sliced)."""
+    pcl_spher arrays (fresh or reused-and-sliced)."""
     n = pcl.shape[0]
-    intensity, pcl_local, pcl_spher = bufs(n)
+    intensity, pcl_spher = bufs(n)
     p = wp.array(pcl, dtype=wp.float32, device=DEV)
     nm = wp.array(normals, dtype=wp.float32, device=DEV)
     s = wp.array(sem, dtype=wp.uint32, device=DEV)
@@ -309,7 +309,7 @@ def _pipeline_bins(kern, pcl, normals, sem, refl, vt, n_range, n_beams,
               inputs=[p, nm, wp.mat44(vt), s, ir, wp.float32(0.1)],
               outputs=[intensity], device=DEV)
     wp.launch(kern.world2local, dim=n,
-              inputs=[wp.mat44(vt), p], outputs=[pcl_local, pcl_spher], device=DEV)
+              inputs=[wp.mat44(vt), p], outputs=[pcl_spher], device=DEV)
     bin_sum = wp.zeros((n_range, n_beams), dtype=wp.float32, device=DEV)
     bin_count = wp.zeros((n_range, n_beams), dtype=wp.int32, device=DEV)
     wp.launch(kern.bin_intensity, dim=n,
@@ -341,19 +341,17 @@ def test_make_sonar_data_buffer_reuse_matches_fresh(kern):
 
     # grow-on-demand reusable buffers, mirroring _ensure_point_buffers / the
     # [:num_points] views; capacity only ever grows.
-    state = {"cap": 0, "i": None, "l": None, "s": None}
+    state = {"cap": 0, "i": None, "s": None}
 
     def reused(n):
         if state["cap"] < n:
             state["cap"] = n
             state["i"] = wp.empty(n, dtype=wp.float32, device=DEV)
-            state["l"] = wp.empty(n, dtype=wp.vec3, device=DEV)
             state["s"] = wp.empty(n, dtype=wp.vec3, device=DEV)
-        return state["i"][:n], state["l"][:n], state["s"][:n]
+        return state["i"][:n], state["s"][:n]
 
     def fresh(n):
         return (wp.empty(n, dtype=wp.float32, device=DEV),
-                wp.empty(n, dtype=wp.vec3, device=DEV),
                 wp.empty(n, dtype=wp.vec3, device=DEV))
 
     # grow (4000) -> shrink (700, exercises stale residue) -> grow again (5000).
@@ -450,11 +448,10 @@ def test_cartesian_to_spherical_origin_is_finite(kern):
     origin (r == 0) must yield a finite elevation, not acos(nan)."""
     pcl = np.array([[0.0, 0.0, 0.0], [1.0, 2.0, 3.0]], dtype=np.float32)  # row 0 -> origin
     vt = np.eye(4, dtype=np.float64).reshape(-1)
-    local = wp.zeros(2, dtype=wp.vec3, device=DEV)
     spher = wp.zeros(2, dtype=wp.vec3, device=DEV)
     wp.launch(kern.world2local, dim=2,
               inputs=[wp.mat44(vt), wp.array(pcl, dtype=wp.float32, device=DEV)],
-              outputs=[local, spher], device=DEV)
+              outputs=[spher], device=DEV)
     wp.synchronize()
     assert np.all(np.isfinite(spher.numpy())), "origin produced NaN/inf in spherical coords"
 
@@ -474,3 +471,103 @@ def test_make_sonar_image_clamps_overflow(kern):
     assert img[0, 0, 0] == 255          # saturated, NOT 382 % 256 == 126
     assert img[0, 1, 0] == 255          # intensity 1.0 -> 255
     assert img[0, 2, 0] == 127          # intensity 0.5 -> 127 (unchanged)
+
+
+# --- upstream segmentation kernels (bin_process & co.) ---------------------
+
+def _grid(kern, x_off, y_off, x_res, y_res, nx, ny):
+    g = kern.sonarGrid()
+    g.x_offset, g.y_offset = float(x_off), float(y_off)
+    g.x_res, g.y_res = float(x_res), float(y_res)
+    g.x_num, g.y_num = int(nx), int(ny)
+    return g
+
+
+def test_bin_process_matches_bin_intensity_and_flags_out_of_grid(kern):
+    """bin_process must bin exactly like bin_intensity (floor + bounds check)
+    and tag off-grid points with INVALID_BIN instead of wrapping a negative
+    index through a uint32 cast (an out-of-bounds write upstream)."""
+    n_range, n_beams = 2, 2
+    pts = np.array([[0.5, 0.5, 0.3],
+                    [1.5, 0.5, 0.2],
+                    [9.0, 0.5, 0.1],     # range past the grid
+                    [0.5, -0.5, 0.1],    # just below the azimuth origin
+                    [0.5, 0.5, 0.1]],    # same bin as point 0, lower zenith
+                   dtype=np.float32)
+    inten = np.array([1.0, 2.0, 99.0, 99.0, 4.0], dtype=np.float32)
+    sem = np.array([2, 3, 4, 5, 6], dtype=np.uint32)
+    pcl = wp.array(pts, dtype=wp.vec3, device=DEV)
+    it = wp.array(inten, dtype=wp.float32, device=DEV)
+    s = wp.array(sem, dtype=wp.uint32, device=DEV)
+
+    ref_sum = wp.zeros((n_range, n_beams), dtype=wp.float32, device=DEV)
+    ref_cnt = wp.zeros((n_range, n_beams), dtype=wp.int32, device=DEV)
+    wp.launch(kern.bin_intensity, dim=5,
+              inputs=[pcl, it, wp.float32(0.0), wp.float32(0.0),
+                      wp.float32(1.0), wp.float32(1.0), ref_sum, ref_cnt], device=DEV)
+
+    bin_sum = wp.zeros((n_range, n_beams), dtype=wp.float32, device=DEV)
+    bin_cnt = wp.zeros((n_range, n_beams), dtype=wp.int32, device=DEV)
+    idx = wp.zeros(5, dtype=wp.vec2ui, device=DEV)
+    zen = wp.full((n_range, n_beams), value=np.pi, dtype=wp.float32, device=DEV)
+    wp.launch(kern.bin_process, dim=5,
+              inputs=[pcl, it, s, _grid(kern, 0, 0, 1, 1, n_range, n_beams)],
+              outputs=[bin_sum, bin_cnt, idx, zen], device=DEV)
+    wp.synchronize()
+
+    assert np.array_equal(bin_sum.numpy(), ref_sum.numpy())
+    assert np.array_equal(bin_cnt.numpy(), ref_cnt.numpy())
+    bad = int(np.iinfo(np.uint32).max)
+    got = idx.numpy()
+    assert tuple(got[0]) == (0, 0) and tuple(got[1]) == (1, 0)
+    assert tuple(got[2]) == (bad, bad) and tuple(got[3]) == (bad, bad)
+    assert zen.numpy()[0, 0] == pytest.approx(0.1)   # min zenith of the bin
+
+    # The segmentation pass must skip the sentinel rows, and label bin (0,0)
+    # with its top-most (minimum zenith) return.
+    bin_sem = wp.zeros((n_range, n_beams), dtype=wp.uint8, device=DEV)
+    bin_inst = wp.zeros((n_range, n_beams), dtype=wp.uint8, device=DEV)
+    inst = wp.array(sem + 10, dtype=wp.uint32, device=DEV)
+    wp.launch(kern.bin_segmentation_process, dim=5,
+              inputs=[pcl, s, inst, idx, zen], outputs=[bin_sem, bin_inst], device=DEV)
+    bin_sem32 = wp.zeros((n_range, n_beams), dtype=wp.uint32, device=DEV)
+    wp.launch(kern.bin_semantics_process, dim=5,
+              inputs=[pcl, s, idx, zen], outputs=[bin_sem32], device=DEV)
+    wp.synchronize()
+    assert bin_sem.numpy()[0, 0] == 6 and bin_inst.numpy()[0, 0] == 16
+    assert bin_sem.numpy()[1, 0] == 3
+    assert bin_sem32.numpy()[0, 0] == 6
+    assert int(bin_sem.numpy().sum()) == 9   # nothing from the off-grid points
+
+
+def test_make_semantics_image_mirrors_and_clamps_palette(kern):
+    """Column map matches make_sonar_image (width-1-j) and a semantic id past
+    the end of the palette reuses the last colour instead of reading OOB."""
+    bins = np.array([[0, 1, 7]], dtype=np.uint32)          # id 7 > palette rows
+    palette = np.array([[0, 0, 0, 255], [10, 20, 30, 255]], dtype=np.uint8)
+    img = wp.zeros((1, 3, 4), dtype=wp.uint8, device=DEV)
+    wp.launch(kern.make_semantics_image, dim=(1, 3),
+              inputs=[wp.array(bins, dtype=wp.uint32, device=DEV),
+                      wp.array(palette, dtype=wp.uint8, device=DEV)],
+              outputs=[img], device=DEV)
+    wp.synchronize()
+    out = img.numpy()
+    assert tuple(out[0, 2]) == (0, 0, 0, 255)       # id 0 -> column 2
+    assert tuple(out[0, 1]) == (10, 20, 30, 255)    # id 1 -> column 1
+    assert tuple(out[0, 0]) == (10, 20, 30, 255)    # id 7 clamped -> last colour
+
+
+def test_draw_bbox_stays_in_bounds_at_column_zero(kern):
+    """A box touching azimuth bin 0 must draw on the last image column, not one
+    past it (upstream used width - y)."""
+    h, w = 4, 5
+    img = wp.zeros((h, w, 4), dtype=wp.uint8, device=DEV)
+    bmin = wp.array(np.array([[0, 0]], dtype=np.int32), dtype=wp.int32, device=DEV)
+    bmax = wp.array(np.array([[2, 2]], dtype=np.int32), dtype=wp.int32, device=DEV)
+    col = wp.array(np.array([[255, 0, 0, 255]], dtype=np.uint8), dtype=wp.uint8, device=DEV)
+    wp.launch(kern.draw_bbox, dim=(2, 2), inputs=[0, bmin, bmax, col, img], device=DEV)
+    wp.synchronize()
+    out = img.numpy()
+    assert out[0, w - 1, 0] == 255                   # y_min=0 -> last column
+    assert out[0, w - 3, 0] == 255                   # y_max=2 -> column w-3
+    assert out[:, : w - 3, 0].sum() == 0             # nothing left of the box

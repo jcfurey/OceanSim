@@ -15,6 +15,9 @@ readme = "docs/README.md"
 preview_image = "data/preview.png"
 icon = "data/icon.png"
 
+[fswatcher.patterns]
+include = ["*.ogn", "*.py"]
+exclude = ["Ogn*Database.py"]
 
 # Dependencies use the Isaac Sim 6.x extension ids the code actually imports
 # (isaacsim.gui.components / isaacsim.core.* / isaacsim.examples.extension);
@@ -36,5 +39,11 @@ name = "isaacsim.oceansim.modules.SensorExample_python"
 [[python.module]]
 name = "isaacsim.oceansim.modules.colorpicker_python"
 
+[[python.module]]
+name = "isaacsim.oceansim.modules.trajRecorder_python"
 
+[[python.module]]
+name = "isaacsim.oceansim.modules.SDGplayground_python"
 
+[[python.module]]
+name = "isaacsim.oceansim"

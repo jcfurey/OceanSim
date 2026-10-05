@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0] - 2026-10-05
+
+### Changed
+
+- Merge upstream OceanSim 0.2 (umfieldrobotics/OceanSim main): SDG playground,
+  trajectory recorder, water surface, KITTI writers, OmniGraph `*_ROS` sensor
+  subclasses, depth degradation and the Seaclear standalone SDG scripts
+- Target Isaac Sim 6.1.0
+
 ## [0.3.0] - 2025-09-06
 
 ### Changed
