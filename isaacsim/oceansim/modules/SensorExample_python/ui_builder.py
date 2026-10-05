@@ -409,6 +409,11 @@ class UIBuilder():
             return np.array(tr, dtype=float), np.array(rpy, dtype=float)
 
         use_og_ros = getattr(self, "_use_omnigraph_ros", False)
+        # The sensor classes are fixed here, at LOAD. Remember the choice so
+        # RESET wires the scenario for the classes actually built, not for the
+        # checkbox's current state (toggling it then pressing RESET would hand
+        # og_node kwargs to the plain sensors).
+        self._scene_use_omnigraph_ros = use_og_ros
 
         if getattr(self, "_use_imu", False):
             if use_og_ros:
@@ -492,7 +497,7 @@ class UIBuilder():
         self._scenario.teardown_scenario()
         self._scenario.setup_scenario(self._rob, self._sonar, self._cam, self._DVL, self._baro, self._ctrl_mode,
                                       imu=self._imu,
-                                      use_omnigraph_ros=getattr(self, "_use_omnigraph_ros", False))
+                                      use_omnigraph_ros=getattr(self, "_scene_use_omnigraph_ros", False))
     def _on_post_reset_btn(self):
         """
         This function is attached to the Reset Button as the post_reset_fn callback.

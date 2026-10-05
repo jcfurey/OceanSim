@@ -280,12 +280,17 @@ class ImagingSonarSensor(Camera):
                 self.remove_semantic_segmentation_from_frame()
                 self.cameraParams_annot.detach(self._render_product_path)
                 rep.AnnotatorCache.clear(self.cameraParams_annot)
-                if getattr(self, "bbox_annot", None) is not None:
-                    self.bbox_annot.detach(self._render_product_path)
-                    rep.AnnotatorCache.clear(self.bbox_annot)
-                    self.bbox_annot = None
             except Exception as exc:  # noqa: BLE001
                 print(f"[{self._name}] re-init annotator cleanup warning: {exc}", flush=True)
+            # Separate guard so a failure above can't orphan the bbox annotator
+            # (still attached to the old render product) when it's reset below.
+            if getattr(self, "bbox_annot", None) is not None:
+                try:
+                    self.bbox_annot.detach(self._render_product_path)
+                    rep.AnnotatorCache.clear(self.bbox_annot)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[{self._name}] re-init bbox annotator cleanup warning: {exc}", flush=True)
+                self.bbox_annot = None
             if _old_rp is not None:
                 try:
                     _old_rp.hydra_texture.set_updates_enabled(True)

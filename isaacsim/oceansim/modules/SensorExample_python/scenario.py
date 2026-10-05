@@ -384,10 +384,16 @@ class MHL_Sensor_Example_Scenario():
         if self._ctrl_mode=="Manual control":
             # Built here, after world.play(), for the same reason as _rob_rigid.
             if self._rob_view is None and self._rob is not None:
-                self._rob_view = RigidPrim(prim_paths_expr=get_prim_path(self._rob))
-                self._rob_view.initialize()
-            force = np.asarray(self._force_cmd._base_command, dtype=np.float32).reshape(1, 3)
-            torque = np.asarray(self._torque_cmd._base_command, dtype=np.float32).reshape(1, 3)
+                self._init_manual_control_view()
+            # Keyboard commands keep the meaning they had with PhysxForceAPI
+            # (default mode "acceleration"): linear m/s^2 and angular deg/s^2.
+            # apply_forces_and_torques_at_pos takes newtons / N*m, so scale by the
+            # body's mass and inertia diagonal (else a 26 kg vehicle would get
+            # 1/26 of the thrust it had before).
+            force = (np.asarray(self._force_cmd._base_command, dtype=np.float32)
+                     * self._manual_mass).reshape(1, 3)
+            torque = (np.deg2rad(np.asarray(self._torque_cmd._base_command, dtype=np.float32))
+                      * self._manual_inertia).reshape(1, 3).astype(np.float32)
             self._rob_view.apply_forces_and_torques_at_pos(
                 forces=force, torques=torque, is_global=False
             )
@@ -410,6 +416,30 @@ class MHL_Sensor_Example_Scenario():
                 # Once, not every physics step (60 Hz of identical lines).
                 self._warned_no_receiver = True
                 print("[Scenario] ROS2 Control receiver is not initialized, skipping update.")
+
+    def _init_manual_control_view(self):
+        """Create the manual-control RigidPrim view (post-play) and cache the
+        mass / inertia diagonal used to turn keyboard accelerations into forces.
+        Falls back to unit scaling (raw N / N*m) if they can't be read."""
+        self._manual_mass = 1.0
+        self._manual_inertia = np.ones(3, dtype=np.float32)
+        view = RigidPrim(prim_paths_expr=get_prim_path(self._rob))
+        view.initialize()
+        # Only publish the view once it initialized; a failure retries next step.
+        self._rob_view = view
+        try:
+            def _np(a):
+                return a.numpy() if hasattr(a, "numpy") else np.asarray(a)
+            mass = float(_np(self._rob_view.get_masses()).reshape(-1)[0])
+            inertia = _np(self._rob_view.get_inertias()).reshape(-1, 9)[0]
+            diag = np.array([inertia[0], inertia[4], inertia[8]], dtype=np.float32)
+            if mass > 0.0:
+                self._manual_mass = mass
+            if np.all(np.isfinite(diag)) and np.all(diag > 0.0):
+                self._manual_inertia = diag
+        except Exception as e:  # noqa: BLE001
+            print(f"[Scenario] manual control: could not read mass/inertia ({e}); "
+                  f"applying keyboard commands as raw forces/torques")
 
     def _read_dvl(self):
         if self._use_omnigraph_ros:

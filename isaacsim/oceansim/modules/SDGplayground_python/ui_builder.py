@@ -16,7 +16,6 @@ from isaacsim.gui.components import CollapsableFrame, StateButton, IntField, get
 from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
 from isaacsim.core.utils.extensions import get_extension_path
 
-from isaacsim.gui.property.array_widget import CustomMultiIntField, CustomMultiFloatField
 # Custom import
 from .scenario import SDGplayground_Scenario
 from .global_variables import EXTENSION_DESCRIPTION, EXTENSION_TITLE, EXTENSION_LINK
@@ -25,7 +24,6 @@ import isaacsim.core.utils.stage as stage_utils
 from pxr import Gf, Sdf, UsdGeom
 from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
 from isaacsim.oceansim.utils.UWCam_sdg_utils import *
-from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
 class UIBuilder:
     def __init__(self):
         self._ext_id = omni.kit.app.get_app().get_extension_manager().get_extension_id_by_module(__name__)
@@ -392,6 +390,9 @@ class UIBuilder:
 
         stage = stage_utils.get_current_stage()
         create_dome_ligth(stage, "/Environment", intensity=1000.0)
+        # Imported here, not at module load: UW_Camera pulls in rclpy, and this
+        # module is loaded at extension startup whether or not the ROS 2 bridge is.
+        from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
         self._UW_cam = UW_Camera("/UW_Camera", resolution=(1920, 1080))
         for key, value in self._camera_properties.items():
             self._UW_cam.prim.GetAttribute(key).Set(value)
@@ -538,7 +539,12 @@ class UIBuilder:
         if self._scenario_state_btn.enabled:
             if self.save_dir_field.get_value() != "":
                 save_dir = self.save_dir_field.get_value()
-                rendered_image = self._scenario._cam._uw_image.numpy()
+                # UW_Camera keeps its last rendered frame in _uw_image_buf.
+                frame = getattr(self._scenario._cam, "_uw_image_buf", None)
+                if frame is None:
+                    carb.log_error("No rendered frame yet -- press RUN first, then save.")
+                    return
+                rendered_image = frame.numpy()
                 uw_image = Image.fromarray(rendered_image, 'RGBA')
                 uw_image.save(save_dir + '/viewport_uw_rgba.png')
                 print(f'viewport result written to {save_dir}.')

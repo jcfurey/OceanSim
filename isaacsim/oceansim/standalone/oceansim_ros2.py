@@ -321,7 +321,8 @@ def main(argv):
     # in Isaac 6.0, but still importable). omni.ui is not available in a headless
     # kit app, so executing that import chain fails regardless of LoadButton.
     # Pre-seed a stub for that package so `scenario` loads as a submodule WITHOUT
-    # executing the package __init__. (oceansim/ and modules/ have no __init__.)
+    # executing the package __init__. (modules/ has no __init__; oceansim/'s
+    # __init__ only does guarded convenience re-exports, so it is safe to run.)
     import sys
     import types
     _sep_name = "isaacsim.oceansim.modules.SensorExample_python"

@@ -73,13 +73,22 @@ class Extension(omni.ext.IExt):
 
     def on_shutdown(self):
         self._models = {}
-        remove_menu_items(self._menu_items, EXTENSION_TITLE)
+        # Must match the menu name used at add_menu_items() time ("OceanSim");
+        # removing under EXTENSION_TITLE never matched, leaking a duplicate
+        # menu entry on every disable/re-enable (see SensorExample extension).
+        remove_menu_items(self._menu_items, "OceanSim")
 
         action_registry = omni.kit.actions.core.get_action_registry()
         action_registry.deregister_action(self.ext_id, f"CreateUIExtension:{EXTENSION_TITLE}")
 
         if self._window:
             self._window = None
+        # Release the carb event subscriptions before gc.collect() (same fix as
+        # the SensorExample / colorpicker extensions): they hold strong refs to
+        # the bound callbacks, so this instance can't be reclaimed otherwise.
+        self._stage_event_sub = None
+        self._timeline_event_sub = None
+        self._physx_subscription = None
         self.ui_builder.cleanup()
         gc.collect()
 

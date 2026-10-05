@@ -17,6 +17,8 @@ class CmdVelController:
         self._robot_prim = None
         self._force_api = None
         self._graph_path = None
+        # Set by _setup_cmd_vel_graph; stays None if the graph can't be built.
+        self._twist_node = None
         self._current_linear_vel = [0.0, 0.0, 0.0]
         self._current_angular_vel = [0.0, 0.0, 0.0]
         self._setup_cmd_vel_graph()
@@ -112,6 +114,12 @@ class CmdVelController:
                 # Apply forces
                 self._force_api.GetForceAttr().Set(tuple(force))
                 self._force_api.GetTorqueAttr().Set(tuple(torque))
+            elif self._force_api is not None:
+                # Command returned to zero: release the thrust. The force attrs
+                # persist on the prim, so without this the last nonzero command
+                # kept pushing the vehicle indefinitely.
+                self._force_api.GetForceAttr().Set((0.0, 0.0, 0.0))
+                self._force_api.GetTorqueAttr().Set((0.0, 0.0, 0.0))
 
         except Exception as e:
             carb.log_warn(f"[CmdVelController] Error in update: {e}")

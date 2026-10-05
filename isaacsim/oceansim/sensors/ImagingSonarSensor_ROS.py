@@ -28,6 +28,13 @@ class ImagingSonarSensor_ROS(ImagingSonarSensor):
         og_node=None,
         **kwargs,
     ):
+        # Publishing writes OmniGraph attributes and must happen on the main
+        # thread, right after the frame is computed. The base class's async
+        # worker would run make_sonar_data (and so this publish) off-thread, so
+        # this class always computes synchronously.
+        if kwargs.pop("async_compute", False):
+            print(f"[{name}] async_compute is not supported with OmniGraph "
+                  f"publishing; running the sonar synchronously.")
         super().__init__(
             prim_path=prim_path,
             name=name,
@@ -67,6 +74,9 @@ class ImagingSonarSensor_ROS(ImagingSonarSensor):
         )
 
     def make_sonar_data(self, *args, **kwargs):
+        if kwargs.get("_skip_scan"):
+            # Internal async-worker re-entry; never publish from there.
+            return super().make_sonar_data(*args, **kwargs)
         previous_frame_id = self.id
         # handles sonar data generation
         result = super().make_sonar_data(*args, **kwargs)

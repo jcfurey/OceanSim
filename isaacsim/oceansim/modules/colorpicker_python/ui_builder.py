@@ -15,7 +15,6 @@ from isaacsim.gui.components import CollapsableFrame, StateButton, IntField, get
 from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
 from isaacsim.core.utils.extensions import get_extension_path
 
-from isaacsim.gui.property.array_widget import CustomMultiIntField
 # Custom import
 from .scenario import Colorpicker_Scenario
 from isaacsim.oceansim.utils.UWrenderer_utils import UW_render
