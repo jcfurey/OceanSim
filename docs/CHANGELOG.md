@@ -7,7 +7,15 @@
 - Merge upstream OceanSim 0.2 (umfieldrobotics/OceanSim main): SDG playground,
   trajectory recorder, water surface, KITTI writers, OmniGraph `*_ROS` sensor
   subclasses, depth degradation and the Seaclear standalone SDG scripts
-- Target Isaac Sim 6.1.0
+- Target Isaac Sim 6.1.0: Docker base image `nvcr.io/nvidia/isaac-sim:6.1.0`, docs and
+  links updated; the Dockerfile only pip-installs OpenCV when the bundled interpreter lacks cv2
+
+### Fixed
+
+- Import `read_camera_info` from `isaacsim.ros2.core` (the ROS 2 bridge extension no
+  longer exports it), with the old path as a fallback
+- Colorpicker caustics sliders get explicit bounds; Isaac Sim 6.1.0's slider clamp
+  would otherwise force Max Depth / Time Speed / decal positions into 0..1
 
 ## [0.3.0] - 2025-09-06
 

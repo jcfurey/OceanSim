@@ -29,7 +29,12 @@ def to_ros_stamp(sim_time: float) -> tuple[int, int]:
 
 # Source: https://docs.isaacsim.omniverse.nvidia.com/5.1.0/ros2_tutorials/tutorial_ros2_camera_publishing.html
 def publish_camera_info(camera: Camera, freq):
-    from isaacsim.ros2.bridge import read_camera_info
+    try:
+        # Isaac Sim 6.x: lives in isaacsim.ros2.core (the bridge extension
+        # no longer re-exports it); the bridge path is the older location.
+        from isaacsim.ros2.core import read_camera_info
+    except ImportError:
+        from isaacsim.ros2.bridge import read_camera_info
 
     # The following code will link the camera's render product and publish the data to the specified topic name.
     render_product = camera._render_product_path

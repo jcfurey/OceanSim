@@ -289,6 +289,17 @@ class UIBuilder:
             0.0, 0.0, 0.0,
             1.0,
         ]
+        # Explicit (min, max) per slider: isaacsim.gui.components >= 1.8.9 (Isaac
+        # Sim 6.1.0) clamps typed values to the slider bounds, and the default
+        # 0..1 would clamp Max Depth (100), Time Speed (2) and negative decal
+        # positions on the first edit.
+        caustics_params_bounds = [
+            (0.0, 1.0), (0.0, 200.0), (0.0, 200.0),
+            (0.0, 10.0), (0.0, 10.0),
+            (0.0, 10.0),
+            (-100.0, 100.0), (-100.0, 100.0), (-100.0, 100.0),
+            (0.0, 10.0),
+        ]
         self._caustics_param = caustics_params_default
         with caustics_frame:
             with ui.VStack(spacing=10):
@@ -297,7 +308,9 @@ class UIBuilder:
                     param_model, param_slider = combo_floatfield_slider_builder(
                         label=caustics_params_labels[i],
                         type=caustics_params_types[i],
-                        default_val=caustics_params_default[i])
+                        default_val=caustics_params_default[i],
+                        min=caustics_params_bounds[i][0],
+                        max=caustics_params_bounds[i][1])
                     self._caustics_param_models.append(param_model)
                     param_model.add_value_changed_fn(self._on_caustics_param_changes)
                     self._on_caustics_param_changes(param_model)

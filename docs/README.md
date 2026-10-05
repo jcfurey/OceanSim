@@ -6,7 +6,7 @@
 [![Website](https://img.shields.io/website?down_color=red&down_message=offline&up_color=blue&up_message=online&url=https%3A%2F%2Fumfieldrobotics.github.io%2FOceanSim%2F)](https://umfieldrobotics.github.io/OceanSim/)
 [![Subscription Form](https://img.shields.io/badge/Subscribe-Form-blue.svg)](https://docs.google.com/forms/d/e/1FAIpQLSfKWMhE4L6R4jjvEw_bfMtLigXbv5WZeijDah5vk2SpQZW1hA/viewform)
 [![arXiv](https://img.shields.io/badge/arXiv-2503.01074-b31b1b.svg)](https://arxiv.org/abs/2503.01074)
-[![IsaacSim 6.0.1](https://img.shields.io/badge/IsaacSim-6.0.1-brightgreen.svg)](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/index.html)
+[![IsaacSim 6.1.0](https://img.shields.io/badge/IsaacSim-6.1.0-brightgreen.svg)](https://docs.isaacsim.omniverse.nvidia.com/6.1.0/index.html)
 <!-- add and scale media/oceansim_demo.gif to full width-->
 <!-- ![OceanSim Demo](../media/oceansim_demo.gif) \ -->
 <a href="https://umfieldrobotics.github.io/OceanSim/">
@@ -63,7 +63,7 @@ We divide the documentation into four parts:
 ## ROS2 Bridge
 OceanSim ships an optional ROS2 bridge so the provided example can be driven from, and publish to, a ROS2 graph.
 
-Set up your ROS2 workspace with Isaac Sim by following the official [Isaac Sim ROS 2 installation tutorial](https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/install_ros.html). On Isaac Sim 6.0.1 the default target is Ubuntu 24.04 with ROS 2 Jazzy (ROS 2 Humble on Ubuntu 22.04 is also supported). For a ready-made environment, see the [Docker setup](subsections/installation.md#running-in-docker-isaac-sim-601--ros-2-jazzy) (Isaac Sim 6.0.1 + ROS 2 Jazzy, with GPU and X11 display passthrough).
+Set up your ROS2 workspace with Isaac Sim by following the official [Isaac Sim ROS 2 installation tutorial](https://docs.isaacsim.omniverse.nvidia.com/6.1.0/installation/install_ros.html). On Isaac Sim 6.1.0 the default target is Ubuntu 24.04 with ROS 2 Jazzy (ROS 2 Humble on Ubuntu 22.04 is also supported). For a ready-made environment, see the [Docker setup](subsections/installation.md#running-in-docker-isaac-sim-610--ros-2-jazzy) (Isaac Sim 6.1.0 + ROS 2 Jazzy, with GPU and X11 display passthrough).
 
 Before the OceanSim extension is activated, the `isaacsim.ros2.bridge` extension must be activated, otherwise `rclpy` will fail to load. We suggest setting `isaacsim.ros2.bridge` to **AUTOLOADED** in *Window → Extensions*.
 

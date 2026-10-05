@@ -1,21 +1,21 @@
 # syntax=docker/dockerfile:1
 #
-# OceanSim on NVIDIA Isaac Sim 6.0.1 (Ubuntu 24.04 / ROS 2 Jazzy)
+# OceanSim on NVIDIA Isaac Sim 6.1.0 (Ubuntu 24.04 / ROS 2 Jazzy)
 # ---------------------------------------------------------------------------
-# Builds on NVIDIA's official Isaac Sim 6.0.1 container (Ubuntu 24.04 base, which
+# Builds on NVIDIA's official Isaac Sim 6.1.0 container (Ubuntu 24.04 base, which
 # is why ROS 2 Jazzy is the matching distro), layers ROS 2 Jazzy and the OceanSim
 # Python dependencies on top, and installs OceanSim as an Isaac Sim user
 # extension under /isaac-sim/extsUser.
 #
 # Build:
-#   docker build -t oceansim:6.0.1 .
+#   docker build -t oceansim:6.1.0 .
 # Run (GPU + X11 display passthrough):
 #   ./docker/run.sh          # see that script for xhost / display flags
 #
 # Pulling the base image requires an NGC login:
 #   docker login nvcr.io
 # ---------------------------------------------------------------------------
-ARG ISAACSIM_VERSION=6.0.1
+ARG ISAACSIM_VERSION=6.1.0
 FROM nvcr.io/nvidia/isaac-sim:${ISAACSIM_VERSION}
 
 ARG ROS_DISTRO=jazzy
@@ -70,8 +70,11 @@ ENV OCEANSIM_PATH=/isaac-sim/extsUser/OceanSim
 COPY . ${OCEANSIM_PATH}
 
 # cv2 for the bundled Isaac Sim interpreter (UW_Camera / ROS2 image publisher).
-# numpy, pyyaml and warp already ship with Isaac Sim.
-RUN /isaac-sim/python.sh -m pip install --no-cache-dir opencv-python-headless
+# numpy, pyyaml and warp already ship with Isaac Sim. Isaac Sim 6.1.0 bundles
+# its own headless OpenCV build, so only install one if the interpreter can't
+# already import cv2 (two packages both providing cv2 would shadow each other).
+RUN /isaac-sim/python.sh -c "import cv2" 2>/dev/null \
+    || /isaac-sim/python.sh -m pip install --no-cache-dir opencv-python-headless
 
 # Source ROS 2 automatically in interactive shells.
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc

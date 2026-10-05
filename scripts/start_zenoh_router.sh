@@ -6,7 +6,7 @@
 # discover each other via the Zenoh router's gossip -- multicast discovery is
 # OFF by default -- so a router MUST be running before any ROS 2 node (the
 # OceanSim sim publishers, RViz, robot_localization, sonar_image_proc, ...) can
-# see each other. https://docs.isaacsim.omniverse.nvidia.com/6.0.1/installation/install_ros.html
+# see each other. https://docs.isaacsim.omniverse.nvidia.com/6.1.0/installation/install_ros.html
 #
 # In a real deployment the router is part of the robot stack and its endpoint
 # config is sourced from the workspace bashrc.d/99-zenoh_configs.bashrc (see the

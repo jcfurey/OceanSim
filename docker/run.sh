@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 #
-# Launch the OceanSim Isaac Sim 6.0.1 container with GPU access and X11 display
+# Launch the OceanSim Isaac Sim 6.1.0 container with GPU access and X11 display
 # passthrough (Ubuntu 24.04 / ROS 2 Jazzy).
 #
 # Usage:
 #   ./docker/run.sh                 # interactive bash inside the container
 #   ./docker/run.sh ./isaac-sim.sh  # launch the Isaac Sim GUI directly
 #
-# Override the image tag with OCEANSIM_IMAGE (default: oceansim:6.0.1).
+# Override the image tag with OCEANSIM_IMAGE (default: oceansim:6.1.0).
 # Mount your downloaded assets with OCEANSIM_ASSETS=/path/to/OceanSim_assets.
 set -euo pipefail
 
-IMAGE="${OCEANSIM_IMAGE:-oceansim:6.0.1}"
+IMAGE="${OCEANSIM_IMAGE:-oceansim:6.1.0}"
 
 # --- X11 display passthrough -------------------------------------------------
 # Allow the container's user to talk to the host X server, and revoke the grant
@@ -25,7 +25,7 @@ else
 fi
 
 # Persisted Isaac Sim caches (first run is slow while shaders compile). The bulk
-# of the RTX/MDL shader cache on 6.0.x is /isaac-sim/kit/cache (~570 MB); without
+# of the RTX/MDL shader cache on 6.x is /isaac-sim/kit/cache (~570 MB); without
 # it the shader compile is paid on every --rm run.
 mkdir -p \
     ~/docker/isaac-sim/cache/kit \

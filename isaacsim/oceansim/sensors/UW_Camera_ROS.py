@@ -91,7 +91,12 @@ class UW_Camera_ROS(UW_Camera):
             ).set("32FC1")
 
         if self._pointcloud_og_node:
-            from isaacsim.ros2.bridge import read_camera_info
+            try:
+                # Isaac Sim 6.x: lives in isaacsim.ros2.core (the bridge extension
+                # no longer re-exports it); the bridge path is the older location.
+                from isaacsim.ros2.core import read_camera_info
+            except ImportError:
+                from isaacsim.ros2.bridge import read_camera_info
 
             frame_id = self.prim_path.split("/")[-1]
             camera_info, _ = read_camera_info(
