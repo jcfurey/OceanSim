@@ -58,8 +58,11 @@ class MultivariateUniform:
         if self.N != 1:
             raise ValueError(f"Can't use MVN size {self.N} with exponential samples")
         if self.uncertain:
+            # uniform(0,1) is half-open [0,1): x can be exactly 0, where log(0)
+            # = -inf would return +inf. 1-x lies in (0,1], whose log is finite
+            # (log(1)=0 -> sample 0.0), and the distribution is unchanged.
             x = self.rng.uniform(0, 1)
-            return -self.max[0] * np.log(x)
+            return -self.max[0] * np.log(1.0 - x)
         return 0.0
 
     def exponential_pdf(self, x: float) -> float:

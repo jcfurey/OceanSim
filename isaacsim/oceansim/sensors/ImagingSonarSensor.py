@@ -826,12 +826,19 @@ class ImagingSonarSensor(Camera):
         self.sonar_map.zero_()
 
         # Calculate multiplicative gaussian noise
-        
+        #
+        # Seed note: both noise kernels derive per-cell RNG state as
+        # rand_init(seed, i*W+j). Passing the SAME seed to both (the old code
+        # passed self.id twice) made the Gaussian field bit-identical to the
+        # Rayleigh kernel's first draw -- the "independent" multiplicative and
+        # additive noise rose and fell together every frame. Splitting the seed
+        # space even/odd (2*id vs 2*id+1) keeps the streams disjoint across both
+        # kernels AND frames.
         wp.launch(
             kernel=normal_2d,
             dim=self.bin_sum.shape,
             inputs=[
-                self.id,   # use frame num for RNG seed increment
+                2 * self.id,       # frame-incremented seed, even half
                 0.0,
                 gau_noise_param
             ],
@@ -846,7 +853,7 @@ class ImagingSonarSensor(Camera):
             kernel=range_dependent_rayleigh_2d,
             dim=self.bin_sum.shape,
             inputs=[
-                self.id,   # use frame num for RNG seed increment
+                2 * self.id + 1,   # frame-incremented seed, odd half (see above)
                 self.r,
                 self.azi,
                 self.max_range,

@@ -331,6 +331,16 @@ class UIBuilder:
         """This is called when the user opens a new stage from self.on_stage_event().
         All state should be reset.
         """
+        # Tear down the previous scenario before _on_init() discards it (same
+        # fix as the SensorExample ui_builder): otherwise opening a new stage
+        # orphans the old scenario's LdrColor/depth render-product annotators
+        # (GPU caches) and its "Render Result" ui.Window -- leaked again on
+        # every stage open. teardown_scenario() is null-safe when RUN never ran.
+        if getattr(self, "_scenario", None) is not None:
+            try:
+                self._scenario.teardown_scenario()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[OceanSim colorpicker] scenario teardown on stage-open warning: {exc}")
         self._on_init()
         self._reset_ui()
 
@@ -395,6 +405,15 @@ class UIBuilder:
 
     def _on_save_viewport(self):
         if self._scenario_state_btn.enabled:
+            # The state button enables on LOAD, but the render buffers only
+            # exist after the first playing physics step (update_scenario).
+            # Clicking Save between Load and RUN used to crash on
+            # None.numpy(); tell the user what to do instead.
+            if (getattr(self._scenario, "raw_rgba", None) is None
+                    or getattr(self._scenario, "depth_image", None) is None
+                    or getattr(self._scenario, "uw_image", None) is None):
+                carb.log_error("No rendered frame yet -- press RUN first, then save.")
+                return
             if self.save_dir_field.get_value() != "":
                 save_dir = self.save_dir_field.get_value()
                 raw_rgba = self._scenario.raw_rgba.numpy()

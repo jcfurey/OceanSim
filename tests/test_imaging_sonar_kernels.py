@@ -51,19 +51,24 @@ def test_bin_intensity_drops_out_of_grid_points(kern):
     bin_count = wp.zeros(shape=(n_range, n_beams), dtype=wp.int32, device=DEV)
 
     # offsets/res chosen so bin_idx = floor(coord). Points:
-    #  (0.5, 0.5) -> bin (0,0)  in-grid
-    #  (1.5, 0.5) -> bin (1,0)  in-grid
-    #  (9.0, 0.5) -> bin (9,0)  OUT of range (>= n_range) -> must be dropped
-    #  (0.5,-1.0) -> bin (0,-1) negative beam -> must be dropped
+    #  (0.5, 0.5)  -> bin (0,0)  in-grid
+    #  (1.5, 0.5)  -> bin (1,0)  in-grid
+    #  (9.0, 0.5)  -> bin (9,0)  OUT of range (>= n_range) -> must be dropped
+    #  (0.5,-1.0)  -> bin (0,-1) negative beam -> must be dropped
+    #  (-0.5, 0.5) -> bin (-1,0) fractional-NEGATIVE coords: a bare int cast
+    #  (0.5,-0.5)  -> bin (0,-1) truncates -0.5 to 0, sneaking these off-grid
+    #                 points into bin 0 as spurious returns; floor() drops them.
     pts = np.array([[0.5, 0.5, 0.0],
                     [1.5, 0.5, 0.0],
                     [9.0, 0.5, 0.0],
-                    [0.5, -1.0, 0.0]], dtype=np.float32)
+                    [0.5, -1.0, 0.0],
+                    [-0.5, 0.5, 0.0],
+                    [0.5, -0.5, 0.0]], dtype=np.float32)
     pcl = wp.array(pts, dtype=wp.vec3, device=DEV)
-    intensity = wp.array(np.array([1.0, 2.0, 99.0, 99.0], dtype=np.float32),
+    intensity = wp.array(np.array([1.0, 2.0, 99.0, 99.0, 99.0, 99.0], dtype=np.float32),
                          dtype=wp.float32, device=DEV)
 
-    wp.launch(kern.bin_intensity, dim=4,
+    wp.launch(kern.bin_intensity, dim=6,
               inputs=[pcl, intensity, wp.float32(0.0), wp.float32(0.0),
                       wp.float32(1.0), wp.float32(1.0), bin_sum, bin_count],
               device=DEV)
@@ -100,6 +105,45 @@ def test_make_sonar_map_all_zero_guard_no_nan(kern):
     out = result.numpy()
     assert np.all(np.isfinite(out)), "zero-guard failed: NaN/inf in sonar map"
     assert np.all(out[:, :, 2] == 0.0)  # intensity channel stays 0
+
+
+def test_make_sonar_map_modes_apply_same_op_order(kern):
+    """"all" and "range" normalization must apply noise/offset/gain in the SAME
+    order, so switching normalizing_method changes only the normalization. On a
+    single-row grid the global max equals the row max, so any remaining output
+    difference would be a divergent op order (the old "all" path applied
+    offset/gain BEFORE the noise)."""
+    n_range, n_beams = 1, 5
+    shape = (n_range, n_beams)
+    rng = np.random.default_rng(7)
+    inten_np = rng.uniform(0.1, 3.0, shape).astype(np.float32)
+    gau_np = rng.normal(0.0, 0.2, shape).astype(np.float32)
+    ray_np = rng.uniform(0.0, 0.1, shape).astype(np.float32)
+    r = wp.array(np.ones(shape, dtype=np.float32), dtype=wp.float32, device=DEV)
+    azi = wp.array(np.full(shape, np.pi / 2, dtype=np.float32), dtype=wp.float32, device=DEV)
+    gau = wp.array(gau_np, dtype=wp.float32, device=DEV)
+    ray = wp.array(ray_np, dtype=wp.float32, device=DEV)
+    offset, gain = wp.float32(0.13), wp.float32(1.7)   # non-defaults expose ordering
+
+    max_all = wp.array(np.array([inten_np.max()], dtype=np.float32),
+                       dtype=wp.float32, device=DEV)
+    max_rows = wp.array(inten_np.max(axis=1), dtype=wp.float32, device=DEV)
+
+    out_all = wp.zeros(shape, dtype=wp.vec3, device=DEV)
+    out_rng = wp.zeros(shape, dtype=wp.vec3, device=DEV)
+    int_all = wp.array(inten_np.copy(), dtype=wp.float32, device=DEV)
+    int_rng = wp.array(inten_np.copy(), dtype=wp.float32, device=DEV)
+
+    wp.launch(kern.make_sonar_map_all, dim=shape,
+              inputs=[r, azi, int_all, max_all, gau, ray, offset, gain, out_all],
+              device=DEV)
+    wp.launch(kern.make_sonar_map_range, dim=shape,
+              inputs=[r, azi, int_rng, max_rows, gau, ray, offset, gain, out_rng],
+              device=DEV)
+    wp.synchronize()
+
+    np.testing.assert_allclose(out_all.numpy()[:, :, 2], out_rng.numpy()[:, :, 2],
+                               rtol=1e-6)
 
 
 def test_make_sonar_image_column_flip_and_bounds(kern):
