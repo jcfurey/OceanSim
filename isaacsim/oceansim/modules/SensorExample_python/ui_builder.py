@@ -486,8 +486,9 @@ class UIBuilder():
             from isaacsim.oceansim.utils import sensor_presets
             _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
             _sonar_pl = payload_catalogue.sensor_payload(self._fitted_payloads, "sonar")
-            _sk = (sensor_presets.sonar_kwargs(_sonar_pl) if _sonar_pl is not None
-                   else dict(range_res=0.005, angular_res=0.25))
+            if _sonar_pl is None:
+                _sonar_pl = payload_catalogue.get_payload(sensor_presets.DEFAULT_SONAR_PAYLOAD)
+            _sk = sensor_presets.sonar_kwargs(_sonar_pl)
             self._sonar = ImagingSonarSensor(prim_path=robot_prim_path + '/sonar',
                                             translation=_sonar_tr,
                                             orientation=euler_angles_to_quat(_sonar_rpy, degrees=True),
@@ -499,6 +500,7 @@ class UIBuilder():
                                             # to numpy by itself if the AOVs aren't on-device.
                                             gpu_point_filter=True,
                                             )
+            self._sonar.make_sonar_data_params = sensor_presets.sonar_model_params(_sonar_pl)
 
         if self._use_camera:
             if use_og_ros:

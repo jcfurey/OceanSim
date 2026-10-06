@@ -312,7 +312,8 @@ _BLUEROV2 = PlatformSpec(
     manufacturer="Blue Robotics",
     camera_hfov_deg=110.0,       # BlueROV2 page: 110 deg horizontal underwater
     default_payloads=("lumen_light_pair",),
-    payload_options=("ping360", "ping2", "oculus_m750d", "oculus_m1200d", "waterlinked_a50",
+    payload_options=("ping360", "ping2", "oculus_m750d", "oculus_m1200d", "oculus_m3000d",
+                     "oculus_m3000d_hf", "waterlinked_a50",
                      "waterlinked_a125", "newton_gripper", "lumen_light_pair"),
 )
 
@@ -392,7 +393,8 @@ _DEEPTREKKER_REVOLUTION = PlatformSpec(
     urdf_subpath=os.path.join("DeepTrekker", "revolution.urdf"),
     dimensions=(0.717, 0.44, 0.235),
     manufacturer="Deep Trekker",
-    payload_options=("oculus_m750d", "oculus_m1200d", "oculus_c550d", "waterlinked_a50"),
+    payload_options=("oculus_m750d", "oculus_m1200d", "oculus_m3000d", "oculus_m3000d_hf",
+                     "oculus_c550d", "waterlinked_a50"),
     hydro=HydroEstimate(
         thrusters=vectored_thrusters(0.25, 0.16, 0.0, 41.62)
         + vertical_thrusters([(0.0, -0.17, 0.0), (0.0, 0.17, 0.0)], 58.86),

@@ -34,3 +34,13 @@ def test_invalid_camera_resolution_fails_before_gpu_start(tmp_path, resolution):
     config.write_text(json.dumps({"camera_resolution": resolution}))
     with pytest.raises(ValueError, match="camera_resolution"):
         runner.load_config(runner.parse_args(["--config", str(config)]))
+
+
+def test_demo_uses_m3000d_without_overriding_device_sampling():
+    config = PATH.parents[3] / "demo/revolution.json"
+    cfg = runner.load_config(runner.parse_args(["--config", str(config)]))
+    assert cfg["payloads"] == ["oculus_m3000d"]
+    assert cfg["sonar_params"]["max_range"] == 12.0
+    # The defaults must not silently replace the selected mode's beam count,
+    # sample spacing, or near range when config dictionaries are merged.
+    assert not {"angular_res", "range_res", "min_range"} & cfg["sonar_params"].keys()

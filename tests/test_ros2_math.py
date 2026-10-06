@@ -101,7 +101,7 @@ def test_oculus_beamwidths_by_frequency(m):
     assert az12 == pytest.approx(math.radians(0.6))   # M300d LF azimuth beamwidth
     assert el12 == pytest.approx(math.radians(20.0))  # elevation aperture
     az30, _ = m.oculus_beamwidths(3.0e6)
-    assert az30 == pytest.approx(math.radians(0.4))   # HF azimuth beamwidth
+    assert az30 == pytest.approx(math.radians(0.25))  # M3000d HF, datasheet rev 10
     # rx beamwidth (0.6deg) is WIDER than typical beam spacing (e.g. 130/520=0.25deg)
     assert az12 > math.radians(130.0 / 520.0)
 
@@ -150,6 +150,19 @@ def test_single_beam_points_forward(m):
     assert d[2] == pytest.approx(1.0)   # cos(0)
 
 
+def test_sonar_beamwidths_describe_the_published_image(m):
+    """The imaging sonar's reported azimuth resolving power wins (it may be
+    a model override, or the beam spacing when unblurred); the RTX backend
+    reports none and gets the Oculus band constant. Elevation is the
+    sensor's own aperture, e.g. the M1200d HF's 12 deg, not a table's 20."""
+    az, el = m.sonar_beamwidths(1.2e6, 20.0, 0.6)
+    assert az == pytest.approx(math.radians(0.6)) and el == pytest.approx(math.radians(20.0))
+    az, _ = m.sonar_beamwidths(1.2e6, 20.0, 130.0 / 512)   # blur disabled
+    assert az == pytest.approx(math.radians(130.0 / 512))
+    az, el = m.sonar_beamwidths(2.1e6, 12.0, None)         # RTX: no sensor value
+    assert az == pytest.approx(math.radians(0.4)) and el == pytest.approx(math.radians(12.0))
+
+
 def test_oculus_beamwidths_bands(m):
     import math
     az, el = m.oculus_beamwidths(1.2e6)     # M300d/M1200d LF
@@ -157,8 +170,8 @@ def test_oculus_beamwidths_bands(m):
     assert el == pytest.approx(math.radians(20.0))
     az, _ = m.oculus_beamwidths(2.1e6)      # M1200d HF
     assert az == pytest.approx(math.radians(0.4))
-    az, _ = m.oculus_beamwidths(3.0e6)      # M300d HF
-    assert az == pytest.approx(math.radians(0.4))
+    az, _ = m.oculus_beamwidths(3.0e6)      # M3000d HF
+    assert az == pytest.approx(math.radians(0.25))
     az, el = m.oculus_beamwidths(999.0)     # unrecognised -> 1.2 MHz defaults
     assert az == pytest.approx(math.radians(0.6))
 

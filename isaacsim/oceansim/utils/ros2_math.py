@@ -209,9 +209,24 @@ def oculus_beamwidths(frequency_hz):
         return math.radians(0.6), math.radians(20.0)
     if 2.0e6 < f < 2.2e6:        # 2.1 MHz (M1200d): az 0.4 deg, el 20 deg
         return math.radians(0.4), math.radians(20.0)
-    if 2.9e6 < f < 3.1e6:        # 3.0 MHz (M300d HF): az 0.4 deg, el 20 deg
-        return math.radians(0.4), math.radians(20.0)
+    if 2.9e6 < f < 3.1e6:        # M3000d HF, DA-148-P01443-10: az 0.25 deg
+        return math.radians(0.25), math.radians(20.0)
     return math.radians(0.6), math.radians(20.0)
+
+
+def sonar_beamwidths(frequency_hz, vert_fov_deg, azimuth_beamwidth_deg=None):
+    """(azimuth, elevation) beamwidths in RADIANS for ProjectedSonarImage.
+
+    A sensor that reports its azimuth resolving power (the imaging sonar's
+    applied beam FWHM, or its beam spacing when unblurred) is described as
+    simulated, so the metadata matches the published image. Otherwise (the
+    RTX backend) the Oculus band constant for the carrier is used. Elevation
+    is the sensor's vertical aperture.
+    """
+    az, _ = oculus_beamwidths(frequency_hz)
+    if azimuth_beamwidth_deg:
+        az = math.radians(float(azimuth_beamwidth_deg))
+    return az, math.radians(float(vert_fov_deg))
 
 
 def sonar_intensity_uint8(grid):

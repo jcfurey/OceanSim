@@ -898,7 +898,7 @@ class OceanSimSensorPublisher:
 
         # Acoustic carrier frequency for ping_info. Prefer an explicit config
         # override, then the sensor's own MODELLED acoustic frequency
-        # (ImagingSonarSensor.acoustic_frequency = 375 kHz for the Oculus M370s;
+        # (ImagingSonarSensor defaults to the M3000d's 1.2 MHz mode;
         # RtxAcousticSensor.center_frequency for the RTX backend). Do NOT use the
         # Camera `frequency` attribute -- on the imaging sonar that is the render
         # frame rate (e.g. 5-60 Hz), not the acoustic carrier, which would publish
@@ -1018,17 +1018,20 @@ class OceanSimSensorPublisher:
         # Bin geometry from the sensor's own grid resolutions (bin centres).
         range_res = getattr(self._sonar, "range_res", None)
         angular_res = getattr(self._sonar, "angular_res", None)  # degrees
+        # Resolving power of the published data (imaging sonar only; None on
+        # the RTX backend, which falls back to the Oculus band constants).
+        beamwidth = getattr(self._sonar, "azimuth_beamwidth_deg", None)
         key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov, frequency_hz,
-               range_res, angular_res)
+               range_res, angular_res, beamwidth)
         cache = self._sonar_geom
         if cache is not None and cache["key"] == key:
             return cache
         from geometry_msgs.msg import Vector3
-        # rx (azimuth) + tx (elevation) BEAMWIDTHS from the Oculus M-series constants
-        # for this carrier frequency (liboculus/Constants.h via ros2_math). The
-        # beamwidth is the angular WIDTH of a beam, NOT the beam spacing -- the old
-        # rx = hori_fov/n_beams (0.25deg) understated it (real M300d LF is 0.6deg).
-        az_bw, el_bw = ros2_math.oculus_beamwidths(frequency_hz)
+        # rx (azimuth) + tx (elevation) BEAMWIDTHS. The beamwidth is the angular
+        # WIDTH of a beam, NOT the beam spacing -- the old rx = hori_fov/n_beams
+        # (0.25deg) understated a real M300d LF's 0.6deg. The imaging sonar reports
+        # the width it applied; RTX uses the Oculus constants (liboculus/Constants.h).
+        az_bw, el_bw = ros2_math.sonar_beamwidths(frequency_hz, vert_fov, beamwidth)
         geom = {
             "key": key,
             "beam_directions": [

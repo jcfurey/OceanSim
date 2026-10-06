@@ -15,11 +15,16 @@ and so can be validated **without launching Isaac Sim**.
   reference selection across random seeds, including the `(H,W)` reshape /
   4-channel-normals slice / reusable-buffer glue that `scan()` uses), and the
   `make_sonar_data` work-buffer reuse (bit-identical to fresh allocation across
-  grow→shrink frames, so no stale residue leaks).
+  grow→shrink frames, so no stale residue leaks), and Cartesian fan projection
+  (brightest-bin pooling, one-bin echoes on the 3 MHz fan, saturation, blank
+  pixels, semantic labels and display-only guides).
 - `test_sonar_scan_math.py` — pure point selection: `select_in_range_points`
   exactly equals the readable `valid_point_mask` reference, and
   `make_indexToProp_array` (reflectivity lookup: numeric key ordering / array
-  sizing, missing-property default, non-numeric fallback).
+  sizing, missing-property default, non-numeric fallback), plus M3000d fan
+  geometry (equal metre scales, circular range arcs, port/starboard orientation,
+  every bin reaching a pixel symmetrically, and full vertical aperture coverage
+  in both frequency modes).
 - `test_rtx_acoustic_math.py` — `fold_gmo_to_grid` time→range / receiver→beam
   folding and peak normalisation, including the non-finite-range sentinel.
 - `test_ros2_math.py` — the ROS2 publishing math (quaternion conversion, world→

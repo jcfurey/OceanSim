@@ -486,6 +486,67 @@ def make_sonar_image(sonar_data: wp.array(ndim=2, dtype=wp.vec3),
 
 
 @wp.kernel
+def make_sonar_fan_image(sonar_data: wp.array(ndim=2, dtype=wp.vec3),
+                         range_span: wp.array(ndim=3, dtype=wp.int32),
+                         beam_span: wp.array(ndim=3, dtype=wp.int32),
+                         fan_image: wp.array(ndim=3, dtype=wp.uint8)):
+    """Cartesian range/bearing fan; source data stays range-major for ROS.
+
+    Each pixel shows the brightest bin it pools (sonar_fan_lookup), so an
+    echo one bin wide is never skipped where bins outnumber pixels."""
+    i, j = wp.tid()
+    peak = wp.float32(0.0)
+    if range_span[i, j, 0] >= 0:
+        for r in range(range_span[i, j, 0], range_span[i, j, 1] + 1):
+            for b in range(beam_span[i, j, 0], beam_span[i, j, 1] + 1):
+                peak = wp.max(peak, sonar_data[r, b][2])
+    shade = wp.uint8(wp.clamp(peak * wp.float32(255.0), wp.float32(0.0), wp.float32(255.0)))
+    fan_image[i, j, 0] = shade
+    fan_image[i, j, 1] = shade
+    fan_image[i, j, 2] = shade
+    fan_image[i, j, 3] = wp.uint8(255)
+
+
+@wp.kernel
+def overlay_sonar_fan_guides(guides: wp.array(ndim=2, dtype=wp.uint8),
+                             fan_image: wp.array(ndim=3, dtype=wp.uint8),
+                             display_image: wp.array(ndim=3, dtype=wp.uint8)):
+    """Display copy of the fan with cached guides; fan_image is left unmarked."""
+    i, j = wp.tid()
+    for c in range(3):
+        display_image[i, j, c] = wp.max(fan_image[i, j, c], guides[i, j])
+    display_image[i, j, 3] = fan_image[i, j, 3]
+
+
+@wp.kernel
+def make_semantics_fan_image(sonar_data: wp.array(ndim=2, dtype=wp.vec3),
+                             polar_image: wp.array(ndim=3, dtype=wp.uint8),
+                             range_span: wp.array(ndim=3, dtype=wp.int32),
+                             beam_span: wp.array(ndim=3, dtype=wp.int32),
+                             fan_image: wp.array(ndim=3, dtype=wp.uint8)):
+    """Semantic fan labelling the bin make_sonar_fan_image shows: the
+    brightest pooled bin (first on ties). polar_image is the mirrored image
+    from make_semantics_image."""
+    i, j = wp.tid()
+    best_r = int(-1)
+    best_b = int(-1)
+    peak = wp.float32(-1.0)
+    if range_span[i, j, 0] >= 0:
+        for r in range(range_span[i, j, 0], range_span[i, j, 1] + 1):
+            for b in range(beam_span[i, j, 0], beam_span[i, j, 1] + 1):
+                if sonar_data[r, b][2] > peak:
+                    peak = sonar_data[r, b][2]
+                    best_r = r
+                    best_b = b
+    for c in range(3):
+        color = wp.uint8(0)
+        if best_r >= 0:
+            color = polar_image[best_r, polar_image.shape[1] - 1 - best_b, c]
+        fan_image[i, j, c] = color
+    fan_image[i, j, 3] = wp.uint8(255)
+
+
+@wp.kernel
 def make_semantics_image(bin_semantics: wp.array(ndim=2, dtype=wp.uint32),
                          semantics_color: wp.array(ndim=2, dtype=wp.uint8),
                          semantics_image: wp.array(ndim=3, dtype=wp.uint8),

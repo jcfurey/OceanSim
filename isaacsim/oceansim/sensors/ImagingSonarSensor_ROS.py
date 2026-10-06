@@ -18,12 +18,12 @@ class ImagingSonarSensor_ROS(ImagingSonarSensor):
         translation=None,
         render_product_path=None,
         physics_sim_view=None,
-        min_range: float = 0.2,
-        max_range: float = 3.0,
-        range_res: float = 0.008,
+        min_range: float = 0.1,
+        max_range: float = 10.0,
+        range_res: float = 10.0 / 1024,
         hori_fov: float = 130.0,
         vert_fov: float = 20.0,
-        angular_res: float = 0.5,
+        angular_res: float = 130.0 / 512,
         hori_res: int = 3000,
         og_node=None,
         **kwargs,
@@ -87,10 +87,9 @@ class ImagingSonarSensor_ROS(ImagingSonarSensor):
         # handles sonar data generation
         result = super().make_sonar_data(*args, **kwargs)
         if self.id > previous_frame_id:
-            # handles ROS publishing of sonar image. Re-render sonar_image here:
-            # the base class only refreshes it for the GUI viewport, so with
-            # viewport=False it would otherwise publish a stale/blank frame.
-            self._on_sonar_frame(self.get_sonar_image())
+            # Publish the fan the GUI shows, also when viewport=False, but
+            # without its display guides: subscribers get only sonar returns.
+            self._on_sonar_frame(self.get_sonar_fan_image())
         return result
 
     def _on_sonar_frame(self, sonar_image):

@@ -308,6 +308,92 @@ def test_sonar_preset_maps_datasheet_to_sensor_args(mods):
     assert sp.sonar_frequency(m750) == 750e3
 
 
+@pytest.mark.parametrize("name,freq,fov,limit,res,beamwidth", [
+    ("oculus_m3000d", 1.2e6, 130.0, 30.0, 0.0025, 0.6),
+    ("oculus_m3000d_hf", 3.0e6, 40.0, 5.0, 0.002, 0.25),
+])
+def test_m3000d_modes_and_resolution_are_distinct(mods, name, freq, fov, limit, res, beamwidth):
+    _, payloads, *_ = mods
+    presets = _load("sensor_presets")
+    payload = payloads.get_payload(name)
+    assert payload.params["max_range"] == limit
+    assert payload.params["range_res"] == res
+    assert payload.params["rate_hz"] == 40.0
+    kw = presets.sonar_kwargs(payload)
+    assert kw["acoustic_frequency"] == freq
+    assert kw["hori_fov"] == fov and kw["vert_fov"] == 20.0
+    assert kw["min_range"] == 0.1
+    assert kw["hori_fov"] / kw["angular_res"] == pytest.approx(512)
+    assert kw["beam_fwhm_deg"] == beamwidth
+    assert kw["beam_fwhm_deg"] > kw["angular_res"]
+    assert presets.sonar_kwargs(payload, {"max_range": 1.0})["range_res"] == res
+    with pytest.raises(ValueError, match="exceeds"):
+        presets.sonar_kwargs(payload, {"max_range": limit + 0.1})
+    assert presets.sonar_model_params(payload) == {"normalizing_method": "all",
+                                                   "beam_fwhm_deg": beamwidth}
+    override = presets.sonar_model_params(payload, {"beam_fwhm_deg": 0, "normalizing_method": "range"})
+    assert override == {"beam_fwhm_deg": 0, "normalizing_method": "range"}
+
+
+def test_every_imaging_sonar_preset_normalises_per_ping(mods):
+    """Normalisation is not tied to whether a payload records a beamwidth:
+    swapping the M3000d for another sonar must not switch it to per-range."""
+    _, payloads, *_ = mods
+    sp = _load("sensor_presets")
+    sonars = [p for p in payloads.PAYLOADS.values() if p.kind == "sonar" and p.simulated]
+    assert len(sonars) > 5
+    for payload in sonars:
+        params = sp.sonar_model_params(payload)
+        assert params["normalizing_method"] == "all", payload.name
+        beamwidth = payload.params.get("beamwidth_h_deg")
+        assert params.get("beam_fwhm_deg") == beamwidth, payload.name
+        assert sp.sonar_kwargs(payload)["beam_fwhm_deg"] == (beamwidth or 0.0), payload.name
+
+
+@pytest.mark.parametrize("name,beamwidth", [
+    ("oculus_m370s", 2.0), ("oculus_m750d_hf", 0.6), ("oculus_m1200d", 0.6),
+    ("oculus_m1200d_hf", 0.4), ("oculus_m3000d", 0.6), ("oculus_m3000d_hf", 0.25),
+])
+def test_oculus_payload_beamwidths_match_band_constants(mods, name, beamwidth):
+    """Payload beamwidths agree with the Oculus band constants ros2_math
+    publishes for the RTX backend, so both backends describe a device alike."""
+    _, payloads, *_ = mods
+    payload = payloads.get_payload(name)
+    assert payload.params["beamwidth_h_deg"] == beamwidth
+    az, _ = _load("ros2_math").oculus_beamwidths(payload.params["frequency_hz"])
+    assert math.degrees(az) == pytest.approx(beamwidth)
+
+
+def _init_defaults(path, cls):
+    """Constant default arguments of cls.__init__ in a source file (parsed,
+    not imported: the sensor modules need Isaac Sim)."""
+    import ast
+    tree = ast.parse(open(path).read())
+    init = next(n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == cls
+                for n in c.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    args = init.args.args[-len(init.args.defaults):]
+    return {a.arg: eval(compile(ast.Expression(d), path, "eval"), {"__builtins__": {}})
+            for a, d in zip(args, init.args.defaults)}
+
+
+@pytest.mark.parametrize("module,cls", [("ImagingSonarSensor", "ImagingSonarSensor"),
+                                        ("ImagingSonarSensor_ROS", "ImagingSonarSensor_ROS")])
+def test_sonar_constructor_defaults_match_default_payload(mods, module, cls):
+    """A sensor built with no arguments matches what the GUI and the ROS
+    runner build from DEFAULT_SONAR_PAYLOAD (and stays within the bin cap)."""
+    _, payloads, *_ = mods
+    sp = _load("sensor_presets")
+    expected = sp.sonar_kwargs(payloads.get_payload(sp.DEFAULT_SONAR_PAYLOAD))
+    path = os.path.join(_UTILS, "..", "sensors", module + ".py")
+    defaults = _init_defaults(path, cls)
+    shared = expected.keys() & defaults.keys()
+    assert {"min_range", "max_range", "range_res", "hori_fov", "angular_res"} <= shared
+    for key in shared:
+        assert defaults[key] == pytest.approx(expected[key]), key
+    span = defaults["max_range"] - defaults["min_range"]
+    assert math.ceil(span / defaults["range_res"]) <= sp.MAX_RANGE_BINS
+
+
 def test_dvl_altimeter_and_camera_presets(mods):
     _, payloads, *_ = mods
     sp = _load("sensor_presets")

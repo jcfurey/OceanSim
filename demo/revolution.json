@@ -3,12 +3,10 @@
   "water_surface_z": null,
   "camera_resolution": [960, 540],
   "sensor_compute_rate": 10.0,
+  "payloads": ["oculus_m3000d"],
   "sonar_params": {
     "hori_res": 960,
-    "min_range": 0.2,
     "max_range": 12.0,
-    "range_res": 0.025,
-    "angular_res": 0.5,
     "gpu_point_filter": true
   },
   "publisher": {

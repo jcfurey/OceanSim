@@ -110,6 +110,8 @@ Payloads come from `utils/payloads.py`, with datasheet values and sources:
 | `oculus_c550d_hf` | sonar | Oculus C550d imaging sonar, high-frequency mode (820 kHz) | 0.98 / 0.36 kg | yes |
 | `oculus_m1200d` | sonar | Oculus M1200d imaging sonar, low-frequency mode (1.2 MHz) | 0.98 / 0.36 kg | yes |
 | `oculus_m1200d_hf` | sonar | Oculus M1200d imaging sonar, high-frequency mode (2.1 MHz) | 0.98 / 0.36 kg | yes |
+| `oculus_m3000d` | sonar | Oculus M3000d imaging sonar, low-frequency mode (1.2 MHz) | 0.98 / 0.36 kg | yes |
+| `oculus_m3000d_hf` | sonar | Oculus M3000d imaging sonar, high-frequency mode (3.0 MHz) | 0.98 / 0.36 kg | yes |
 | `oculus_m370s` | sonar | Oculus M370s imaging sonar (375 kHz) | 0.98 / 0.36 kg | yes |
 | `oculus_m750d` | sonar | Oculus M750d imaging sonar, low-frequency mode (750 kHz) | 0.98 / 0.36 kg | yes |
 | `oculus_m750d_hf` | sonar | Oculus M750d imaging sonar, high-frequency mode (1.2 MHz) | 0.98 / 0.36 kg | yes |

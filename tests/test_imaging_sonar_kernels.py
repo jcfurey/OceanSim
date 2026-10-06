@@ -43,6 +43,96 @@ def kern():
 DEV = "cpu"
 
 
+def _spans(*rows):
+    """(H, W, 2) int32 spans from rows of (first, last) pairs; None = no fan."""
+    return np.array([[(-1, -1) if s is None else s for s in row] for row in rows], np.int32)
+
+
+def test_fan_pixel_shows_brightest_pooled_bin_and_clears_invalid(kern):
+    """Each pixel takes the max over its range x beam span and fully overwrites
+    the previous frame (a pixel outside the fan is black, not stale)."""
+    source = np.zeros((3, 4, 3), np.float32)
+    source[:, :, 2] = [[0.1, 0.2, 0.3, 0.4],
+                       [0.5, 0.9, 0.0, 0.6],
+                       [0.2, 0.0, 2.0, 0.3]]
+    rs = _spans([None, (0, 1), (2, 2)], [(0, 0), (1, 2), (0, 2)])
+    bs = _spans([None, (0, 2), (3, 3)], [(1, 1), (2, 3), (0, 1)])
+    output = wp.full((2, 3, 4), value=wp.uint8(99), dtype=wp.uint8, device=DEV)
+    wp.launch(kern.make_sonar_fan_image, dim=(2, 3),
+              inputs=[wp.array(source, dtype=wp.vec3, device=DEV),
+                      wp.array(rs, dtype=wp.int32, device=DEV),
+                      wp.array(bs, dtype=wp.int32, device=DEV), output], device=DEV)
+    # max(rows 0-1, beams 0-2) = 0.9; bin (2, 3) = 0.3; bin (0, 1) = 0.2;
+    # rows 1-2 x beams 2-3 saturate at 2.0; rows 0-2 x beams 0-1 = 0.9.
+    expected = np.array([[0, 229, 76], [51, 255, 229]], np.uint8)
+    rgba = output.numpy()
+    for c in range(3):
+        np.testing.assert_array_equal(rgba[:, :, c], expected)
+    assert np.all(rgba[:, :, 3] == 255)
+
+
+def _load_scan_math():
+    path = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim", "utils",
+                        "sonar_scan_math.py")
+    spec = importlib.util.spec_from_file_location("sonar_scan_math", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_single_bin_echo_always_reaches_m3000d_hf_fan(kern):
+    """The 3 MHz fan has fewer pixels than bins (494x720 for 1004x512). Cells
+    the old nearest-cell lookup never displayed -- e.g. range bin 500 on the
+    boresight beams -- must still light a pixel at full brightness."""
+    sm = _load_scan_math()
+    min_r, max_r, fov, beams = 0.1, 5.0, 40.0, 512
+    res = max_r / 1024
+    n_range = int(np.ceil((max_r - min_r) / res))
+    rs, bs, _ = sm.sonar_fan_lookup(min_r, max_r, res, np.deg2rad(90 - fov / 2),
+                                    np.deg2rad(fov / beams), n_range, beams, fov)
+    spans = [wp.array(a, dtype=wp.int32, device=DEV) for a in (rs, bs)]
+    out = wp.zeros((*rs.shape[:2], 4), dtype=wp.uint8, device=DEV)
+    for cell in [(500, 255), (500, 256), (504, 255), (0, 0), (n_range - 1, beams - 1), (3, 300)]:
+        source = np.zeros((n_range, beams, 3), np.float32)
+        source[cell + (2,)] = 1.0
+        wp.launch(kern.make_sonar_fan_image, dim=rs.shape[:2],
+                  inputs=[wp.array(source, dtype=wp.vec3, device=DEV), *spans, out], device=DEV)
+        assert out.numpy()[:, :, 0].max() == 255, cell
+
+
+def test_semantics_fan_labels_the_displayed_bin(kern):
+    """The label is the brightest pooled bin's, read through the polar
+    semantic image's column mirror, so labels sit on the echoes shown."""
+    intensity = np.zeros((2, 3, 3), np.float32)
+    intensity[:, :, 2] = [[0.1, 0.8, 0.3], [0.9, 0.2, 0.2]]
+    # Polar semantic image is mirrored: beam b lives in column 2 - b.
+    labels = np.array([[1, 2, 3], [4, 5, 6]], np.uint8)
+    polar = np.zeros((2, 3, 4), np.uint8)
+    polar[:, :, 0] = labels[:, ::-1]
+    rs = _spans([(0, 0), (0, 1), (0, 0), None])
+    bs = _spans([(0, 2), (0, 1), (2, 2), None])
+    out = wp.full((1, 4, 4), value=wp.uint8(99), dtype=wp.uint8, device=DEV)
+    wp.launch(kern.make_semantics_fan_image, dim=(1, 4),
+              inputs=[wp.array(intensity, dtype=wp.vec3, device=DEV),
+                      wp.array(polar, dtype=wp.uint8, device=DEV),
+                      wp.array(rs, dtype=wp.int32, device=DEV),
+                      wp.array(bs, dtype=wp.int32, device=DEV), out], device=DEV)
+    assert out.numpy()[0, :, 0].tolist() == [2, 4, 3, 0]
+    assert np.all(out.numpy()[:, :, 3] == 255)
+
+
+def test_fan_guides_go_to_a_display_copy(kern):
+    """Guides never darken echoes, and the fan published to ROS stays unmarked."""
+    rgba = np.array([[[0, 0, 0, 255], [180, 180, 180, 255]]], np.uint8)
+    image = wp.array(rgba, dtype=wp.uint8, device=DEV)
+    display = wp.zeros_like(image)
+    guides = wp.array(np.array([[36, 36]], np.uint8), dtype=wp.uint8, device=DEV)
+    wp.launch(kern.overlay_sonar_fan_guides, dim=(1, 2), inputs=[guides, image],
+              outputs=[display], device=DEV)
+    assert display.numpy().tolist() == [[[36, 36, 36, 255], [180, 180, 180, 255]]]
+    assert image.numpy().tolist() == rgba.tolist()
+
+
 def test_bin_intensity_drops_out_of_grid_points(kern):
     """The bounds-check (PR #3) must drop points whose range/azimuth bin falls
     outside the grid instead of writing out of bounds."""

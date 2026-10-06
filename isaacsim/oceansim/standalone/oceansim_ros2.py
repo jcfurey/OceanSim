@@ -177,8 +177,8 @@ def load_config(args):
         "sonar_backend": "oceansim",
         # Imaging-sonar tuning (oceansim backend). range_res (m) + angular_res
         # (deg) set the OUTPUT image resolution (range bins x beams). hori_res is
-        # the raytrace SUPERSAMPLING (vert auto = hori_res/AR); it drives compute
-        # (~hori_res^2 points) but NOT output resolution -- lower it to speed up
+        # the raytrace SUPERSAMPLING (vertical coverage spans the full fan); it
+        # drives compute (~hori_res^2 points) but NOT output resolution -- lower it to speed up
         # the scan (and unblock odom, which shares the sim loop) without losing
         # resolution. gpu_point_filter compacts points on-device (skips a host
         # round-trip; self-heals to the numpy path if outputs aren't on-device).
@@ -190,8 +190,7 @@ def load_config(args):
         # is the real limit). With async_compute, render is also gated on the worker
         # being idle so no rendered frame is wasted.
         "sonar_params": {"hori_res": 2500, "gpu_point_filter": True,
-                         "async_compute": False, "render_rate": 0.0,
-                         "range_res": 0.005, "angular_res": 0.25},
+                         "async_compute": False, "render_rate": 0.0},
         # Physics simulation device: None -> Isaac default (GPU/cuda:0). Set to
         # "cpu" to run PhysX on the CPU -- needed when the host NVIDIA driver is too
         # new for Isaac 6.0.1's bundled CUDA (e.g. driver 595.80 / CUDA 13.2 leaves
@@ -719,13 +718,11 @@ def main(argv):
             # A fitted sonar payload (e.g. oculus_m750d) supplies the device's
             # FOV, beam spacing and range defaults; sonar_params still win.
             _sonar_pl = payload_catalogue.sensor_payload(fitted, "sonar")
-            _sk = sensor_presets.sonar_kwargs(_sonar_pl, sp) if _sonar_pl is not None else dict(
-                min_range=sp.get("min_range", 0.2), max_range=sp.get("max_range", 3.0),
-                hori_fov=sp.get("hori_fov_deg", 130.0), vert_fov=sp.get("vert_fov_deg", 20.0),
-                range_res=sp.get("range_res", 0.005), angular_res=sp.get("angular_res", 0.25))
-            if _sonar_pl is not None:
-                print(f"[oceansim_ros2] sonar: {_sonar_pl.description} -> {_sk}")
-            elif any(p.kind == "sonar" for p in fitted):
+            if _sonar_pl is None:
+                _sonar_pl = payload_catalogue.get_payload(sensor_presets.DEFAULT_SONAR_PAYLOAD)
+            _sk = sensor_presets.sonar_kwargs(_sonar_pl, sp)
+            print(f"[oceansim_ros2] sonar: {_sonar_pl.description} -> {_sk}")
+            if any(p.kind == "sonar" and not p.simulated for p in fitted):
                 print("[oceansim_ros2] sonar payload is not simulated (scanning sonar); "
                       "the imaging sonar uses the default parameters")
             _hori_res = int(sp.get("hori_res", 2500))
@@ -739,13 +736,11 @@ def main(argv):
                 gpu_point_filter=_gpu_filter,
                 async_compute=_async,
                 **_sonar_xform)
-            # Optional make_sonar_data model terms (spreading_exponent,
-            # absorption, tvg_exponent, speckle_looks, speckle_cell,
-            # beam_fwhm_deg, noise params, normalizing_method, ...): all off
-            # unless set under sonar_params.model_params in the config.
-            if _sonar_pl is not None:
-                sonar.acoustic_frequency = sensor_presets.sonar_frequency(_sonar_pl)
-            sonar.make_sonar_data_params = dict(sp.get("model_params") or {})
+            # Device beam response and ping normalisation, then optional model
+            # terms from sonar_params.model_params (spreading, absorption, TVG,
+            # speckle, noise, ...). Explicit settings override the device defaults.
+            sonar.make_sonar_data_params = sensor_presets.sonar_model_params(
+                _sonar_pl, sp.get("model_params"))
             if sonar.make_sonar_data_params:
                 print(f"[oceansim_ros2] sonar model params: {sonar.make_sonar_data_params}")
     if sensors.get("camera"):

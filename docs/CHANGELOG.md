@@ -8,6 +8,20 @@ were tuned against real data.
 
 ### Changed
 
+- **(output change)** Default imaging sonar and the Revolution demo model the
+  Oculus M3000d's 1.2 MHz mode. Added the 3 MHz payload (`oculus_m3000d_hf`),
+  with mode-specific apertures, range limits and beam responses from datasheet
+  rev 10. The sensor window and OmniGraph image now show a metric Cartesian
+  fan rather than a stretched polar rectangle; `ProjectedSonarImage` remains
+  range-major. Each fan pixel shows the brightest bin it covers, so no bin is
+  skipped where bins outnumber pixels; range rings are drawn in the window only.
+  Sonar map coordinates now use the same bin centres as ROS. Constructor
+  defaults equal the M3000d preset (10 m working range, 1024-bin budget).
+- **(output change)** Every imaging-sonar preset normalises by the ping maximum
+  (previously only the M3000d did). Oculus presets apply their band's beam
+  response (M370s 2.0°, 1.2 MHz 0.6°, 2.1 MHz 0.4°). `ProjectedSonarImage`
+  `rx_beamwidths` report the beam width actually applied, or the beam spacing
+  when unblurred, and `tx_beamwidths` the sensor's vertical aperture.
 - **(output change)** Imaging sonar geometry and radiometry: the render covers the
   full vertical FOV across the fan and points outside +-vfov/2 are dropped; points
   are weighted by pixel solid angle so beams integrate their true solid angle (edge
@@ -70,6 +84,8 @@ were tuned against real data.
 
 ### Fixed
 
+- Infinite background depths no longer trigger invalid-arithmetic warnings
+  during sonar point reconstruction.
 - Docker launchers disable the optional Hub cache by default to avoid failed
   daemon-launch retries with local scenes; `OMNICLIENT_HUB_MODE=shared` enables
   it explicitly.

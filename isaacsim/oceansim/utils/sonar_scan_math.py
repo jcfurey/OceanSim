@@ -97,6 +97,110 @@ def depth_unprojection_from_camera_params(camera_params, width, height):
 # the optical axis, z up) a pixel ray has azimuth atan2(forward, x) (pi/2 =
 # boresight) and elevation atan2(up, sqrt(x^2 + forward^2)).
 
+# Rounding allowance (in bins) for a bin centre on a fan pixel's edge;
+# such a centre counts for both pixels, keeping the fan symmetric.
+_BIN_EDGE_TOL = 1e-6
+
+
+def sonar_fan_lookup(min_range, max_range, range_res, min_azi, azi_res,
+                     n_range, n_beams, hori_fov_deg, height=720):
+    """Polar bins shown by each pixel of a Cartesian fan display.
+
+    Returns (range span, beam span, metres per display pixel). Each span is
+    (height, width, 2) int32: the first and last bin, inclusive, a pixel
+    pools, or -1 for both where it shows no part of the fan. The sensor is
+    at bottom centre; port is left, starboard right, forward up. Both axes
+    use the SAME scale, so constant slant range draws circular arcs and a
+    narrow HF fan stays narrow. Angular arguments other than hori_fov_deg
+    are radians.
+
+    Bins seldom match pixels: a 720-row fan has fewer rows than range bins,
+    and near the apex one pixel covers many beams. Sampling only the cell
+    under each pixel centre left a quarter of the 1.2 MHz M3000d's cells and
+    two thirds of its 3 MHz cells off screen, so a one-bin echo could vanish.
+    A pixel therefore pools the bins whose centres its square's range/bearing
+    extent contains, or the bin under its own centre where none do. The
+    squares tile the fan, so every bin reaches a pixel without pooling more
+    than the cells that fall inside it.
+    """
+    height = int(height)
+    if height < 1 or not (0.0 <= min_range < max_range):
+        raise ValueError("fan requires positive height and 0 <= min_range < max_range")
+    if range_res <= 0.0 or azi_res <= 0.0 or n_range < 1 or n_beams < 1:
+        raise ValueError("fan requires positive bin sizes and counts")
+    if not 0.0 < hori_fov_deg < 180.0:
+        raise ValueError("fan horizontal FOV must be in (0, 180) degrees")
+    scale = float(max_range) / height
+    half_width = float(max_range) * np.sin(np.deg2rad(hori_fov_deg) / 2.0)
+    # Even width puts the boresight between the central pair of pixels, with
+    # symmetric coverage for both sides of the fan.
+    width = max(2, 2 * int(np.ceil(half_width / scale)))
+    right = (np.arange(width) + 0.5 - width / 2.0) * scale
+    forward = (height - np.arange(height) - 0.5) * scale
+    x, y = np.meshgrid(right, forward)
+    h = 0.5 * scale
+    # Bearings come from atan2(-right, forward), which is odd in `right`, so
+    # mirrored pixels get exactly mirrored beams; beam 0 = starboard edge.
+    def to_beam(bearing):
+        return bearing / azi_res + (np.pi / 2.0 - min_azi) / azi_res
+    corners = to_beam(np.arctan2(-(x[..., None] + [-h, h, -h, h]), y[..., None] + [-h, -h, h, h]))
+    # Square extent in bins: nearest point to farthest corner in range,
+    # extreme corners in bearing (no square contains the apex).
+    r0, r1 = _pooled_bins((np.hypot(np.maximum(np.abs(x) - h, 0.0), y - h) - min_range) / range_res,
+                          (np.hypot(np.abs(x) + h, y + h) - min_range) / range_res,
+                          (np.hypot(x, y) - min_range) / range_res,
+                          (max_range - min_range) / range_res, int(n_range))
+    b0, b1 = _pooled_bins(corners.min(-1), corners.max(-1), to_beam(np.arctan2(-x, y)),
+                          np.deg2rad(hori_fov_deg) / azi_res, int(n_beams))
+    keep = ((r1 >= r0) & (b1 >= b0))[..., None]
+    range_span = np.where(keep, np.stack([r0, r1], axis=-1), -1).astype(np.int32)
+    beam_span = np.where(keep, np.stack([b0, b1], axis=-1), -1).astype(np.int32)
+    return range_span, beam_span, scale
+
+
+def _pooled_bins(lo, hi, centre, upper, count):
+    """First/last bin whose centre lies in [lo, hi], all in bin units; else
+    the bin under the pixel centre when that is inside the fan [0, upper].
+    A last bin cut by the fan edge (upper < count) counts by the centre of
+    its part inside the fan, which a pixel always contains. Empty where
+    last < first."""
+    tail = (count - 1 + min(float(count), upper)) / 2.0
+    first = np.ceil(lo - 0.5 - _BIN_EDGE_TOL)
+    first = np.where(first < count - 1, np.maximum(first, 0.0),
+                     np.where(lo - _BIN_EDGE_TOL <= tail, count - 1, count))
+    last = np.where(hi + _BIN_EDGE_TOL >= tail, count - 1,
+                    np.minimum(np.floor(hi - 0.5 + _BIN_EDGE_TOL), count - 2))
+    # A pixel centre on a bin edge (e.g. a 45-degree beam edge through the
+    # pixel diagonal) pools both bins, so the two halves of the fan agree.
+    fallback = ((last < first) & (centre >= -_BIN_EDGE_TOL)
+                & (centre <= upper + _BIN_EDGE_TOL))
+    first = np.where(fallback, np.maximum(np.floor(centre - _BIN_EDGE_TOL), 0.0), first)
+    last = np.where(fallback, np.minimum(np.floor(centre + _BIN_EDGE_TOL), count - 1), last)
+    return first.astype(np.int64), last.astype(np.int64)
+
+
+def sonar_fan_guides(fan_mask, max_range, hori_fov_deg):
+    """Static display overlay: four range rings and five bearing guides.
+
+    fan_mask is the (height, width) set of pixels showing the fan. The overlay
+    is for viewing only; it never enters the published sonar image. Rings are
+    spaced at max_range / 4; the bearing guides span the aperture at equal
+    angles.
+    """
+    height, width = fan_mask.shape
+    scale = float(max_range) / height
+    x, y = np.meshgrid((np.arange(width) + 0.5 - width/2) * scale,
+                       (height - np.arange(height) - 0.5) * scale)
+    radius = np.hypot(x, y)
+    theta = np.arctan2(x, y)
+    rings = np.abs(radius - np.round(radius / (max_range/4)) * (max_range/4)) <= scale
+    lines = np.zeros(fan_mask.shape, dtype=bool)
+    half = np.deg2rad(hori_fov_deg/2)
+    for angle in np.linspace(-half, half, 5):
+        lines |= radius * np.abs(np.sin(theta - angle)) <= scale
+    return np.where(fan_mask & (rings | lines), 36, 0).astype(np.uint8)
+
+
 def sonar_render_height(width, hori_fov_deg, vert_fov_deg):
     """Render height (px) so the camera covers elevation +-vert_fov/2 across the
     WHOLE fan. A pinhole's vertical extent for a fixed elevation grows as
@@ -162,13 +266,20 @@ def beam_solid_angle_gain(width, height, fx, fy, min_azi, azi_res, n_beams,
 def depth_to_world_points(depth, cam_to_world, fx, fy, cx=None, cy=None):
     """(H*W, 3) world points from a distance_to_image_plane image -- the numpy
     twin of the compact_depth_points kernel (same convention as Isaac's
-    Camera.get_pointcloud() depth fallback, row-major over (H, W))."""
+    Camera.get_pointcloud() depth fallback, row-major over (H, W)). Non-finite
+    background depths produce NaN points without invalid arithmetic."""
     depth = np.asarray(depth, dtype=np.float64)
     h, w = depth.shape
     cx = float(w) / 2.0 if cx is None else float(cx)
     cy = float(h) / 2.0 if cy is None else float(cy)
+    finite = np.isfinite(depth)
+    # Do not feed infinite background distances into 0*depth or a matrix
+    # multiply. Preserve them as invalid points for the downstream mask.
+    safe_depth = np.where(finite, depth, 0.0)
     uu, vv = np.meshgrid(np.arange(w) + 0.5, np.arange(h) + 0.5)
-    x_ros = (uu - cx) * depth / float(fx)
-    y_ros = (vv - cy) * depth / float(fy)
-    cam = np.stack([x_ros, -y_ros, -depth, np.ones_like(depth)], axis=-1).reshape(-1, 4)
-    return (cam @ np.asarray(cam_to_world, dtype=np.float64).T)[:, :3]
+    x_ros = (uu - cx) * safe_depth / float(fx)
+    y_ros = (vv - cy) * safe_depth / float(fy)
+    cam = np.stack([x_ros, -y_ros, -safe_depth, np.ones_like(depth)], axis=-1).reshape(-1, 4)
+    points = (cam @ np.asarray(cam_to_world, dtype=np.float64).T)[:, :3]
+    points[~finite.reshape(-1)] = np.nan
+    return points

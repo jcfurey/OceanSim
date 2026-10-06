@@ -23,19 +23,20 @@ class ImagingSonarSensor(Camera):
                  translation = None, 
                  render_product_path = None,
                  physics_sim_view = None,
-                 min_range: float = 0.2, # m
-                 max_range: float = 3.0, # m
-                 range_res: float = 0.008, # deg
+                 min_range: float = 0.1, # m (Oculus M3000d)
+                 max_range: float = 10.0, # m (M3000d 1.2 MHz working range)
+                 range_res: float = 10.0 / 1024, # m (working range / 1024-bin budget)
                  hori_fov: float = 130.0, # deg
                  vert_fov: float = 20.0, # deg
-                 angular_res: float = 0.5, # deg
-                 hori_res: int = 3000, # isaac camera render product only accepts square pixel,
-                                      # for now vertical res is automatically set with ratio of hori_fov vs.vert_fov
+                 angular_res: float = 130.0 / 512, # deg (output beam spacing)
+                 hori_res: int = 3000, # query render width; height covers the fan's elevation
                  gpu_point_filter: bool = False, # on-device point compaction; skips the
                                       # device->host->device round-trip. Self-heals to the
                                       # numpy path if the AOV outputs aren't on-device Warp arrays.
                  async_compute: bool = False, # run the post-scan kernels + sonar_map readback on
                                       # a worker thread so the sonar doesn't block the sim loop / odom.
+                 acoustic_frequency: float = 1.2e6, # Hz, distinct from camera frame rate
+                 beam_fwhm_deg: float = 0.6, # M3000d LF angular resolving power
                  ):
         
     
@@ -65,13 +66,15 @@ class ImagingSonarSensor(Camera):
                                     Defaults to None
 
             physics_sim_view (_type_, optional): _description_. Defaults to None.            
-            min_range (float, optional): Minimum detection range in meters. Defaults to 0.2.
-            max_range (float, optional): Maximum detection range in meters. Defaults to 3.0.
-            range_res (float, optional): Range resolution in meters. Defaults to 0.008.
+            min_range (float, optional): Minimum detection range in meters. Defaults to 0.1.
+            max_range (float, optional): Maximum detection range in meters. Defaults to 10.0.
+            range_res (float, optional): Range resolution in meters. Defaults to 10 / 1024.
             hori_fov (float, optional): Horizontal field of view in degrees. Defaults to 130.0.
             vert_fov (float, optional): Vertical field of view in degrees. Defaults to 20.0.
-            angular_res (float, optional): Angular resolution in degrees. Defaults to 0.5.
+            angular_res (float, optional): Output beam spacing in degrees. Defaults to 130 / 512.
             hori_res (int, optional): Horizontal pixel resolution. Defaults to 3000.
+            acoustic_frequency (float): Acoustic carrier in Hz, default 1.2 MHz.
+            beam_fwhm_deg (float): Beam response FWHM in degrees, default 0.6.
     
         Note:
             - Vertical resolution is automatically calculated to maintain aspect ratio
@@ -81,35 +84,34 @@ class ImagingSonarSensor(Camera):
 
 
         self._name = name
-        # Raw parameters from Oculus M370s\MT370s\MD370s
-        self.max_range = max_range # m (max is 200 m in datasheet )
-        self.min_range = min_range # m (min is 0.2 m in datasheet)
-        self.range_res = range_res # m (datasheet is 0.008 m)
-        self.hori_fov = hori_fov # degree (hori_fov is 130 degrees in datasheet)
-        self.vert_fov = vert_fov # degree (vert_fov is 20 degrees in datasheet)
-        self.angular_res = angular_res # degree (datasheet is 2 deg)
+        # Defaults equal sensor_presets.sonar_kwargs for the default payload
+        # (Oculus M3000d, 1.2 MHz), which the GUI and ROS runner build from.
+        self.max_range = max_range
+        self.min_range = min_range
+        self.range_res = range_res
+        self.hori_fov = hori_fov
+        self.vert_fov = vert_fov
+        self.angular_res = angular_res
         self.hori_res= hori_res
         # Requested gpu_point_filter; applied in sonar_initialize (which resets the
         # live flag) so it survives (re)initialization.
         self._gpu_point_filter_init = gpu_point_filter
         self._async_compute_init = async_compute
-        # Acoustic carrier frequency of the modelled sonar (Hz). The Oculus M370s
-        # is a 375 kHz single-frequency unit (Blueprint Subsea datasheet). This is
-        # the value reported in ProjectedSonarImage.ping_info.frequency -- kept
-        # SEPARATE from the inherited Camera `frequency` attribute, which is the
-        # render frame rate, not the acoustic carrier.
-        self.acoustic_frequency = 375e3  # Hz (Oculus M370s)
-
-        # self.beam_separation = 0.5 # degree (Not USED FOR NOW)!!
-        # self.num_beams = 256 # (max number of beams) (NOT USED FOR NOW)!!
-        # self.update_rate = 40 # Hz (max update rate) (NOT USED FOR NOW)!!
-
+        self.acoustic_frequency = float(acoustic_frequency)
+        self.beam_fwhm_deg = float(beam_fwhm_deg)
+        # Beam FWHM make_sonar_data last applied (model params can override
+        # the device's); azimuth_beamwidth_deg reports it to ROS.
+        self._applied_beam_fwhm_deg = self.beam_fwhm_deg
 
         # Generate sonar map's r and z meshgrid
         self.min_azi = np.deg2rad(90-self.hori_fov/2)
-        r, azi = np.meshgrid(np.arange(self.min_range,self.max_range,self.range_res),
-                                       np.arange(np.deg2rad(90-self.hori_fov/2), np.deg2rad(90+self.hori_fov/2), np.deg2rad(self.angular_res)),
-                                       indexing='ij')
+        # Cell centres agree with ROS ranges/bearings. Binning offsets below
+        # remain at the cell edges.
+        n_range = int(np.ceil((self.max_range - self.min_range) / self.range_res))
+        n_beams = int(np.ceil(self.hori_fov / self.angular_res))
+        r, azi = np.meshgrid(self.min_range + (np.arange(n_range) + 0.5) * self.range_res,
+                            self.min_azi + (np.arange(n_beams) + 0.5) * np.deg2rad(self.angular_res),
+                            indexing='ij')
         self.r = wp.array(r, shape=r.shape, dtype=wp.float32)
         self.azi = wp.array(azi, shape=r.shape, dtype=wp.float32)
 
@@ -140,7 +142,6 @@ class ImagingSonarSensor(Camera):
         self.sonar_grid.x_num = self.r.shape[0]
         self.sonar_grid.y_num = self.r.shape[1]
 
-        self.AR = self.hori_fov / self.vert_fov
         # Render tall enough to cover elevation +-vert_fov/2 across the whole
         # fan (pixels are square, and a pinhole's vertical extent for a fixed
         # elevation grows toward the fan edges); the binning kernels then drop
@@ -156,6 +157,10 @@ class ImagingSonarSensor(Camera):
         # range >= min_range; binning rejects what's closer than min_range.
         self._depth_near = sonar_scan_math.slant_range_near_depth(
             self.min_range, self.hori_res, self.vert_res, self._fx_px, self._fx_px)
+        self._fan_image = None
+        self._fan_display_image = None
+        self._fan_semantics_image = None
+        self._fan_stale = True
         
         super().__init__(prim_path=prim_path, 
                          name=name, 
@@ -375,6 +380,9 @@ class ImagingSonarSensor(Camera):
         self.focal_length = self.get_focal_length()
         horizontal_aper = 2 * self.focal_length * np.tan(np.deg2rad(self.hori_fov) / 2)
         self.set_horizontal_aperture(horizontal_aper)
+        # Explicitly set both apertures to the query render's aspect ratio;
+        # a viewport's aspect must never change the sonar elevation coverage.
+        self.set_vertical_aperture(horizontal_aper * self.vert_res / self.hori_res)
 
         # Isaac Sim 6.0.1 port (FIX for the world.play() SIGSEGV): the old
         # `pointcloud` COMPOSITE annotator crashes natively at play() on 6.0.1
@@ -821,7 +829,7 @@ class ImagingSonarSensor(Camera):
                         tvg_exponent: float = 0.0, # time-varied gain r^+m applied after the losses
                         speckle_looks: int = 0, # >0: Gamma(L) speckle (L=1 single-look) instead of 0.5+N(0, gau_noise_param)
                         speckle_cell: tuple = (1, 1), # speckle correlation cell in (range, azimuth) bins
-                        beam_fwhm_deg: float = 0.0, # >0: Gaussian azimuth beam-pattern blur with this FWHM
+                        beam_fwhm_deg: float = None, # None -> device response; 0 disables blur
                         sim_time: float = None, # sim time this scan is captured at (for
                                       # publisher header stamps); None if unknown/unused.
                         _skip_scan: bool = False, # internal: worker has already run scan() on
@@ -852,7 +860,7 @@ class ImagingSonarSensor(Camera):
             speckle_looks (int): >0 replaces the 0.5 + N(0, gau_noise_param) multiplier with
                                 fully developed speckle, Gamma(L, 1/L) (mean 1, contrast
                                 1/sqrt(L)), constant over speckle_cell (range, azimuth) bins.
-            beam_fwhm_deg (float): >0 blurs each range row along azimuth with a Gaussian of
+            beam_fwhm_deg (float): None uses the device beamwidth; >0 blurs each range row along azimuth with a Gaussian of
                                 this FWHM -- the beam pattern (e.g. the published
                                 azimuth beamwidth), applied before noise.
     
@@ -862,6 +870,9 @@ class ImagingSonarSensor(Camera):
 
         if normalizing_method is None:
             normalizing_method = getattr(self, "_normalizing_method", "range")
+        if beam_fwhm_deg is None:
+            beam_fwhm_deg = self.beam_fwhm_deg
+        self._applied_beam_fwhm_deg = float(beam_fwhm_deg or 0.0)
 
         if self.async_compute and not _skip_scan:
             # Main thread: scan (reads annotators) + hand off to the worker; the
@@ -1157,6 +1168,9 @@ class ImagingSonarSensor(Camera):
                       self.sonar_map
                   ]
                   )
+        # New sonar_map: the next get_sonar_fan_image reprojects it once,
+        # shared by the viewport and the ROS publisher.
+        self._fan_stale = True
         
         
         # Write data to the dir
@@ -1175,12 +1189,13 @@ class ImagingSonarSensor(Camera):
             # Skip in async mode: this pushes to the Isaac UI byte provider, which
             # must not be touched from the worker thread. ROS consumers read the
             # published sonar_map, not this in-Isaac viewport texture.
-            self._sonar_provider.set_bytes_data_from_gpu(self.make_sonar_image().ptr,
-                                                    [self.sonar_map.shape[1], self.sonar_map.shape[0]])
+            fan = self.get_sonar_fan_image(show_grid=True)
+            self._sonar_provider.set_bytes_data_from_gpu(fan.ptr,
+                                                       [fan.shape[1], fan.shape[0]])
             if self._segmentation:
+                fan_semantics = self.get_semantics_fan_image()
                 self._sonar_segmentation_provider.set_bytes_data_from_gpu(
-                    self.get_semantics_image().ptr,
-                    [self.sonar_semantics_image.shape[1], self.sonar_semantics_image.shape[0]])
+                    fan_semantics.ptr, [fan_semantics.shape[1], fan_semantics.shape[0]])
             # self.backend.schedule(write_image, f'sonar_{self.id}.png', data = self.make_sonar_image())        
             
         self.id += 1
@@ -1286,13 +1301,13 @@ class ImagingSonarSensor(Camera):
         self._async_thread = None
 
     def make_sonar_image(self):
-        """Convert processed sonar data to a viewable grayscale image.
+        """Convert processed sonar data to a polar grayscale image.
     
         Returns:
             wp.array: GPU array containing the sonar image (RGBA format)
     
         Note:
-            - Used internally for viewport display
+            - Polar rows/columns are range/bearing; use get_sonar_fan_image for viewing
             - Image dimensions match the sonar's polar binning resolution
         """
         # make_sonar_image writes all four channels (RGB + A=255) for every pixel
@@ -1310,6 +1325,64 @@ class ImagingSonarSensor(Camera):
             ]
         )
         return self.sonar_image
+
+    def _ensure_fan_buffers(self):
+        """Build the static fan projection once; no host readback per frame."""
+        if self._fan_image is not None:
+            return
+        range_span, beam_span, scale = sonar_scan_math.sonar_fan_lookup(
+            self.min_range, self.max_range, self.range_res, self.min_azi,
+            np.deg2rad(self.angular_res), self.r.shape[0], self.r.shape[1], self.hori_fov)
+        device = self.sonar_map.device
+        self._fan_range_span = wp.array(range_span, dtype=wp.int32, device=device)
+        self._fan_beam_span = wp.array(beam_span, dtype=wp.int32, device=device)
+        self._fan_guides = wp.array(
+            sonar_scan_math.sonar_fan_guides(range_span[..., 0] >= 0, self.max_range, self.hori_fov),
+            dtype=wp.uint8, device=device)
+        self._fan_metres_per_pixel = scale
+        self._fan_image = wp.zeros((*range_span.shape[:2], 4), dtype=wp.uint8, device=device)
+        self._fan_display_image = wp.zeros_like(self._fan_image)
+        self._fan_stale = True
+
+    def get_sonar_fan_image(self, show_grid: bool = False) -> wp.array:
+        """RGBA fan with equal metre scales; each pixel shows the brightest bin
+        it covers. Reprojected once per make_sonar_data frame.
+
+        show_grid returns a separate display copy with range rings and bearing
+        guides, so the plain image published to ROS never carries them."""
+        self._ensure_fan_buffers()
+        dim = self._fan_image.shape[:2]
+        if self._fan_stale:
+            wp.launch(make_sonar_fan_image, dim=dim,
+                      inputs=[self.sonar_map, self._fan_range_span, self._fan_beam_span],
+                      outputs=[self._fan_image], device=self.sonar_map.device)
+            self._fan_stale = False
+        if not show_grid:
+            return self._fan_image
+        wp.launch(overlay_sonar_fan_guides, dim=dim, inputs=[self._fan_guides, self._fan_image],
+                  outputs=[self._fan_display_image], device=self.sonar_map.device)
+        return self._fan_display_image
+
+    def get_semantics_fan_image(self) -> wp.array:
+        """Semantic labels on the same Cartesian fan as the intensity image:
+        each pixel labels the bin the intensity fan shows."""
+        self._ensure_fan_buffers()
+        if self._fan_semantics_image is None:
+            self._fan_semantics_image = wp.zeros(self._fan_image.shape, dtype=wp.uint8,
+                                                device=self.sonar_map.device)
+        wp.launch(make_semantics_fan_image, dim=self._fan_image.shape[:2],
+                  inputs=[self.sonar_map, self.get_semantics_image(),
+                          self._fan_range_span, self._fan_beam_span],
+                  outputs=[self._fan_semantics_image], device=self.sonar_map.device)
+        return self._fan_semantics_image
+
+    @property
+    def azimuth_beamwidth_deg(self) -> float:
+        """Azimuth resolving power of the published sonar data, in degrees:
+        the beam FWHM make_sonar_data last applied (the device's until the
+        first frame), never finer than the beam spacing. With no beam blur
+        the bins themselves set the resolution."""
+        return max(self._applied_beam_fwhm_deg, float(self.angular_res))
 
     # --- Upstream OceanSim 0.2 accessors (sonar_data == sonar_map) ----------
 
@@ -1497,62 +1570,35 @@ class ImagingSonarSensor(Camera):
 
 
     def make_sonar_viewport(self):
-        """Create an interactive viewport window for real-time sonar visualization.
-    
-        Note:
-            - Displays live sonar images when simulation is running
-            - Includes range and azimuth tick marks
-            - Window size is fixed at 800x800 pixels
-        """
+        """Show a metric fan without stretching its range/bearing geometry."""
         self.wrapped_ui_elements = []
-
-        range_tick_num = 10
-        range_tick = np.round(np.linspace(self.min_range, self.max_range, range_tick_num), 2)
-
-        azi_tick_num = 10
-        azi_tick = np.round(np.linspace(90-self.hori_fov/2, 90+self.hori_fov/2, azi_tick_num))
+        self._ensure_fan_buffers()
         self._sonar_provider = ui.ByteImageProvider()
         segmentation = getattr(self, "_segmentation", False)
-        # With segmentation the semantics panel sits beside the sonar image
-        # (upstream's 1440-wide layout); otherwise keep the single 800x800 view.
-        panel_w = 1440 if segmentation else 720
-        self._window = ui.Window(self._name, width=panel_w + 80, height=800, visible=True)
-        
+        image_h, image_w = self._fan_image.shape[:2]
+        # Fit a wide LF fan within a desktop window while retaining its aspect.
+        display_scale = min(1.0, 1000.0 / image_w)
+        view_w, view_h = int(image_w * display_scale), int(image_h * display_scale)
+        panel_w = view_w * (2 if segmentation else 1)
+        self._window = ui.Window(self._name, width=panel_w + 20, height=view_h + 100, visible=True)
         with self._window.frame:
-            with ui.ZStack(height=720, width = panel_w):
-                ui.Rectangle(style={"background_color": 0xFF000000})
-                ui.Label('Run the scenario for image to be received',
-                         style={'font_size': 55,'alignment': ui.Alignment.CENTER},
-                         word_wrap=True)
-                with ui.HStack(height=720, width=panel_w):
-                    sonar_image_provider = ui.ImageWithProvider(self._sonar_provider, 
-                                        style={"width": 720, 
-                                            "height": 720, 
-                                            "fill_policy" : ui.FillPolicy.STRETCH,
-                                            'alignment': ui.Alignment.CENTER})
+            with ui.VStack(spacing=4):
+                ui.Label(f"{self.acoustic_frequency / 1e6:g} MHz  |  "
+                         f"{self.hori_fov:g}\u00b0 x {self.vert_fov:g}\u00b0  |  "
+                         f"{self.min_range:g}\u2013{self.max_range:g} m", height=24)
+                with ui.HStack(height=view_h):
+                    sonar_image_provider = ui.ImageWithProvider(
+                        self._sonar_provider, width=view_w,
+                        style={"fill_policy": ui.FillPolicy.PRESERVE_ASPECT_FIT})
                     if segmentation:
                         self._sonar_segmentation_provider = ui.ByteImageProvider()
                         segmentation_image_provider = ui.ImageWithProvider(
-                            self._sonar_segmentation_provider,
-                            style={"width": 720,
-                                   "height": 720,
-                                   "fill_policy" : ui.FillPolicy.STRETCH,
-                                   'alignment': ui.Alignment.CENTER})
-                
-                # ui.Line(alignment=ui.Alignment.LEFT,
-                #         style={'border_width': 2,
-                #                 'color':ui.color.white })
-                # with ui.VGrid(row_height = 720/(range_tick_num-1)):
-                #     for i in range(range_tick_num-1):
-                #         with ui.ZStack():
-                #             ui.Rectangle(style={'border_color': ui.color.white, 'background_color': ui.color.transparent,'border_width': 0.05, 'margin': 0})
-                #             ui.Label(str(range_tick[i]) + ' m',style={'font_size': 15,'alignment': ui.Alignment.LEFT, 'margin':2})
-                # with ui.HGrid(column_width = 720/(azi_tick_num-1), direction=ui.Direction.RIGHT_TO_LEFT):
-                #     for i in range(azi_tick_num-1):
-                #         with ui.ZStack():
-                #             ui.Rectangle(style={'border_color': ui.color.white, 'background_color': ui.color.transparent,'border_width': 0.05, 'margin': 0})
-                #             ui.Label(str(azi_tick[i]) + "°",style={'font_size': 15,'alignment': ui.Alignment.RIGHT, 'margin':2})                           
-                # ui.Label(str(range_tick[-1]) +" m", style={'font_size': 15, "alignment":ui.Alignment.LEFT_BOTTOM, 'margin':2})
+                            self._sonar_segmentation_provider, width=view_w,
+                            style={"fill_policy": ui.FillPolicy.PRESERVE_ASPECT_FIT})
+                ui.Label("PORT / LEFT                         STARBOARD / RIGHT", height=22,
+                         alignment=ui.Alignment.CENTER)
+                ui.Label(f"Range rings: {self.max_range/4:g} m  |  sensor at bottom centre",
+                         height=22, alignment=ui.Alignment.CENTER)
         
         self.wrapped_ui_elements.append(sonar_image_provider)
         self.wrapped_ui_elements.append(self._sonar_provider)

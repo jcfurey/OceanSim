@@ -113,10 +113,15 @@ _OCULUS_SRC = ("Blueprint Subsea Oculus M-series product page "
                "(blueprintsubsea.com/oculus/oculus-m-series) and datasheet DA-148-P01443-10")
 _OCULUS_BODY = dict(mass=0.98, volume=_vol(0.98, 0.36), size=(0.062, 0.122, 0.124),
                     manufacturer="Blueprint Subsea")
+# beamwidth_h_deg (azimuth resolving power) per carrier band, as in liboculus
+# Constants.h (ros2_math.oculus_beamwidths): 375 kHz 2.0, 1.2 MHz 0.6,
+# 2.1 MHz 0.4 deg. The M3000d entries take theirs from datasheet rev 10. No
+# value is recorded for 750 kHz, so the M750d's low-frequency mode is unblurred.
 
 _add(PayloadSpec("oculus_m370s", "sonar", "Oculus M370s imaging sonar (375 kHz)",
                  params=dict(hori_fov_deg=130.0, vert_fov_deg=20.0, n_beams=256, frequency_hz=375e3,
-                             min_range=0.2, max_range=200.0, working_range=20.0, range_res=0.008),
+                             min_range=0.2, max_range=200.0, working_range=20.0, range_res=0.008,
+                             beamwidth_h_deg=2.0),
                  sources=_OCULUS_SRC, **_OCULUS_BODY))
 _add(PayloadSpec("oculus_m750d", "sonar", "Oculus M750d imaging sonar, low-frequency mode (750 kHz)",
                  params=dict(hori_fov_deg=130.0, vert_fov_deg=20.0, n_beams=512, frequency_hz=750e3,
@@ -125,15 +130,30 @@ _add(PayloadSpec("oculus_m750d", "sonar", "Oculus M750d imaging sonar, low-frequ
 _add(PayloadSpec("oculus_m750d_hf", "sonar",
                  "Oculus M750d imaging sonar, high-frequency mode (1.2 MHz)",
                  params=dict(hori_fov_deg=130.0, vert_fov_deg=20.0, n_beams=512, frequency_hz=1.2e6,
-                             min_range=0.1, max_range=40.0, working_range=10.0, range_res=0.0025),
+                             min_range=0.1, max_range=40.0, working_range=10.0, range_res=0.0025,
+                             beamwidth_h_deg=0.6),
                  sources=_OCULUS_SRC, **_OCULUS_BODY))
 _add(PayloadSpec("oculus_m1200d", "sonar", "Oculus M1200d imaging sonar, low-frequency mode (1.2 MHz)",
                  params=dict(hori_fov_deg=130.0, vert_fov_deg=20.0, n_beams=512, frequency_hz=1.2e6,
-                             min_range=0.1, max_range=40.0, working_range=10.0, range_res=0.0025),
+                             min_range=0.1, max_range=40.0, working_range=10.0, range_res=0.0025,
+                             beamwidth_h_deg=0.6),
                  sources=_OCULUS_SRC, **_OCULUS_BODY))
 _add(PayloadSpec("oculus_m1200d_hf", "sonar", "Oculus M1200d imaging sonar, high-frequency mode (2.1 MHz)",
                  params=dict(hori_fov_deg=60.0, vert_fov_deg=12.0, n_beams=512, frequency_hz=2.1e6,
-                             min_range=0.1, max_range=10.0, working_range=5.0, range_res=0.0025),
+                             min_range=0.1, max_range=10.0, working_range=5.0, range_res=0.0025,
+                             beamwidth_h_deg=0.4),
+                 sources=_OCULUS_SRC, **_OCULUS_BODY))
+# DA-148-P01443-10 (Feb 2026): beamwidth is the resolving power, not
+# FOV / output beam count. Both modes support up to 512 output beams.
+_add(PayloadSpec("oculus_m3000d", "sonar", "Oculus M3000d imaging sonar, low-frequency mode (1.2 MHz)",
+                 params=dict(hori_fov_deg=130.0, vert_fov_deg=20.0, n_beams=512, frequency_hz=1.2e6,
+                             min_range=0.1, max_range=30.0, working_range=10.0, range_res=0.0025,
+                             beamwidth_h_deg=0.6, rate_hz=40.0),
+                 sources=_OCULUS_SRC, **_OCULUS_BODY))
+_add(PayloadSpec("oculus_m3000d_hf", "sonar", "Oculus M3000d imaging sonar, high-frequency mode (3.0 MHz)",
+                 params=dict(hori_fov_deg=40.0, vert_fov_deg=20.0, n_beams=512, frequency_hz=3.0e6,
+                             min_range=0.1, max_range=5.0, working_range=5.0, range_res=0.002,
+                             beamwidth_h_deg=0.25, rate_hz=40.0),
                  sources=_OCULUS_SRC, **_OCULUS_BODY))
 _C550D_SRC = ("Blueye Robotics' Oculus C550d integration page (blueyerobotics.com) and Deep "
               "Trekker's C550d page; not listed on Blueprint's own site")

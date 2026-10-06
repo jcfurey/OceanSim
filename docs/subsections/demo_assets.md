@@ -64,11 +64,31 @@ Use `docker logs -f oceansim-gui` for logs and `docker stop oceansim-gui` to clo
 
 The demo preset in `demo/revolution.json` uses CPU PhysX, GPU RTX rendering, a
 960x540 underwater camera, and a 960-pixel sonar render product. Sonar output
-uses a 12 m working range, 2.5 cm range bins and 0.5 degree beam spacing. The
-vehicle still uses the registry's estimated hydrodynamics and six thrusters.
+models the Oculus M3000d at 1.2 MHz: a 130° x 20° fan, 0.1 m minimum range,
+12 m working range, 512 output beams and a 0.6° beam response. Range bins
+coarsen to approximately 12 mm at this working range (1024 sample budget).
+The sensor window shows a Cartesian fan with equal distance scales, range rings
+every 3 m, sensor at bottom centre, port left and starboard right. Each pixel
+shows the brightest range/bearing bin it covers, so a one-bin echo is never
+dropped. The OmniGraph `ImagingSonar/image` topic carries the same fan without
+range rings. ROS `ProjectedSonarImage` retains
+its range-major data for `sonar_image_proc`. The vehicle still uses the registry's
+estimated hydrodynamics and six thrusters.
 Use `--camera-resolution 1920 1080` or your own `--config` for different fidelity.
 The preset reads water level from the bundled scene metadata; MHL scenes
 without that metadata keep the original Z=1.43389 surface height.
+
+For the M3000d's 3 MHz inspection mode, use a config with
+`"payloads": ["oculus_m3000d_hf"]` and `"sonar_params": {"max_range": 5.0}`.
+It has a 40° x 20° aperture, 0.1 m minimum range, 2 mm best range resolution
+and a 0.25° beam response. The 1.2 MHz mode permits up to 30 m; 3 MHz permits
+up to 5 m. These mode specifications follow
+[Blueprint Subsea's February 2026 datasheet, revision 10](https://www.blueprintsubsea.com/downloads/oculus/DA-148-P01443-10.pdf).
+The sample budget can coarsen range bins; set `sonar_params.range_res` explicitly
+to use the device's best resolution at a higher simulation cost. Set
+`sonar_params.model_params.beam_fwhm_deg` to zero to disable the approximate
+Gaussian beam response. Sonar presets use global ping normalisation so relative
+echo strength is preserved across ranges; explicit model parameters override it.
 
 Check live ROS output and save camera/sonar captures from inside the service:
 

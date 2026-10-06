@@ -9,10 +9,11 @@ import math
 # resolution coarsens with the range setting (fixed sample count), and the
 # sim's binning cost grows with the bin count.
 MAX_RANGE_BINS = 1024
+DEFAULT_SONAR_PAYLOAD = "oculus_m3000d"
 
 
 def sonar_kwargs(payload, overrides=None):
-    """ImagingSonarSensor / RtxAcousticSensor arguments for a sonar payload.
+    """ImagingSonarSensor arguments for a sonar payload.
 
     max_range is the payload's default working range (an operator setting),
     not the device limit; range_res is the device's resolution or
@@ -30,6 +31,8 @@ def sonar_kwargs(payload, overrides=None):
         vert_fov=float(p["vert_fov_deg"]),
         range_res=max(float(p["range_res"]), max_range / MAX_RANGE_BINS),
         angular_res=float(p["hori_fov_deg"]) / float(p["n_beams"]),
+        acoustic_frequency=sonar_frequency(payload),
+        beam_fwhm_deg=float(p.get("beamwidth_h_deg", 0.0)),
     )
     for src, dst in (("hori_fov_deg", "hori_fov"), ("vert_fov_deg", "vert_fov"),
                      ("min_range", "min_range"), ("range_res", "range_res"),
@@ -39,11 +42,35 @@ def sonar_kwargs(payload, overrides=None):
     if kw["max_range"] > float(p["max_range"]):
         raise ValueError(f"{payload.name}: max_range {kw['max_range']} m exceeds the device's "
                          f"{p['max_range']} m")
+    if not (0.0 <= kw["min_range"] < kw["max_range"]):
+        raise ValueError(f"{payload.name}: require 0 <= min_range < max_range")
+    if not (0.0 < kw["hori_fov"] < 180.0 and 0.0 < kw["vert_fov"] < 180.0):
+        raise ValueError(f"{payload.name}: FOV must be in (0, 180) degrees")
+    if kw["range_res"] <= 0.0 or kw["angular_res"] <= 0.0:
+        raise ValueError(f"{payload.name}: range_res and angular_res must be positive")
     return kw
 
 
 def sonar_frequency(payload):
     return float(payload.params["frequency_hz"])
+
+
+def sonar_model_params(payload, overrides=None):
+    """make_sonar_data settings for a sonar payload; explicit model settings
+    (the config's sonar_params.model_params) take precedence.
+
+    Every preset normalises a ping by its global maximum: a range-row maximum
+    promotes every weak echo to the same brightness and hides relative target
+    strength and shadows. A payload with a published azimuth resolving power
+    (beamwidth_h_deg) is blurred by a Gaussian with that FWHM, which integrates
+    neighbouring output beams rather than giving every bin independent,
+    infinitely narrow resolving power; without one, beams are not blurred.
+    """
+    params = {"normalizing_method": "all"}
+    if "beamwidth_h_deg" in payload.params:
+        params["beam_fwhm_deg"] = float(payload.params["beamwidth_h_deg"])
+    params.update(overrides or {})
+    return params
 
 
 def dvl_kwargs(payload):
