@@ -212,3 +212,83 @@ def test_rate_gate_due_predicts_ready_without_consuming(m):
 def test_rate_gate_due_always_true_when_unthrottled(m):
     g = m.RateGate(0)
     assert all(g.due(t) and g.ready(t) for t in (0.0, 0.0, 1e-9, 5.0))
+
+
+# ------------------------------------------------- sonar -> LaserScan / PointCloud2
+
+def test_sonar_bearings_match_beam_directions(m):
+    b = m.sonar_bearings(130.0, 520, 0.25)
+    assert b[0] == pytest.approx(math.radians(-65.0 + 0.125))
+    assert np.allclose(np.diff(b), math.radians(0.25))
+    dirs = m.sonar_beam_directions(130.0, 520, 0.25)
+    assert np.allclose([math.atan2(-y, z) for (_, y, z) in dirs], b)
+    assert m.sonar_bearings(130.0, 1).tolist() == [0.0]
+
+
+def _noisy_grid(rng, n_range=200, n_beams=64):
+    """Per-row normalised (every row max == 1) Rayleigh clutter, like the
+    default "range" normalisation of a noise-only scene."""
+    g = rng.rayleigh(0.1, (n_range, n_beams)).astype(np.float32)
+    return g / g.max(axis=1, keepdims=True)
+
+
+def test_detections_ignore_per_row_normalised_noise(m):
+    """With "range" normalisation every row peaks at 1.0, so a fixed threshold
+    would 'detect' every row; the row-median test must not."""
+    rng = np.random.default_rng(0)
+    g = _noisy_grid(rng)
+    assert (g.max(axis=1) == 1.0).all()
+    assert m.sonar_detections(g).mean() < 0.002
+
+
+def test_detections_find_targets_in_clutter(m):
+    rng = np.random.default_rng(1)
+    g = _noisy_grid(rng) * 0.1
+    g[50, 10:14] = 1.0            # a target 4 beams wide
+    g[120, 40] = 0.8
+    det = m.sonar_detections(g)
+    assert det[50, 10:14].all() and det[120, 40]
+    assert det.sum() <= 6 + 2
+
+
+def test_detections_skip_a_row_filled_by_seafloor(m):
+    g = np.zeros((10, 32), np.float32)
+    g[6, :] = 0.9                 # flat floor band across the whole fan
+    g[3, 5] = 0.9                 # an obstacle
+    det = m.sonar_detections(g)
+    assert det[3, 5] and not det[6].any()
+
+
+def test_detections_floor_rejects_weak_returns(m):
+    g = np.zeros((4, 8), np.float32)
+    g[1, 2] = 0.1                 # infinitely above a zero median, but weak
+    g[2, 3] = 0.5
+    det = m.sonar_detections(g, floor=0.2)
+    assert not det[1, 2] and det[2, 3]
+
+
+def test_first_returns_take_nearest_detection_per_beam(m):
+    mask = np.zeros((5, 4), bool)
+    mask[3, 0] = mask[1, 0] = True
+    mask[4, 2] = True
+    ranges = [1.0, 2.0, 3.0, 4.0, 5.0]
+    r, rows = m.sonar_first_returns(mask, ranges)
+    assert r.dtype == np.float32
+    assert r.tolist() == [2.0, float("inf"), 5.0, float("inf")]
+    assert rows.tolist() == [1, -1, 4, -1]
+
+
+def test_detection_points_on_sonar_plane(m):
+    g = np.zeros((3, 3), np.float32)
+    mask = np.zeros((3, 3), bool)
+    g[2, 0], mask[2, 0] = 0.7, True       # starboard beam
+    g[1, 2], mask[1, 2] = 0.9, True       # port beam
+    ranges = [1.0, 2.0, 3.0]
+    bearings = np.radians([-30.0, 0.0, 30.0])
+    pts = m.sonar_detection_points(g, mask, ranges, bearings)
+    assert pts.dtype == np.float32 and pts.shape == (2, 4)
+    by_i = {round(float(p[3]), 3): p for p in pts}
+    assert np.allclose(by_i[0.7][:3], [3 * math.cos(math.radians(30)), -1.5, 0.0], atol=1e-6)
+    assert np.allclose(by_i[0.9][:3], [2 * math.cos(math.radians(30)), 1.0, 0.0], atol=1e-6)
+    empty = m.sonar_detection_points(g, np.zeros_like(mask), ranges, bearings)
+    assert empty.shape == (0, 4)

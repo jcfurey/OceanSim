@@ -33,9 +33,20 @@ were tuned against real data.
 - Opt-in sonar model terms for `make_sonar_data` / `sonar_params.model_params`, all
   off by default: spreading / absorption / TVG range gain, Gamma speckle with a
   correlation cell, Gaussian beam-pattern blur
+- ROS control mode `dynamic velocity control`: cmd_vel tracked by a PI loop with
+  PhysX-damping feedforward through forces, so buoyancy / drag / collisions still
+  act. `control_params` gains `ros2_mode`, topic names, `stamped_cmd_vel`
+  (TwistStamped) and `command_timeout`
+- Navigation outputs (opt-in): sonar LaserScan / PointCloud2 from a row-median
+  detector, `odom -> base_link` TF from ground truth, static `map -> odom`; Nav2 /
+  EasyNav / 3D notes in the bringup guide
 
 ### Fixed
 
+- ROS force control applies the Wrench in N / N·m through a rigid-body view.
+  `PhysxForceAPI` defaulted to acceleration mode, so newtons were read as m/s²
+  (26x too strong on the 26 kg Revolution), and upstream found it stopped the IMU
+- OmniGraph `/cmd_vel` subscriber zeroes the command after 1 s without a message
 - DVL: lever-arm velocity (`v + omega x r`), altitude from the beams' vertical
   component, twist covariance from the beam noise; barometer variance reported
 - OmniGraph ROS: IMU orientation order (xyzw), planar 32FC1 depth, image frame ids

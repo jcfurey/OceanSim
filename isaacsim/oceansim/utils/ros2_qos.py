@@ -58,6 +58,9 @@ TOPIC_CONTRACTS = [
     Contract("/oceansim/robot/dvl/twist", "pub", SENSOR_DATA, "robot_localization", SENSOR_DATA),
     Contract("/oceansim/robot/pressure", "pub", SENSOR_DATA, "depth consumer", SENSOR_DATA),
     Contract("/oceansim/robot/sonar", "pub", SENSOR_DATA, "sonar_image_proc", SENSOR_DATA),
+    # Nav2 costmap observation sources subscribe with SensorDataQoS.
+    Contract("/oceansim/robot/sonar/scan", "pub", SENSOR_DATA, "Nav2 costmap", SENSOR_DATA),
+    Contract("/oceansim/robot/sonar/points", "pub", SENSOR_DATA, "Nav2 costmap", SENSOR_DATA),
     Contract("/robot_description", "pub", LATCHED, "robot_state_publisher / RViz", LATCHED),
     # robot_state_publisher subscribes to joint_states with the rclcpp default
     # (RELIABLE) -- a BEST_EFFORT joint_states publisher would silently never be

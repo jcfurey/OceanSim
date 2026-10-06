@@ -67,10 +67,12 @@ their QoS is compatible.
 | `/oceansim/robot/dvl/twist` | geometry_msgs/TwistWithCovarianceStamped | pub | sensor |
 | `/oceansim/robot/pressure` | sensor_msgs/FluidPressure | pub | sensor |
 | `/oceansim/robot/sonar` | marine_acoustic_msgs/ProjectedSonarImage | pub | sensor |
+| `/oceansim/robot/sonar/scan` | sensor_msgs/LaserScan (opt-in, §7) | pub | sensor |
+| `/oceansim/robot/sonar/points` | sensor_msgs/PointCloud2 (opt-in, §7) | pub | sensor |
 | `/robot_description` | std_msgs/String | pub | **latched** (transient-local) |
 | `/joint_states` | sensor_msgs/JointState | pub | **reliable** (robot_state_publisher) |
 | `/oceansim/robot/joint_command` | sensor_msgs/JointState | sub | sensor |
-| `/oceansim/robot/vel_cmd` | geometry_msgs/Twist | sub | reliable |
+| `/oceansim/robot/vel_cmd` | geometry_msgs/Twist (or TwistStamped, §6) | sub | reliable |
 | `/oceansim/robot/force_cmd` | geometry_msgs/Wrench | sub | reliable |
 
 Sensor streams are **best-effort**: subscribe best-effort (RViz / `sonar_image_proc`
@@ -103,3 +105,116 @@ ros2 topic pub --once /oceansim/robot/joint_command sensor_msgs/msg/JointState \
 Joint manipulation is active only when the loaded asset is an articulation with
 DOFs (a URDF, or a USD that defines joints); a plain rigid-body hull makes the
 joint topics a graceful no-op.
+
+## 6. Vehicle control modes (ROS control)
+
+`control_mode: "ROS control"` subscribes to the velocity and force topics; the
+config's `control_params` (or the GUI's *ROS2 Control Mode* dropdown) picks how
+commands move the vehicle:
+
+| `ros2_mode` | Input | What happens |
+|---|---|---|
+| `velocity control` (default) | Twist, body frame | Sets the body velocity every step (kinematic). Exact tracking, but buoyancy, drag and collision response are overwritten. |
+| `dynamic velocity control` | Twist, body frame | A PI loop with damping feedforward turns the command into force / torque (`ros2_control_math.BodyVelocityPI`), so the physics still acts. Use this to tune controllers that must transfer to a real vehicle. |
+| `force control` | Wrench, body frame, N / N·m | Applied at the centre of mass each step. |
+
+Forces go through a rigid-body tensor view in newtons. The old `PhysxForceAPI`
+path defaulted to *acceleration* mode, so a Wrench was read as m/s².
+
+Other `control_params`:
+- `vel_topic` / `force_topic`: topic names, e.g. `"/cmd_vel"` for Nav2.
+- `stamped_cmd_vel: true`: subscribe `TwistStamped`. Use it with Nav2's
+  `enable_stamped_cmd_vel` (the default from Kilted on).
+- `command_timeout`: dead-man timeout in seconds (default 2). A silent link
+  zeroes the command; the dynamic mode then actively holds zero velocity.
+- `velocity_pi`: gain overrides (`kp_lin`, `ki_lin`, `kp_ang`, `ki_ang`,
+  `i_limit_*`, `damping_*`). By default the damping feedforward is the body's
+  PhysX damping and `ki = (kp + damping)^2 / 8`.
+- `max_linear_vel`, `max_angular_vel`, `max_force`, `max_torque`: magnitude clamps.
+
+## 7. Navigation (Nav2, EasyNav, 3D)
+
+OceanSim provides the simulator side; the navigation stack runs in your ROS
+workspace. These options are off by default; turn them on under `publisher`:
+
+```json
+{
+  "control_mode": "ROS control",
+  "control_params": {"ros2_mode": "dynamic velocity control", "vel_topic": "/cmd_vel"},
+  "publish_static_tf": true,
+  "publisher": {
+    "publish_odom_tf": true,
+    "publish_map_odom_tf": true,
+    "publish_sonar_scan": true,
+    "publish_sonar_cloud": true
+  }
+}
+```
+
+- **`publish_odom_tf`**: broadcasts `odom → base_link` from the ground-truth
+  pose with every odometry message. Leave it off if `robot_localization`
+  publishes that transform.
+- **`publish_map_odom_tf`**: a static identity `map → odom`, for stacks that
+  expect a `map` frame when nothing localises.
+- **`publish_sonar_scan`**: a LaserScan with the nearest sonar detection per
+  beam. Beams with no detection are `+inf`, which lets costmaps clear along them.
+- **`publish_sonar_cloud`**: a PointCloud2 (x, y, z, intensity) of every
+  detection.
+
+**How sonar detections work.** A cell counts as a detection when it is at least
+`sonar_detect_factor` (default 5) times the median of its range row and at least
+`sonar_detect_floor` (default 0.2). That works with either sonar normalisation,
+and a flat seafloor band across the whole fan is not reported as an obstacle.
+
+**Sonar points are placed at zero elevation**, on the sonar's horizontal plane.
+An imaging sonar measures range and bearing, not elevation, so this is what a
+real one gives you. The scan frame must be x-forward / z-up; the runner's sonar
+static TF is. For true 3D points, use the camera depth: `/oceansim/robot/depth`
+and `/oceansim/robot/camera_info` go through `depth_image_proc` to make a cloud.
+
+**Nav2** plans in 2D (x, y, yaw). A vehicle that holds depth fits: both velocity
+modes take the Twist's `linear.z` (Nav2 sends 0). Note that the dynamic mode
+holds zero heave *velocity*, not depth, so depth can drift slowly. The settings
+that matter for OceanSim (a sketch; not run in CI):
+
+```yaml
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: true            # OceanSim publishes /clock
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        observation_sources: sonar
+        sonar:
+          topic: /oceansim/robot/sonar/scan
+          data_type: "LaserScan"
+          marking: true
+          clearing: true
+          inf_is_valid: true
+          # Heights are checked in the global frame. Underwater, z is negative,
+          # and the defaults (0 to 2 m) drop every point.
+          min_obstacle_height: -1000.0
+          max_obstacle_height: 1000.0
+controller_server:
+  ros__parameters:
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      motion_model: "Omni"          # ROVs move sideways as well
+```
+
+**EasyNav** (URJC's representation-agnostic ROS 2 navigation system) consumes
+the same inputs: TF, odometry, LaserScan / PointCloud2 and `cmd_vel`. Its 3D
+representations (Octomap, NavMap meshes) model navigable *surfaces*, though,
+not free water volume.
+
+**Full 3D** (volumetric) navigation needs a 3D map and planner from elsewhere,
+e.g. an OctoMap or voxel map built from the camera depth cloud, with an OMPL
+planner. The simulator side is already there:
+- the Twist's `linear.z` and angular rates are honoured in both velocity modes;
+- the camera depth gives true 3D points;
+- odometry, TF and the clock are published as above.
+

@@ -19,7 +19,14 @@ Topic (default)                   Message type                                So
 ``/oceansim/robot/dvl/twist``     ``geometry_msgs/TwistWithCovarianceStamped``  ``DVLsensor.get_linear_vel()``
 ``/oceansim/robot/pressure``      ``sensor_msgs/FluidPressure``               ``BarometerSensor.get_pressure()``
 ``/oceansim/robot/sonar``         ``marine_acoustic_msgs/ProjectedSonarImage``  ``ImagingSonarSensor``
+``/oceansim/robot/sonar/scan``    ``sensor_msgs/LaserScan`` (opt-in)          nearest sonar detection per beam
+``/oceansim/robot/sonar/points``  ``sensor_msgs/PointCloud2`` (opt-in)        all sonar detections (z = 0)
+``/tf`` odom -> base_link          ``tf2_msgs/TFMessage`` (opt-in)             ground-truth pose (as odom)
 ================================  ==========================================  =================================
+
+The opt-in sonar scan / cloud and TF feed navigation stacks (Nav2 costmaps):
+see ``publish_sonar_scan`` / ``publish_sonar_cloud`` / ``publish_odom_tf`` /
+``publish_map_odom_tf`` in ``DEFAULT_CONFIG``.
 
 The message types for odom / imu / dvl / pressure deliberately match what
 ``robot_localization`` and the ``sonar_image_proc`` / ``sonar_proc`` pipelines
@@ -125,6 +132,8 @@ class OceanSimSensorPublisher:
         "dvl_topic": "/oceansim/robot/dvl/twist",
         "baro_topic": "/oceansim/robot/pressure",
         "sonar_topic": "/oceansim/robot/sonar",
+        "sonar_scan_topic": "/oceansim/robot/sonar/scan",
+        "sonar_cloud_topic": "/oceansim/robot/sonar/points",
         "clock_topic": "/clock",
         "robot_description_topic": "/robot_description",
         "joint_states_topic": "/joint_states",
@@ -163,6 +172,28 @@ class OceanSimSensorPublisher:
         # sonar_image_proc need the sensor frames in the TF tree). The transforms
         # themselves are supplied by the runner via "static_transforms".
         "publish_static_tf": False,
+        # Navigation (Nav2 / EasyNav ...). All OFF by default.
+        # publish_odom_tf: broadcast odom -> base_link with every odometry
+        # message (ground truth). Leave off when robot_localization (or anything
+        # else) publishes that transform.
+        "publish_odom_tf": False,
+        # publish_map_odom_tf: a static identity map -> odom, for stacks that
+        # want a map frame when nothing localises (ground-truth odom == map).
+        "publish_map_odom_tf": False,
+        "map_frame_id": "map",
+        # Sonar obstacle outputs, published with the sonar image (sonar_rate):
+        # LaserScan of the nearest detection per beam (+inf where none, so
+        # costmaps can clear) and a PointCloud2 of every detection. Detections
+        # use ros2_math.sonar_detections (cell >= sonar_detect_factor x its range
+        # row's median and >= sonar_detect_floor). Points lie on the sonar's
+        # horizontal plane: an imaging sonar has no elevation measurement. The
+        # frame must be x-forward / z-up (the runner's sonar static TF is);
+        # sonar_scan_frame_id overrides it (None -> sonar_frame_id).
+        "publish_sonar_scan": False,
+        "publish_sonar_cloud": False,
+        "sonar_scan_frame_id": None,
+        "sonar_detect_factor": 5.0,
+        "sonar_detect_floor": 0.2,
         # sonar acoustic params (used to fill ProjectedSonarImage.ping_info)
         "sound_speed": 1500.0,
         # Explicit override (Hz) for the sonar acoustic carrier reported in
@@ -194,6 +225,10 @@ class OceanSimSensorPublisher:
         self._dvl_pub = None
         self._baro_pub = None
         self._sonar_pub = None
+        self._sonar_scan_pub = None    # opt-in LaserScan from sonar detections
+        self._sonar_cloud_pub = None   # opt-in PointCloud2 from sonar detections
+        self._pc2_fields = None
+        self._tf_broadcaster = None    # opt-in odom -> base_link
         self._clock_pub = None
         self._robot_desc_pub = None    # latched /robot_description (URDF)
         self._joint_state_pub = None   # /joint_states from the articulation
@@ -271,6 +306,24 @@ class OceanSimSensorPublisher:
             except Exception as e:  # pragma: no cover
                 self._node.get_logger().warn(
                     f"sonar publisher disabled (marine_acoustic_msgs missing?): {e}")
+            if self._cfg["publish_sonar_scan"]:
+                from sensor_msgs.msg import LaserScan
+                self._sonar_scan_pub = self._node.create_publisher(
+                    LaserScan, self._cfg["sonar_scan_topic"], _sensor_qos(depth=2))
+            if self._cfg["publish_sonar_cloud"]:
+                from sensor_msgs.msg import PointCloud2, PointField
+                self._sonar_cloud_pub = self._node.create_publisher(
+                    PointCloud2, self._cfg["sonar_cloud_topic"], _sensor_qos(depth=2))
+                self._pc2_fields = [
+                    PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1)
+                    for i, n in enumerate(("x", "y", "z", "intensity"))]
+
+        if self._cfg["publish_odom_tf"]:
+            try:
+                from tf2_ros import TransformBroadcaster
+                self._tf_broadcaster = TransformBroadcaster(self._node)
+            except Exception as e:  # pragma: no cover - tf2_ros not installed
+                self._node.get_logger().warn(f"odom TF disabled (tf2_ros unavailable): {e}")
 
         self._setup_robot_description()
         self._setup_joints()
@@ -405,8 +458,12 @@ class OceanSimSensorPublisher:
         {child_frame_id, translation:[x,y,z], rotation_wxyz:[w,x,y,z]} expressed
         in the robot base frame (the sensors are children of the robot prim, so
         their local mount pose is exactly base_link->sensor)."""
-        transforms = self._cfg.get("static_transforms", [])
-        if not self._cfg.get("publish_static_tf") or not transforms:
+        transforms = list(self._cfg.get("static_transforms", [])
+                          if self._cfg.get("publish_static_tf") else [])
+        if self._cfg.get("publish_map_odom_tf"):
+            transforms.append({"parent_frame_id": self._cfg["map_frame_id"],
+                               "child_frame_id": self._cfg["odom_frame_id"]})
+        if not transforms:
             return
         try:
             from tf2_ros import StaticTransformBroadcaster
@@ -425,12 +482,13 @@ class OceanSimSensorPublisher:
         stamp = self._stamp(0.0)
         msgs = []
         for t in transforms:
+            parent = t.get("parent_frame_id", base)
             child = t.get("child_frame_id")
-            if not child or child == base:
+            if not child or child == parent:
                 continue  # skip identity / unnamed (e.g. sensors reported in base_link)
             ts = TransformStamped()
             ts.header.stamp = stamp
-            ts.header.frame_id = base
+            ts.header.frame_id = parent
             ts.child_frame_id = child
             tr = t.get("translation", [0.0, 0.0, 0.0])
             ts.transform.translation.x = float(tr[0])
@@ -445,14 +503,18 @@ class OceanSimSensorPublisher:
         if msgs:
             self._static_tf_broadcaster.sendTransform(msgs)
             self._node.get_logger().info(
-                f"published {len(msgs)} static transform(s) from {base}: "
-                f"{[m.child_frame_id for m in msgs]}")
+                f"published {len(msgs)} static transform(s): "
+                f"{[(m.header.frame_id, m.child_frame_id) for m in msgs]}")
 
     # --------------------------------------------------------------- per-step
     def sonar_due(self, sim_time: float) -> bool:
         """True if publish(sim_time) will send a sonar image -- so the runner
         can scan only on publish ticks (the scan feeds nothing else headless)."""
-        return self._sonar_pub is not None and self._sonar_gate.due(sim_time)
+        return self._sonar_outputs() and self._sonar_gate.due(sim_time)
+
+    def _sonar_outputs(self):
+        return (self._sonar_pub is not None or self._sonar_scan_pub is not None
+                or self._sonar_cloud_pub is not None)
 
     def publish(self, sim_time: float):
         """Publish all due sensor messages for the current sim time (seconds)."""
@@ -472,7 +534,7 @@ class OceanSimSensorPublisher:
             self._safe(self._publish_dvl, stamp)
         if self._baro_pub is not None and self._baro_gate.ready(sim_time):
             self._safe(self._publish_baro, stamp)
-        if self._sonar_pub is not None and self._sonar_gate.ready(sim_time):
+        if self._sonar_outputs() and self._sonar_gate.ready(sim_time):
             self._safe(self._publish_sonar, stamp)
         if self._joint_state_pub is not None and self._joint_state_gate.ready(sim_time):
             self._safe(self._publish_joint_state, stamp)
@@ -645,6 +707,16 @@ class OceanSimSensorPublisher:
         msg.twist.covariance = self._diag6(1e-2, 1e-2, 1e-2, 1e-2, 1e-2, 1e-2)
         self._odom_pub.publish(msg)
 
+        if self._tf_broadcaster is not None:
+            from geometry_msgs.msg import TransformStamped
+            ts = TransformStamped()
+            ts.header = msg.header
+            ts.child_frame_id = msg.child_frame_id
+            p = msg.pose.pose.position
+            ts.transform.translation.x, ts.transform.translation.y, ts.transform.translation.z = p.x, p.y, p.z
+            ts.transform.rotation = msg.pose.pose.orientation
+            self._tf_broadcaster.sendTransform(ts)
+
     def _publish_imu(self, stamp, sim_time):
         from sensor_msgs.msg import Imu
         _, quat, lin_vel_w, ang_vel_w = self._robot_state()
@@ -754,9 +826,6 @@ class OceanSimSensorPublisher:
         returns the RGBA viewport texture (shape ``(n_range, n_azimuth, 4)``),
         not the per-beam intensities the sonar pipeline expects.
         """
-        from marine_acoustic_msgs.msg import (
-            ProjectedSonarImage, PingInfo, SonarImageData)
-
         # get_sonar_map_np() returns (capture_sim_time, grid): capture_sim_time
         # is the sim time the frame was actually scanned at, which in async mode
         # can lag the ambient sim_time passed to publish() if the worker is
@@ -778,6 +847,14 @@ class OceanSimSensorPublisher:
         # (n_range, n_azimuth, 3) vec3 grid; channel 2 is intensity in [0, 1].
         if grid.ndim != 3 or grid.shape[2] < 3 or grid.size == 0:
             return
+        if self._sonar_pub is not None:
+            self._publish_sonar_image(grid, stamp)
+        if self._sonar_scan_pub is not None or self._sonar_cloud_pub is not None:
+            self._publish_sonar_detections(grid, stamp)
+
+    def _publish_sonar_image(self, grid, stamp):
+        from marine_acoustic_msgs.msg import (
+            ProjectedSonarImage, PingInfo, SonarImageData)
         # marine_acoustic_msgs SonarImageData is RANGE-major: element (range r,
         # beam b) lives at flat index r*n_beams + b. This matches sonar_image_proc
         # (sonar_image_msg_interface.h), sonar_proc, and the real Oculus driver
@@ -828,6 +905,68 @@ class OceanSimSensorPublisher:
         data.data = ros2_math.uint8_payload(img8)
         msg.image = data
         self._sonar_pub.publish(msg)
+
+    def _publish_sonar_detections(self, grid, stamp):
+        """LaserScan (nearest detection per beam) and / or PointCloud2 (every
+        detection) from the sonar intensity grid, for navigation costmaps."""
+        intensity = grid[:, :, 2]
+        n_range, n_beams = intensity.shape
+        min_range, max_range = self._sonar.get_range()
+        hori_fov, _ = self._sonar.get_fov()
+        ranges, bearings = self._sonar_polar_axes(n_range, n_beams, min_range, max_range, hori_fov)
+        det = ros2_math.sonar_detections(intensity, self._cfg["sonar_detect_factor"],
+                                         self._cfg["sonar_detect_floor"])
+        frame = self._cfg.get("sonar_scan_frame_id") or self._cfg["sonar_frame_id"]
+
+        if self._sonar_scan_pub is not None:
+            from sensor_msgs.msg import LaserScan
+            first, rows = ros2_math.sonar_first_returns(det, ranges)
+            hit = rows >= 0
+            first_i = np.zeros(n_beams, dtype=np.float32)
+            first_i[hit] = intensity[rows[hit], np.nonzero(hit)[0]]
+            scan = LaserScan()
+            scan.header.stamp = stamp
+            scan.header.frame_id = frame
+            scan.angle_min = float(bearings[0])
+            scan.angle_max = float(bearings[-1])
+            scan.angle_increment = float(bearings[1] - bearings[0]) if n_beams > 1 else 0.0
+            rate = float(self._cfg["sonar_rate"])
+            scan.scan_time = 1.0 / rate if rate > 0.0 else 0.0
+            scan.time_increment = 0.0
+            scan.range_min = float(min_range)
+            scan.range_max = float(max_range)
+            scan.ranges = first.tolist()
+            scan.intensities = first_i.tolist()
+            self._sonar_scan_pub.publish(scan)
+
+        if self._sonar_cloud_pub is not None:
+            from sensor_msgs.msg import PointCloud2
+            pts = ros2_math.sonar_detection_points(intensity, det, ranges, bearings)
+            cloud = PointCloud2()
+            cloud.header.stamp = stamp
+            cloud.header.frame_id = frame
+            cloud.height = 1
+            cloud.width = int(pts.shape[0])
+            cloud.fields = self._pc2_fields
+            cloud.is_bigendian = False
+            cloud.point_step = 16
+            cloud.row_step = 16 * int(pts.shape[0])
+            cloud.data = ros2_math.uint8_payload(pts)
+            cloud.is_dense = True
+            self._sonar_cloud_pub.publish(cloud)
+
+    def _sonar_polar_axes(self, n_range, n_beams, min_range, max_range, hori_fov):
+        """Cached (range bin centres, beam bearings) of the sonar grid."""
+        range_res = getattr(self._sonar, "range_res", None)
+        angular_res = getattr(self._sonar, "angular_res", None)
+        key = (n_range, n_beams, min_range, max_range, hori_fov, range_res, angular_res)
+        cache = getattr(self, "_sonar_axes", None)
+        if cache is None or cache[0] != key:
+            ranges = np.asarray(ros2_math.sonar_ranges(min_range, max_range, n_range, range_res),
+                                dtype=np.float32)
+            bearings = ros2_math.sonar_bearings(hori_fov, n_beams, angular_res)
+            cache = self._sonar_axes = (key, ranges, bearings)
+        return cache[1], cache[2]
 
     def _sonar_geometry(self, n_range, n_beams, min_range, max_range, hori_fov, vert_fov,
                         frequency_hz=1.2e6):

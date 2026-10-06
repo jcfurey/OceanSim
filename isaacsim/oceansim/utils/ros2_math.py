@@ -105,17 +105,77 @@ def sonar_beam_directions(hori_fov_deg, n_beams, angular_res_deg=None):
     -fov/2 edge in steps of res. Without it the beams span edge to edge
     (linspace), which is half a bin off at the fan edges.
     """
+    bearings = sonar_bearings(hori_fov_deg, n_beams, angular_res_deg)
+    return [(0.0, float(-math.sin(b)), float(math.cos(b))) for b in bearings]
+
+
+def sonar_bearings(hori_fov_deg, n_beams, angular_res_deg=None):
+    """Per-beam bearings (radians) of the sonar grid's beam columns, positive
+    to port: beam 0 is the starboard edge (the grid bins azimuth from the
+    right, see ImagingSonarSensor.min_azi; the RTX backend's first signal way
+    is the starboard element too). In an x-forward / z-up sensor frame that is
+    the REP-103 LaserScan angle (counter-clockwise about +z).
+
+    With ``angular_res_deg`` each beam sits at its bin centre,
+    -fov/2 + (j + 0.5) * res; without it the beams span edge to edge.
+    A single beam points straight ahead."""
     half = math.radians(hori_fov_deg) / 2.0
     # n_beams == 1: a single beam points straight ahead (bearing 0), not at the
     # fan edge -- np.linspace(-half, half, 1) returns [-half].
     if int(n_beams) <= 1:
-        bearings = np.array([0.0])
-    elif angular_res_deg:
+        return np.array([0.0])
+    if angular_res_deg:
         res = math.radians(float(angular_res_deg))
-        bearings = -half + (np.arange(int(n_beams)) + 0.5) * res
-    else:
-        bearings = np.linspace(-half, half, n_beams)
-    return [(0.0, float(-math.sin(b)), float(math.cos(b))) for b in bearings]
+        return -half + (np.arange(int(n_beams)) + 0.5) * res
+    return np.linspace(-half, half, int(n_beams))
+
+
+def sonar_detections(intensity, factor=5.0, floor=0.2):
+    """Obstacle returns in a sonar intensity grid ``(n_range, n_beams)``.
+
+    A cell is a detection when it is at least ``factor`` times its range row's
+    median and at least ``floor``. Comparing within the row (a cell-averaging
+    CFAR across azimuth, with a median reference) is invariant to per-row
+    scaling, which the default "range" normalisation applies (every row's
+    maximum is 1, so a plain threshold fires on noise-only rows). It also
+    ignores returns that fill a whole row, such as a flat seafloor band seen
+    across the fan, which are not obstacles to a vehicle holding depth.
+    factor 5 puts Rayleigh clutter's per-cell false-alarm rate near 3e-8
+    (exp(-(1.18 factor)^2 / 2)); 4 gives ~1.5e-5, a few spurious cells per frame."""
+    grid = np.asarray(intensity, dtype=np.float32)
+    # The row median from ~128 evenly spaced beams is as good a reference and
+    # several times cheaper than over all of them (520 at the defaults).
+    step = max(1, grid.shape[1] // 128)
+    ref = np.median(grid[:, ::step], axis=1, keepdims=True)
+    return (grid >= float(floor)) & (grid >= float(factor) * ref)
+
+
+def sonar_first_returns(mask, ranges):
+    """Per-beam range (m) of the nearest detection, +inf where a beam has none
+    (REP-117: no return within range, which lets costmaps clear along it).
+    ``mask`` is ``(n_range, n_beams)``, ``ranges`` the n_range bin centres.
+    Returns (ranges float32, row index or -1)."""
+    mask = np.asarray(mask, dtype=bool)
+    hit = mask.any(axis=0)
+    rows = np.where(hit, mask.argmax(axis=0), -1)
+    out = np.full(mask.shape[1], np.inf, dtype=np.float32)
+    out[hit] = np.asarray(ranges, dtype=np.float32)[rows[hit]]
+    return out, rows
+
+
+def sonar_detection_points(intensity, mask, ranges, bearings):
+    """Detections as an (N, 4) float32 array of x, y, z, intensity in an
+    x-forward / y-port / z-up sonar frame, placed on the sonar's horizontal
+    plane (z = 0): an imaging sonar measures range and bearing only, so the
+    elevation of a return within the vertical beam is unknown."""
+    ri, bi = np.nonzero(np.asarray(mask, dtype=bool))
+    r = np.asarray(ranges, dtype=np.float64)[ri]
+    b = np.asarray(bearings, dtype=np.float64)[bi]
+    pts = np.zeros((ri.size, 4), dtype=np.float32)
+    pts[:, 0] = r * np.cos(b)
+    pts[:, 1] = r * np.sin(b)
+    pts[:, 3] = np.asarray(intensity, dtype=np.float32)[ri, bi]
+    return pts
 
 
 def sonar_ranges(min_range, max_range, n_range, range_res=None):
