@@ -7,6 +7,8 @@ messages from the values computed here.
 
 import math
 
+import array
+
 import numpy as np
 
 
@@ -158,3 +160,15 @@ def sonar_intensity_uint8(grid):
     n_range, n_beams = intensity.shape
     img8 = np.clip(intensity * 255.0, 0.0, 255.0).astype(np.uint8)
     return img8, n_range, n_beams
+
+
+def uint8_payload(arr):
+    """Pack a numpy array's raw bytes as array('B') for a ROS ``uint8[]`` field.
+
+    rosidl's generated setter takes an array('B') as-is, but checks a plain
+    bytes / list value element by element in Python on Humble (~0.4 s for a
+    1080p rgb8 frame); this is also one copy instead of tobytes()'s two.
+    Byte-for-byte identical to ``arr.tobytes()`` for a C-ordered array."""
+    out = array.array("B")
+    out.frombytes(memoryview(np.ascontiguousarray(arr)).cast("B"))
+    return out

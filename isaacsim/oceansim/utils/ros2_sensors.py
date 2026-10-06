@@ -820,7 +820,7 @@ class OceanSimSensorPublisher:
         data.is_bigendian = False
         data.dtype = SonarImageData.DTYPE_UINT8
         data.beam_count = int(n_beams)
-        data.data = img8.reshape(-1).tobytes()
+        data.data = ros2_math.uint8_payload(img8)
         msg.image = data
         self._sonar_pub.publish(msg)
 

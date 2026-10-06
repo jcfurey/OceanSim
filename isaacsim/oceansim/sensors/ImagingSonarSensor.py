@@ -1226,21 +1226,27 @@ class ImagingSonarSensor(Camera):
         Needs sonar_initialize(segmentation=True); bin_semantics is all zeros
         (background) otherwise.
         """
-        import matplotlib.pyplot as plt
-
         id_to_labels = self.scan_data.get('idToLabels') or {}
         # Size the palette by the largest semantic id, not the number of labels:
         # ids need not be contiguous, and bin_semantics holds raw ids.
         num_semantics = max((int(k) for k in id_to_labels.keys()), default=0) + 1
-        cmap = plt.get_cmap(colormap)
-        colors = cmap(np.linspace(0, 1, num_semantics)) * 255  # Get n colors from the colormap
+        # The palette only depends on (colormap, num_semantics): build + upload
+        # it once, not on every viewport frame.
+        key = (colormap, num_semantics)
+        if getattr(self, "_semantics_palette_key", None) != key:
+            import matplotlib.pyplot as plt
+            cmap = plt.get_cmap(colormap)
+            colors = cmap(np.linspace(0, 1, num_semantics)) * 255  # Get n colors from the colormap
+            self._semantics_palette = wp.array(data=colors.astype(np.uint8), ndim=2,
+                                               dtype=wp.uint8, device=self._device)
+            self._semantics_palette_key = key
 
         wp.launch(
             dim=self.bin_semantics.shape,
             kernel=make_semantics_image,
             inputs=[
                 self.bin_semantics,
-                wp.array(data=colors.astype(np.uint8), ndim=2, dtype=wp.uint8, device=self._device)
+                self._semantics_palette
             ],
             outputs=[
                 self.sonar_semantics_image

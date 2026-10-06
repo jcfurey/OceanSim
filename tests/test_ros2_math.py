@@ -181,3 +181,16 @@ def test_sonar_ranges_follow_sensor_grid(m):
     grid_edges = np.arange(lo, hi, res)
     r = m.sonar_ranges(lo, hi, len(grid_edges), res)
     assert np.allclose(r, grid_edges + res / 2, atol=1e-6)
+
+
+@pytest.mark.parametrize("arr", [
+    np.arange(24, dtype=np.uint8).reshape(2, 4, 3),               # rgb8
+    np.linspace(0.5, 9.5, 12, dtype=np.float32).reshape(3, 4),     # 32FC1 depth
+    np.arange(40, dtype=np.uint8).reshape(5, 8)[:, ::2],           # non-contiguous view
+])
+def test_uint8_payload_matches_tobytes(m, arr):
+    """array('B') payload (rosidl fast path) carries exactly arr.tobytes()."""
+    import array as _array
+    out = m.uint8_payload(arr)
+    assert isinstance(out, _array.array) and out.typecode == "B"
+    assert out.tobytes() == np.ascontiguousarray(arr).tobytes()

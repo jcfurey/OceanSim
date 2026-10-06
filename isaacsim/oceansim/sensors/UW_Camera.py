@@ -328,12 +328,12 @@ class UW_Camera(Camera):
                 cmsg.header.stamp = stamp
                 cmsg.header.frame_id = frame
                 cmsg.format = 'jpeg'
-                cmsg.data = jpg.tobytes()
+                cmsg.data = ros2_math.uint8_payload(jpg)
                 self._uw_img_pub.publish(cmsg)
 
             # raw rgb8 (optional; the rgb copy + tobytes() are ~6 MB each/frame)
             if self._image_raw_pub is not None:
-                rgb = np.ascontiguousarray(uw_image_cpu[:, :, :3])  # drop alpha
+                rgb = cv2.cvtColor(uw_image_cpu, cv2.COLOR_RGBA2RGB)  # drop alpha (contiguous)
                 h, w = rgb.shape[0], rgb.shape[1]
                 imsg = Image()
                 imsg.header.stamp = stamp
@@ -342,14 +342,14 @@ class UW_Camera(Camera):
                 imsg.encoding = 'rgb8'
                 imsg.is_bigendian = 0
                 imsg.step = w * 3
-                imsg.data = rgb.tobytes()
+                imsg.data = ros2_math.uint8_payload(rgb)
                 self._image_raw_pub.publish(imsg)
 
             # depth 32FC1 (planar z-depth, metres) — convert from the radial
             # distance_to_camera the UW kernel uses to ROS's planar convention.
             if depth is not None and self._depth_pub is not None:
                 d = depth.numpy() if hasattr(depth, 'numpy') else np.asarray(depth)
-                d = np.squeeze(d).astype(np.float32)
+                d = np.squeeze(d).astype(np.float32, copy=False)
                 if d.ndim == 2:
                     d = np.ascontiguousarray(self._planar_from_radial(d))
                     dmsg = Image()
@@ -359,7 +359,7 @@ class UW_Camera(Camera):
                     dmsg.encoding = '32FC1'
                     dmsg.is_bigendian = 0
                     dmsg.step = d.shape[1] * 4
-                    dmsg.data = d.tobytes()
+                    dmsg.data = ros2_math.uint8_payload(d)
                     self._depth_pub.publish(dmsg)
 
             # camera info (static intrinsics; restamp + reframe each publish)

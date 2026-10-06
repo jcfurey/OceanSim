@@ -120,12 +120,6 @@ class FLS_KittiWriter(Writer):
             SyntheticData.Get().set_instance_mapping_semantic_filter(semantic_filter_predicate)
 
         self.annotators = [
-            # We don't need these three annotators for they are for camera rendering 
-            AnnotatorRegistry.get_annotator(
-                "rgb", 
-                device="cpu", 
-                do_array_copy=False
-            ),
             # Ray-query points are rebuilt from per-pixel AOVs (depth + normals,
             # with the semantic / instance ids from the segmentation annotators
             # below) by compact_depth_points. This replaces the 'pointcloud'
@@ -148,8 +142,16 @@ class FLS_KittiWriter(Writer):
                 "instance_segmentation_fast", init_params={"colorize": False}
             ),
             "camera_params",
-            "bounding_box_3d_fast"
         ]
+        # rgb (a full host readback) and the 3D bboxes only feed the debug
+        # overlays/object poses, so only attach them in debug mode.
+        if debug_mode:
+            self.annotators.insert(0, AnnotatorRegistry.get_annotator(
+                "rgb",
+                device="cpu",
+                do_array_copy=False
+            ))
+            self.annotators.append("bounding_box_3d_fast")
 
         self._initialize_sonar_renderer(sonar_param)
 
@@ -319,13 +321,26 @@ class FLS_KittiWriter(Writer):
 
         num_points = pcl.shape[0]
         # Load these small numpy arrays to cuda
-        indexToRefl_np = self._make_indexToProp_array(idToLabels=idToLabels, labelsToProp=self.reflectivity_mapping)
-        indexToRefl = wp.array(data=indexToRefl_np, dtype=wp.float32)
+        # The reflectivity table only changes with the labelled set: upload it
+        # when idToLabels changes, not every frame.
+        refl_key = repr(sorted((str(k), str(v)) for k, v in idToLabels.items()))
+        if getattr(self, "_refl_key", None) != refl_key:
+            indexToRefl_np = self._make_indexToProp_array(idToLabels=idToLabels, labelsToProp=self.reflectivity_mapping)
+            self._indexToRefl = wp.array(data=indexToRefl_np, dtype=wp.float32)
+            self._refl_key = refl_key
+        indexToRefl = self._indexToRefl
         viewTransform = wp.mat44(viewTransform)
-        
+
+        # Per-point work buffers, grown to the running high-water mark and
+        # sliced, instead of three fresh device allocations per frame.
+        if getattr(self, "_work_capacity", 0) < num_points:
+            self._work_capacity = num_points
+            self._work_intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+            self._work_bin_idx = wp.empty(shape=(num_points,), dtype=wp.vec2ui)
+            self._work_spher = wp.empty(shape=(num_points,), dtype=wp.vec3)
 
         # Compute intensity for each ray query     
-        intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+        intensity = self._work_intensity[:num_points]
         wp.launch(kernel=compute_intensity,
                 dim=num_points,
                 inputs=[
@@ -342,8 +357,8 @@ class FLS_KittiWriter(Writer):
                 )
                 
         # Transform pointcloud from world cooridates to sonar local and convert to spherical coord
-        pcl_bin_idx = wp.empty(shape=(num_points, ), dtype=wp.vec2ui)
-        pcl_local_spher = wp.empty(shape=(num_points,), dtype=wp.vec3) 
+        pcl_bin_idx = self._work_bin_idx[:num_points]
+        pcl_local_spher = self._work_spher[:num_points] 
         wp.launch(kernel=world2local,
                 dim=num_points,
                 inputs=[
@@ -838,6 +853,11 @@ class FLS_KittiWriter(Writer):
         self._backend.schedule(F.write_image, data=np.fliplr(sem_seg_img_renumbered), path=seg_filepath)
     
     def _write_semantic_mapping_and_sonar_param(self, sub_dir: str):
+        # Constant for the run: write once per output directory, not per frame.
+        written = self.__dict__.setdefault("_static_json_written", set())
+        if sub_dir in written:
+            return
+        written.add(sub_dir)
         self._backend.schedule(F.write_json, data=self.mapping_dict, path=os.path.join(sub_dir, "semantic_mapping.json"))
         self._backend.schedule(F.write_json, data={"sonar_param":self.sonar_param, "reflectivity":self.reflectivity_mapping}, path=os.path.join(sub_dir, "sonar_param.json"))
 

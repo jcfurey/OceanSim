@@ -438,7 +438,12 @@ class UIBuilder():
                                             orientation=euler_angles_to_quat(_sonar_rpy, degrees=True),
                                             range_res=0.005,
                                             angular_res=0.25,
-                                            hori_res=4000
+                                            hori_res=4000,
+                                            # On-device point selection, as the headless runner
+                                            # uses: the numpy path copies ~89 MB to the host and
+                                            # spends ~80 ms per scan at hori_res=4000. Falls back
+                                            # to numpy by itself if the AOVs aren't on-device.
+                                            gpu_point_filter=True,
                                             )
 
         if self._use_camera:
