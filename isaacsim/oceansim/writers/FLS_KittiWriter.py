@@ -168,6 +168,9 @@ class FLS_KittiWriter(Writer):
         self.range_res = sonar_param['range_res']
         self.hori_fov = sonar_param['hori_fov']
         self.vert_fov = sonar_param['vert_fov']
+        # Binning keeps only elevation +-vert_fov/2 (the render must cover it --
+        # see sonar_scan_math.sonar_render_height for the camera height).
+        self._half_vfov = float(np.deg2rad(self.vert_fov) / 2.0)
         self.angular_res = np.deg2rad(sonar_param['angular_res'])
         # Below params are used to define sonar noise and rendering method
         self.query_prop = sonar_param['query_prop']
@@ -280,6 +283,17 @@ class FLS_KittiWriter(Writer):
 
         cam_to_world, fx, fy, cx, cy = sonar_scan_math.depth_unprojection_from_camera_params(
             data[cameraParams_annot], width, height)
+        # Beam geometry for this render product (cached per resolution and
+        # intrinsics): the depth cut admitting slant ranges >= min_range across
+        # the fan, and the per-beam solid-angle gains bin_process weights with.
+        geom_key = (width, height, round(float(fx), 6), round(float(fy), 6))
+        if getattr(self, "_beam_geom_key", None) != geom_key:
+            self._beam_geom_key = geom_key
+            self._depth_near = sonar_scan_math.slant_range_near_depth(
+                self.min_range, width, height, fx, fy)
+            self._beam_gain = wp.array(sonar_scan_math.beam_solid_angle_gain(
+                width, height, fx, fy, self.min_azi, self.angular_res, self.r.shape[1],
+                np.deg2rad(self.hori_fov), self._half_vfov), dtype=wp.float32)
         wp.launch(kernel=compact_depth_points,
                   dim=(height, width),
                   inputs=[
@@ -290,7 +304,7 @@ class FLS_KittiWriter(Writer):
                       wp.array(exclude, dtype=wp.uint8, device=self._device),
                       wp.mat44(cam_to_world.astype(np.float32)),
                       float(fx), float(fy), float(cx), float(cy),
-                      float(self.min_range), float(self.max_range),
+                      float(self._depth_near), float(self.max_range),
                       self._pt_counter,
                   ],
                   outputs=[
@@ -385,7 +399,9 @@ class FLS_KittiWriter(Writer):
                     pcl_local_spher,
                     intensity,
                     semantics,
-                    self.sonar_grid
+                    self.sonar_grid,
+                    self._half_vfov,
+                    self._beam_gain
                 ],
                 outputs=[
                     self.bin_sum,

@@ -59,7 +59,10 @@ def compute_intensity(pcl: wp.array(ndim=2, dtype=wp.float32),
     unit_directs = wp.vec3(0.0, 0.0, 0.0)
     if dist > wp.float32(1e-8):
         unit_directs = incidence / dist
-    cos_theta = wp.dot(-unit_directs, normal_vec)
+    # |cos|: a surface the render shows returns energy whichever way its normal
+    # was authored. A back-facing (double-sided / flipped) normal gave a
+    # NEGATIVE contribution that cancelled other returns in the same bin.
+    cos_theta = wp.abs(wp.dot(-unit_directs, normal_vec))
     reflectivity = indexToRefl[semantics[tid]]
     intensity[tid] = reflectivity * cos_theta * wp.exp(-attenuation * dist)
 
@@ -113,11 +116,54 @@ def bin_intensity(pcl: wp.array(dtype=wp.vec3),
         wp.atomic_add(bin_count, x_bin_idx, y_bin_idx, 1)
 
 
+@wp.func
+def pixel_solid_angle_weight(spher: wp.vec3, beam_gain: wp.array(dtype=wp.float32), beam: wp.int32):
+    """cos^3 of the ray's angle off the optical axis (local +y) -- a pinhole
+    pixel's relative solid angle -- times the beam's normalising gain
+    (sonar_scan_math.beam_solid_angle_gain)."""
+    c = wp.sin(spher[2]) * wp.sin(spher[1])
+    return c * c * c * beam_gain[beam]
+
+
+@wp.kernel
+def bin_intensity_sa(pcl: wp.array(dtype=wp.vec3),
+                     intensity: wp.array(dtype=wp.float32),
+                     x_offset: wp.float32,
+                     y_offset: wp.float32,
+                     x_res: wp.float32,
+                     y_res: wp.float32,
+                     half_vfov: wp.float32,
+                     beam_gain: wp.array(dtype=wp.float32),
+                     bin_sum: wp.array(ndim=2, dtype=wp.float32),
+                     bin_count: wp.array(ndim=2, dtype=wp.int32)
+                     ):
+    """bin_intensity with the sonar's real beam geometry:
+    - drops points outside elevation +-half_vfov (the render camera is taller
+      than the beam -- see sonar_scan_math.sonar_render_height);
+    - weights each point by its pixel's solid angle, normalised per beam, so a
+      bin integrates intensity over solid angle instead of counting render
+      pixels (which grew toward the fan edges and striped beam to beam)."""
+    tid = wp.tid()
+    p = pcl[tid]
+    elev = wp.HALF_PI - p[2]
+    if wp.abs(elev) > half_vfov:
+        return
+    x_bin_idx = wp.int32(wp.floor((p[0] - x_offset) / x_res))
+    y_bin_idx = wp.int32(wp.floor((p[1] - y_offset) / y_res))
+    if (x_bin_idx >= 0 and x_bin_idx < bin_sum.shape[0]
+            and y_bin_idx >= 0 and y_bin_idx < bin_sum.shape[1]):
+        w = pixel_solid_angle_weight(p, beam_gain, y_bin_idx)
+        wp.atomic_add(bin_sum, x_bin_idx, y_bin_idx, intensity[tid] * w)
+        wp.atomic_add(bin_count, x_bin_idx, y_bin_idx, 1)
+
+
 @wp.kernel
 def bin_process(pcl: wp.array(dtype=wp.vec3),
                   intensity: wp.array(dtype=wp.float32),
                   semantics: wp.array(dtype=wp.uint32),
                   sonar_grid: sonarGrid,
+                  half_vfov: wp.float32,
+                  beam_gain: wp.array(dtype=wp.float32),
                   bin_sum: wp.array(ndim=2, dtype=wp.float32),
                   bin_count: wp.array(ndim=2, dtype=wp.int32),
                   pcl_bin_idx: wp.array(dtype=wp.vec2ui),
@@ -127,20 +173,24 @@ def bin_process(pcl: wp.array(dtype=wp.vec3),
     need: the bin each point landed in (pcl_bin_idx) and the minimum zenith per
     bin (bin_min_zenith), so a bin's label comes from its top-most return.
 
-    Same floor + bounds check as bin_intensity. Upstream cast straight to
-    uint32, which wrapped a slightly-out-of-grid point to a huge index and
-    wrote out of bounds; here such points get the INVALID_BIN sentinel and are
-    dropped by every downstream kernel."""
+    Same floor + bounds check, elevation cut and solid-angle weighting as
+    bin_intensity_sa. Upstream cast straight to uint32, which wrapped a
+    slightly-out-of-grid point to a huge index and wrote out of bounds; here
+    such points (and points outside +-half_vfov) get the INVALID_BIN sentinel
+    and are dropped by every downstream kernel."""
     tid = wp.tid()
 
     # Get the range, azimuth of the point
     x = pcl[tid][0]
     y = pcl[tid][1]
+    elev = wp.HALF_PI - pcl[tid][2]
     x_bin_idx = wp.int32(wp.floor((x - sonar_grid.x_offset) / sonar_grid.x_res))
     y_bin_idx = wp.int32(wp.floor((y - sonar_grid.y_offset) / sonar_grid.y_res))
-    if (x_bin_idx >= 0 and x_bin_idx < bin_sum.shape[0]
+    if (wp.abs(elev) <= half_vfov
+            and x_bin_idx >= 0 and x_bin_idx < bin_sum.shape[0]
             and y_bin_idx >= 0 and y_bin_idx < bin_sum.shape[1]):
-        wp.atomic_add(bin_sum, x_bin_idx, y_bin_idx, intensity[tid])
+        w = pixel_solid_angle_weight(pcl[tid], beam_gain, y_bin_idx)
+        wp.atomic_add(bin_sum, x_bin_idx, y_bin_idx, intensity[tid] * w)
         wp.atomic_add(bin_count, x_bin_idx, y_bin_idx, 1)
         # Store the bin idx that corresponding to this pcl
         pcl_bin_idx[tid] = wp.vec2ui(wp.uint32(x_bin_idx), wp.uint32(y_bin_idx))

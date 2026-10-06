@@ -141,11 +141,21 @@ class ImagingSonarSensor(Camera):
         self.sonar_grid.y_num = self.r.shape[1]
 
         self.AR = self.hori_fov / self.vert_fov
-        self.vert_res = int(self.hori_res / self.AR)
-        # By doing this, I am assuming the vertical beam separation
-        # is the same as the beam horizontal separation. 
-        # This is bacause replicator raytracing is specified as resolutions
-        # while non-squre pixel is not supported in Isaac sim. See details below.
+        # Render tall enough to cover elevation +-vert_fov/2 across the whole
+        # fan (pixels are square, and a pinhole's vertical extent for a fixed
+        # elevation grows toward the fan edges); the binning kernels then drop
+        # everything outside +-vert_fov/2. The old hori_res / AR (a ratio of
+        # angles) gave ~36.5 deg at boresight but only ~16 deg at the 65 deg
+        # edge for a 130 x 20 deg sonar. See sonar_scan_math.sonar_render_height.
+        self.vert_res = sonar_scan_math.sonar_render_height(
+            self.hori_res, self.hori_fov, self.vert_fov)
+        self._half_vfov = float(np.deg2rad(self.vert_fov) / 2.0)
+        # Pinhole focal length in pixels for the horizontal FOV (square pixels).
+        self._fx_px = self.hori_res / (2.0 * np.tan(np.deg2rad(self.hori_fov) / 2.0))
+        # Depth (distance to the image plane) admitting every point at slant
+        # range >= min_range; binning rejects what's closer than min_range.
+        self._depth_near = sonar_scan_math.slant_range_near_depth(
+            self.min_range, self.hori_res, self.vert_res, self._fx_px, self._fx_px)
         
         super().__init__(prim_path=prim_path, 
                          name=name, 
@@ -157,8 +167,11 @@ class ImagingSonarSensor(Camera):
                          translation=translation, 
                          render_product_path=render_product_path)
 
+        # Near clip at the depth of min_range SLANT range along the corner ray
+        # (clipping depth at min_range cut targets nearer than
+        # min_range / cos(65 deg) = 0.47 m at the fan edge for a 0.2 m sonar).
         self.set_clipping_range(
-            near_distance=self.min_range,
+            near_distance=self._depth_near,
             far_distance=self.max_range
         )
         # Isaac Sim 6.0.1 port: do NOT call self.initialize() here. The runner
@@ -233,10 +246,10 @@ class ImagingSonarSensor(Camera):
         self.id = 0
         self._scan_logged = False  # one-shot shape diagnostic in scan()
 
-        # Optional on-device point compaction (compact_in_range kernel). Default
-        # OFF: the kernel is unit tested against the numpy reference
-        # (tests/test_imaging_sonar_kernels.py), but whether get_pointcloud /
-        # the AOV annotators actually return Warp arrays resident on
+        # Optional on-device point compaction (compact_depth_points kernel).
+        # Default OFF: the kernel is unit tested against the numpy reference
+        # (tests/test_imaging_sonar_kernels.py), but whether the AOV annotators
+        # actually return Warp arrays resident on
         # self._device can only be confirmed on hardware. So it self-heals --
         # if the outputs are not on-device Warp arrays (or anything throws) it
         # disables itself and falls back to the proven numpy path. Enable with
@@ -343,6 +356,15 @@ class ImagingSonarSensor(Camera):
         # frame (global max -> shape (1,), per-range max -> shape (n_range,)).
         self._max_all = wp.zeros(shape=(1,), dtype=wp.float32, device=self._device)
         self._max_range = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32, device=self._device)
+        # Per-beam solid-angle gains for the render camera (static): binning
+        # weights each point by its pixel's solid angle so a beam integrates
+        # over its real solid angle instead of counting render pixels.
+        self._beam_gain = wp.array(sonar_scan_math.beam_solid_angle_gain(
+            self.hori_res, self.vert_res, self._fx_px, self._fx_px,
+            self.min_azi, np.deg2rad(self.angular_res), self.r.shape[1],
+            np.deg2rad(self.hori_fov), self._half_vfov), dtype=wp.float32, device=self._device)
+        self._dummy_instances = None   # compact_depth_points' unused instance output
+        self._point_check_done = False  # one-time depth-vs-get_pointcloud diagnostic
 
         # Initialize the camera (creates the render product) HERE -- post
         # world.reset() (deferred from __init__ for the Isaac Sim 6.0.1 port; see
@@ -465,8 +487,8 @@ class ImagingSonarSensor(Camera):
         if len(id_to_labels) == 0:
             return False
 
-        # Optional on-device fast path: compact the in-range points with the
-        # compact_in_range kernel so the per-pixel depth/pcl/normals/semantics
+        # Optional on-device fast path: unproject + compact the in-range points
+        # with the compact_depth_points kernel so the per-pixel depth/normals/semantics
         # never round-trip device->host->device. Returns True/False on success,
         # or None if it cannot run on-device (in which case it disables itself
         # and we drop through to the numpy path). See sonar_initialize().
@@ -485,17 +507,18 @@ class ImagingSonarSensor(Camera):
         return self._scan_numpy(sem_data, id_to_labels)
 
     def _scan_gpu_compact(self, id_to_labels, sem_dict):
-        """On-device point selection via the compact_in_range kernel.
+        """On-device point selection via the compact_depth_points kernel.
 
         ``sem_dict`` is the semantic-segmentation annotator's already-fetched
         on-device get_data() dict (fetched once in scan(), reused here) so this
         method doesn't re-issue the device get_data() for it.
 
-        Keeps the depth / point-cloud / normals / semantics AOVs on
-        ``self._device`` and appends the in-range, finite points into reusable
-        output buffers with an atomic counter -- the GPU equivalent of
-        ``sonar_scan_math.select_in_range_points`` (and proven equal to it in
-        tests/test_imaging_sonar_kernels.py).
+        Keeps the depth / normals / semantics AOVs on ``self._device``,
+        unprojects depth to world points with this frame's CameraParams and
+        appends the in-range, finite points into reusable output buffers with an
+        atomic counter -- the GPU equivalent of _scan_numpy's
+        ``sonar_scan_math.depth_to_world_points`` + ``select_in_range_points``
+        (proven equal in tests/test_imaging_sonar_kernels.py).
 
         Returns:
             True  - in-range points stored in scan_data.
@@ -505,7 +528,6 @@ class ImagingSonarSensor(Camera):
         """
         try:
             depth = self._custom_annotators["distance_to_image_plane"].get_data(device=self._device)
-            pcl = self.get_pointcloud(device=self._device, world_frame=True)
             normals = self._custom_annotators["normals"].get_data(device=self._device)
             sem = self._annot_get(sem_dict, ('data',), 'semantic_segmentation')
 
@@ -513,25 +535,33 @@ class ImagingSonarSensor(Camera):
             # resident on self._device with the dtype the kernel expects. Any
             # mismatch -> None -> numpy fallback (no silent host round-trip).
             depth = self._require_warp(depth, wp.float32)
-            pcl = self._require_warp(pcl, wp.float32)
             normals = self._require_warp(normals, wp.float32)
             sem = self._require_warp(sem, wp.uint32)
-            if depth is None or pcl is None or normals is None or sem is None:
+            if depth is None or normals is None or sem is None:
                 return None
 
-            n_px = depth.size
-            # Warp's reshape requires C-contiguity, but the annotator AOVs can come
-            # back strided/non-contiguous ("Reshaping non-contiguous arrays is
-            # unsupported"). Make a contiguous device-resident copy first -- a cheap
-            # GPU->GPU copy that still avoids the device->host->device round-trip.
-            depth_f = depth.contiguous().reshape((-1,))          # (N,)
-            pcl_f = pcl.contiguous().reshape((-1, 3))            # (N,3)
-            nm_c = normals.contiguous()
-            nm_f = nm_c.reshape((-1, nm_c.shape[-1]))[:, :3]     # (N,3) view
-            sem_f = sem.contiguous().reshape((-1,))              # (N,)
-            if (pcl_f.shape[0] != n_px or nm_f.shape[0] != n_px
-                    or sem_f.shape[0] != n_px):
+            # Image-shaped views for the 2-D kernel. Warp's reshape needs
+            # C-contiguity and the AOVs can come back strided, so contiguous()
+            # first (a no-op when already contiguous; otherwise a GPU->GPU copy).
+            width, height = (int(v) for v in self.get_resolution())
+            n_px = width * height
+            if depth.size != n_px or sem.size != n_px or normals.size % n_px:
                 return None
+            depth_2d = depth.contiguous().reshape((height, width))
+            sem_2d = sem.contiguous().reshape((height, width))
+            n_ch = normals.size // n_px
+            if n_ch < 3:
+                return None
+            nm_3d = normals.contiguous().reshape((height, width, n_ch))
+
+            # World points from depth with THIS frame's CameraParams -- the same
+            # render-time pose world2local / compute_intensity use below.
+            # (Camera.get_pointcloud() unprojected with the CURRENT USD pose, so
+            # any render lag misregistered the image: 1 deg -> 3-4 beams.)
+            cam_data = self.cameraParams_annot.get_data()
+            view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
+            cam_to_world, fx, fy, cx, cy = sonar_scan_math.depth_unprojection_from_camera_params(
+                cam_data, width, height)
 
             # Reusable, device-resident output buffers sized to the full pixel
             # count (the worst case all-in-range). Allocated once, kept across
@@ -540,30 +570,36 @@ class ImagingSonarSensor(Camera):
                 self._gpu_out_pcl = wp.zeros((n_px, 3), dtype=wp.float32, device=self._device)
                 self._gpu_out_normals = wp.zeros((n_px, 3), dtype=wp.float32, device=self._device)
                 self._gpu_out_sem = wp.zeros(n_px, dtype=wp.uint32, device=self._device)
+                self._dummy_instances = wp.zeros(n_px, dtype=wp.uint32, device=self._device)
                 self._gpu_counter = wp.zeros(1, dtype=wp.int32, device=self._device)
+                self._gpu_keep_all = wp.zeros(1, dtype=wp.uint8, device=self._device)
             self._gpu_counter.zero_()
 
-            wp.launch(kernel=compact_in_range,
-                      dim=n_px,
-                      inputs=[depth_f, pcl_f, nm_f, sem_f,
-                              wp.float32(self.min_range), wp.float32(self.max_range),
-                              self._gpu_counter, self._gpu_out_pcl,
-                              self._gpu_out_normals, self._gpu_out_sem],
+            wp.launch(kernel=compact_depth_points,
+                      dim=(height, width),
+                      inputs=[depth_2d, nm_3d, sem_2d,
+                              sem_2d,                 # instance ids: unused by the sensor
+                              self._gpu_keep_all,     # exclude no semantic id
+                              wp.mat44(cam_to_world.astype(np.float32)),
+                              float(fx), float(fy), float(cx), float(cy),
+                              float(self._depth_near), float(self.max_range),
+                              self._gpu_counter],
+                      outputs=[self._gpu_out_pcl, self._gpu_out_normals,
+                               self._gpu_out_sem, self._dummy_instances],
                       device=self._device)
             # counter.numpy() already does a blocking default-stream device->host
             # copy that orders this readback, so a global wp.synchronize() here
             # only adds an unnecessary all-device stall on the sim thread.
-            n_valid = int(self._gpu_counter.numpy()[0])
+            n_valid = min(int(self._gpu_counter.numpy()[0]), n_px)
 
             if not self._scan_logged:
                 self._scan_logged = True
                 print(f"[{self._name}] scan(gpu): N={n_px} valid={n_valid} "
                       f"idToLabels={id_to_labels}", flush=True)
+                self._log_point_source_check(depth_2d.numpy(), cam_data)
             if n_valid == 0:
                 return False
 
-            cam_data = self.cameraParams_annot.get_data()
-            view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
             # Contiguous prefix views into the reusable buffers. They stay valid
             # through make_sonar_data's kernels (all run before the next scan()).
             self.scan_data['pcl'] = self._gpu_out_pcl[:n_valid]          # (N,3)
@@ -576,6 +612,35 @@ class ImagingSonarSensor(Camera):
             print(f"[{self._name}] gpu_point_filter error ({exc!r}); "
                   f"falling back to numpy scan path.", flush=True)
             return None
+
+    def _log_point_source_check(self, depth_np, cam_data):
+        """One-time hardware check of the depth + CameraParams unprojection:
+        log how far its world points are from Camera.get_pointcloud()'s (which
+        uses the current USD pose). On a static first frame they should agree
+        to ~mm; a large gap means the CameraParams projection assumptions
+        don't hold on this build. Diagnostic only -- never raises."""
+        if getattr(self, "_point_check_done", True):
+            return
+        self._point_check_done = True
+        try:
+            depth_np = np.asarray(depth_np, dtype=np.float64)
+            h, w = depth_np.shape
+            c2w, fx, fy, cx, cy = sonar_scan_math.depth_unprojection_from_camera_params(cam_data, w, h)
+            ours = sonar_scan_math.depth_to_world_points(depth_np, c2w, fx, fy, cx, cy)
+            ref = self._to_numpy(self.get_pointcloud(device=self._device, world_frame=True))
+            ref = np.asarray(ref, dtype=np.float64).reshape(-1, 3)
+            ok = (np.isfinite(depth_np.reshape(-1)) & (depth_np.reshape(-1) > 0)
+                  & np.all(np.isfinite(ref), axis=1))
+            if ref.shape[0] != ours.shape[0] or not np.any(ok):
+                print(f"[{self._name}] point-source check skipped (get_pointcloud {ref.shape}, "
+                      f"depth {depth_np.shape})", flush=True)
+                return
+            d = np.linalg.norm(ours[ok] - ref[ok], axis=1)
+            print(f"[{self._name}] point-source check vs get_pointcloud: median "
+                  f"{np.median(d) * 1e3:.2f} mm, p99 {np.percentile(d, 99) * 1e3:.2f} mm, "
+                  f"max {d.max() * 1e3:.2f} mm over {int(ok.sum())} px", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self._name}] point-source check failed: {exc!r}", flush=True)
 
     def _require_warp(self, arr, dtype):
         """Return ``arr`` only if it is a Warp array of ``dtype`` already
@@ -628,23 +693,25 @@ class ImagingSonarSensor(Camera):
         """Reference scan path: pull the AOVs to the host and select in-range
         points with the (unit-tested) pure-numpy sonar_scan_math. This is the
         default and the fallback for the optional GPU path."""
-        # Isaac Sim 6.0.1: reconstruct the point cloud from the depth AOV instead of
-        # the (crashing) pointcloud annotator. Camera.get_pointcloud() falls back to
-        # a perspective projection of distance_to_image_plane when no pointcloud
-        # annotator is attached, returning world points row-major over (H, W) -- so
-        # the per-pixel normals / semantics flatten the same way and stay aligned.
+        # Reconstruct world points from the depth AOV (the 'pointcloud' annotator
+        # crashed on Isaac 6.x) with THIS frame's CameraParams -- the same
+        # unprojection as Camera.get_pointcloud()'s depth fallback, but with the
+        # render-time pose that world2local / compute_intensity also use (the
+        # current USD pose misregistered the image under motion). Row-major over
+        # (H, W), so the per-pixel normals / semantics flatten the same way.
         depth = self._custom_annotators["distance_to_image_plane"].get_data(device=self._device)
         depth_np = np.squeeze(self._to_numpy(depth))
         if depth_np.ndim != 2 or depth_np.size == 0:
             return False
-        pcl_np = self._to_numpy(self.get_pointcloud(device=self._device, world_frame=True))
-        if pcl_np.size == 0:
-            return False
+        cam_data = self.cameraParams_annot.get_data()
+        view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
+        cam_to_world, fx, fy, cx, cy = sonar_scan_math.depth_unprojection_from_camera_params(
+            cam_data, depth_np.shape[1], depth_np.shape[0])
+        pcl_np = sonar_scan_math.depth_to_world_points(
+            depth_np, cam_to_world, fx, fy, cx, cy).astype(np.float32)
 
         normals_img = self._to_numpy(self._custom_annotators["normals"].get_data(device=self._device))
         sem_img = np.squeeze(self._to_numpy(self._annot_get(sem_data, ('data',), 'semantic_segmentation')))
-        cam_data = self.cameraParams_annot.get_data()
-        view_tf = self._annot_get(cam_data, ('cameraViewTransform',), 'CameraParams')
 
         n_px = depth_np.size
         normals_flat = normals_img.reshape(-1, normals_img.shape[-1])[:, :3]   # (H*W, 3) world normals
@@ -659,10 +726,11 @@ class ImagingSonarSensor(Camera):
         # finiteness check and the gathers only on the depth-passing subset.)
         depth_flat = depth_np.reshape(-1)
         pcl_v, normals_v, sem_v = sonar_scan_math.select_in_range_points(
-            depth_flat, pcl_np, normals_flat, sem_flat, self.min_range, self.max_range)
+            depth_flat, pcl_np, normals_flat, sem_flat, self._depth_near, self.max_range)
         n_valid = pcl_v.shape[0]
         if not getattr(self, "_scan_logged", False):
             self._scan_logged = True
+            self._log_point_source_check(depth_np, cam_data)
             uniq_sem = np.unique(sem_v) if n_valid else np.array([])
             print(f"[{self._name}] scan: depth{tuple(depth_np.shape)} pcl{tuple(pcl_np.shape)} "
                   f"normals{tuple(normals_img.shape)} sem{tuple(sem_img.shape)} "
@@ -863,7 +931,9 @@ class ImagingSonarSensor(Camera):
                           pcl_spher,
                           intensity,
                           semantics,
-                          self.sonar_grid
+                          self.sonar_grid,
+                          self._half_vfov,
+                          self._beam_gain
                       ],
                       outputs=[
                           self.bin_sum,
@@ -885,7 +955,7 @@ class ImagingSonarSensor(Camera):
                       ]
                       )
         else:
-            wp.launch(kernel=bin_intensity,
+            wp.launch(kernel=bin_intensity_sa,
                       dim=num_points,
                       inputs=[
                           pcl_spher,
@@ -894,6 +964,8 @@ class ImagingSonarSensor(Camera):
                           self.min_azi,
                           self.range_res,
                           wp.radians(self.angular_res),
+                          self._half_vfov,
+                          self._beam_gain,
                       ],
                       outputs=[
                           self.bin_sum,

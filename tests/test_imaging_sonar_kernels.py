@@ -397,7 +397,8 @@ def test_compute_intensity_matches_numpy_reference(kern):
     incidence = pcl.astype(np.float64) - sensor_loc
     dist = np.linalg.norm(incidence, axis=1)
     unit = incidence / dist[:, None]
-    cos_theta = np.sum(-unit * normals.astype(np.float64), axis=1)
+    # |cos|: back-facing normals return energy too (see compute_intensity)
+    cos_theta = np.abs(np.sum(-unit * normals.astype(np.float64), axis=1))
     ref = refl[sem].astype(np.float64) * cos_theta * np.exp(-att * dist)
 
     out = wp.zeros(n, dtype=wp.float32, device=DEV)
@@ -510,13 +511,22 @@ def test_bin_process_matches_bin_intensity_and_flags_out_of_grid(kern):
     bin_cnt = wp.zeros((n_range, n_beams), dtype=wp.int32, device=DEV)
     idx = wp.zeros(5, dtype=wp.vec2ui, device=DEV)
     zen = wp.full((n_range, n_beams), value=np.pi, dtype=wp.float32, device=DEV)
+    gain = np.array([1.0, 1.0], dtype=np.float32)
     wp.launch(kern.bin_process, dim=5,
-              inputs=[pcl, it, s, _grid(kern, 0, 0, 1, 1, n_range, n_beams)],
+              inputs=[pcl, it, s, _grid(kern, 0, 0, 1, 1, n_range, n_beams),
+                      wp.float32(np.pi),                    # no elevation cut here
+                      wp.array(gain, dtype=wp.float32, device=DEV)],
               outputs=[bin_sum, bin_cnt, idx, zen], device=DEV)
     wp.synchronize()
 
-    assert np.array_equal(bin_sum.numpy(), ref_sum.numpy())
+    # Same bins / counts as bin_intensity; sums carry the solid-angle weight
+    # (sin(zen) sin(azi))^3 * gain of each kept point.
     assert np.array_equal(bin_cnt.numpy(), ref_cnt.numpy())
+    w = (np.sin(pts[:, 2]) * np.sin(pts[:, 1])) ** 3
+    expect = np.zeros((n_range, n_beams), dtype=np.float64)
+    for k in (0, 1, 4):
+        expect[int(pts[k, 0]), int(pts[k, 1])] += inten[k] * w[k]
+    assert np.allclose(bin_sum.numpy(), expect, rtol=1e-5)
     bad = int(np.iinfo(np.uint32).max)
     got = idx.numpy()
     assert tuple(got[0]) == (0, 0) and tuple(got[1]) == (1, 0)
@@ -571,3 +581,130 @@ def test_draw_bbox_stays_in_bounds_at_column_zero(kern):
     assert out[0, w - 1, 0] == 255                   # y_min=0 -> last column
     assert out[0, w - 3, 0] == 255                   # y_max=2 -> column w-3
     assert out[:, : w - 3, 0].sum() == 0             # nothing left of the box
+
+
+# --- sonar geometry: elevation, solid angle, near clip, pose ----------------
+
+def _ssm():
+    path = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim",
+                        "utils", "sonar_scan_math.py")
+    spec = importlib.util.spec_from_file_location("sonar_scan_math", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+HFOV, VFOV, W_PX = 130.0, 20.0, 1300
+
+
+def _sphere_returns(ssm, radius=2.0):
+    """Every pixel of the sonar render camera hits a sphere around the sensor:
+    per-pixel (r, azimuth, zenith) in the binning frame."""
+    fx = W_PX / (2 * np.tan(np.deg2rad(HFOV) / 2))
+    h_px = ssm.sonar_render_height(W_PX, HFOV, VFOV)
+    xg, ug = ssm._pixel_rays(W_PX, h_px, fx, fx)
+    azi = np.arctan2(1.0, xg)
+    zen = np.pi / 2 - np.arctan2(ug, np.sqrt(xg * xg + 1.0))
+    spher = np.stack([np.full(azi.shape, radius), azi, zen], axis=-1).reshape(-1, 3)
+    return spher.astype(np.float32), fx, h_px
+
+
+def test_render_height_covers_vfov_at_fan_edge(kern):
+    """The taller render must reach +-vfov/2 elevation even at the +-65 deg fan
+    edge (the old W*vfov/hfov reached only ~16 deg there)."""
+    ssm = _ssm()
+    spher, fx, h_px = _sphere_returns(ssm)
+    assert h_px > int(W_PX * VFOV / HFOV)
+    azi, zen = spher[:, 1], spher[:, 2]
+    edge = np.abs(azi - np.deg2rad(90 - HFOV / 2)) < np.deg2rad(0.5)
+    assert np.max(np.abs(np.pi / 2 - zen[edge])) >= np.deg2rad(VFOV / 2) - 1e-3
+
+
+def test_uniform_sphere_gives_flat_beams_and_obeys_vfov(kern):
+    """A uniform sphere must image as a flat row: with solid-angle weights and
+    per-beam gains every beam integrates the same solid angle (raw pixel
+    counting gave 1.5x stripes and ~5x brighter fan edges), and nothing
+    outside +-vfov/2 contributes."""
+    ssm = _ssm()
+    spher, fx, h_px = _sphere_returns(ssm)
+    res = np.deg2rad(0.25)
+    min_azi = np.deg2rad(90 - HFOV / 2)
+    n_beams = int(np.ceil(np.deg2rad(HFOV) / res - 1e-9))
+    half_v = np.deg2rad(VFOV / 2)
+    gain = ssm.beam_solid_angle_gain(W_PX, h_px, fx, fx, min_azi, res, n_beams,
+                                     np.deg2rad(HFOV), half_v)
+    n = spher.shape[0]
+    out_sum = wp.zeros((4, n_beams), dtype=wp.float32, device=DEV)
+    out_cnt = wp.zeros((4, n_beams), dtype=wp.int32, device=DEV)
+    wp.launch(kern.bin_intensity_sa, dim=n,
+              inputs=[wp.array(spher, dtype=wp.vec3, device=DEV),
+                      wp.array(np.ones(n, np.float32), dtype=wp.float32, device=DEV),
+                      wp.float32(0.0), wp.float32(min_azi), wp.float32(1.0), wp.float32(res),
+                      wp.float32(half_v), wp.array(gain, dtype=wp.float32, device=DEV),
+                      out_sum, out_cnt], device=DEV)
+    wp.synchronize()
+    row = out_sum.numpy()[2]                     # r = 2 m -> range bin 2
+    full = row[1:-1]                             # whole beams (last may overhang)
+    assert full.max() / full.min() == pytest.approx(1.0, abs=0.02)
+    assert row[1:-1].sum() == pytest.approx((np.deg2rad(HFOV) - 2 * res) * 2 * np.sin(half_v), rel=0.01)
+    kept = out_cnt.numpy().sum()
+    in_v = np.sum(np.abs(np.pi / 2 - spher[:, 2]) <= half_v)
+    assert kept == in_v < n                      # the rest of the tall render is cut
+
+
+def test_slant_range_near_depth_keeps_fan_edge_targets(kern):
+    """A target at 0.35 m slant range, 60 deg off boresight, has depth
+    0.175 m: cutting depth at min_range (0.2 m) dropped it."""
+    ssm = _ssm()
+    fx = W_PX / (2 * np.tan(np.deg2rad(HFOV) / 2))
+    h_px = ssm.sonar_render_height(W_PX, HFOV, VFOV)
+    near = ssm.slant_range_near_depth(0.2, W_PX, h_px, fx, fx)
+    assert near < 0.35 * np.cos(np.deg2rad(60.0)) < 0.2
+    corner = np.sqrt(1 + (W_PX / 2 / fx) ** 2 + (h_px / 2 / fx) ** 2)
+    assert near * corner == pytest.approx(0.2)
+
+
+def test_depth_unprojection_numpy_matches_kernel(kern):
+    """The numpy scan fallback and the GPU compaction must build the same
+    world points from depth + CameraParams."""
+    ssm = _ssm()
+    rng = np.random.default_rng(5)
+    h, w = 6, 9
+    depth = rng.uniform(0.5, 3.0, (h, w)).astype(np.float32)
+    world_from_cam = np.eye(4)
+    world_from_cam[:3, 3] = [0.3, -1.0, 2.0]
+    fx, fy = 7.0, 7.0
+    ref = ssm.depth_to_world_points(depth, world_from_cam, fx, fy)
+    n = h * w
+    counter = wp.zeros(1, dtype=wp.int32, device=DEV)
+    outs = [wp.zeros((n, 3), dtype=wp.float32, device=DEV), wp.zeros((n, 3), dtype=wp.float32, device=DEV),
+            wp.zeros(n, dtype=wp.uint32, device=DEV), wp.zeros(n, dtype=wp.uint32, device=DEV)]
+    wp.launch(kern.compact_depth_points, dim=(h, w),
+              inputs=[wp.array(depth, dtype=wp.float32, device=DEV),
+                      wp.array(np.zeros((h, w, 4), np.float32), dtype=wp.float32, device=DEV),
+                      wp.array(np.zeros((h, w), np.uint32), dtype=wp.uint32, device=DEV),
+                      wp.array(np.arange(n, dtype=np.uint32).reshape(h, w), dtype=wp.uint32, device=DEV),
+                      wp.array(np.zeros(1, np.uint8), dtype=wp.uint8, device=DEV),
+                      wp.mat44(world_from_cam.astype(np.float32)), fx, fy, w / 2.0, h / 2.0,
+                      0.1, 10.0, counter] + outs, device=DEV)
+    wp.synchronize()
+    order = np.argsort(outs[3].numpy())
+    assert np.allclose(outs[0].numpy()[order], ref, atol=1e-5)
+
+
+def test_back_facing_normal_does_not_cancel_return(kern):
+    """A visible surface with a flipped normal must still return energy (it
+    used to add a negative intensity that erased other returns in its bin)."""
+    pcl = np.array([[0.0, 0.0, -2.0], [0.0, 0.0, -2.0]], dtype=np.float32)
+    normals = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float32)  # front, back
+    out = wp.zeros(2, dtype=wp.float32, device=DEV)
+    wp.launch(kern.compute_intensity, dim=2,
+              inputs=[wp.array(pcl, dtype=wp.float32, device=DEV),
+                      wp.array(normals, dtype=wp.float32, device=DEV),
+                      wp.mat44(np.eye(4, dtype=np.float32)),
+                      wp.array(np.zeros(2, np.uint32), dtype=wp.uint32, device=DEV),
+                      wp.array(np.ones(1, np.float32), dtype=wp.float32, device=DEV), 0.0],
+              outputs=[out], device=DEV)
+    wp.synchronize()
+    a, b = out.numpy()
+    assert a > 0 and b == pytest.approx(a)
