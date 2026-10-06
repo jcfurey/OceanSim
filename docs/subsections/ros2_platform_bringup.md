@@ -7,12 +7,13 @@ platform or a single URDF.
 
 ## 1. Pick a platform (or bring your own asset)
 
-Vehicles live in a small registry (`isaacsim/oceansim/utils/platforms.py`). Two
+Vehicles live in a small registry (`isaacsim/oceansim/utils/platforms.py`). Three
 ship today:
 
 | Platform key | Vehicle | Notes |
 |---|---|---|
 | `bluerov2` | Blue Robotics BlueROV2 | default |
+| `bluerov2_heavy` | BlueROV2 Heavy (8 thrusters) | same 3D asset |
 | `deeptrekker_revolution` | Deep Trekker REVOLUTION | 26 kg, 6 thrusters |
 
 A platform's spec supplies the USD/URDF asset path, mass/damping, collision,
@@ -74,6 +75,7 @@ their QoS is compatible.
 | `/oceansim/robot/joint_command` | sensor_msgs/JointState | sub | sensor |
 | `/oceansim/robot/vel_cmd` | geometry_msgs/Twist (or TwistStamped, §6) | sub | reliable |
 | `/oceansim/robot/force_cmd` | geometry_msgs/Wrench | sub | reliable |
+| `/oceansim/robot/thruster_cmd` | std_msgs/Float64MultiArray (§6) | sub | reliable |
 
 Sensor streams are **best-effort**: subscribe best-effort (RViz / `sonar_image_proc`
 do by default), or you will silently receive nothing.
@@ -117,12 +119,19 @@ commands move the vehicle:
 | `velocity control` (default) | Twist, body frame | Sets the body velocity every step (kinematic). Exact tracking, but buoyancy, drag and collision response are overwritten. |
 | `dynamic velocity control` | Twist, body frame | A PI loop with damping feedforward turns the command into force / torque (`ros2_control_math.BodyVelocityPI`), so the physics still acts. Use this to tune controllers that must transfer to a real vehicle. |
 | `force control` | Wrench, body frame, N / N·m | Applied at the centre of mass each step. |
+| `thruster control` | Float64MultiArray on `/oceansim/robot/thruster_cmd`, one value in [−1, 1] per thruster | Through each thruster's thrust curve. Needs the vehicle model. |
+
+With the platform's vehicle model on (the default; see [Vehicle Models](vehicle_models.md)),
+the force, dynamic velocity and manual modes go through the thrusters, so thrust
+limits and lag apply. The dynamic mode's feedforward is then the model's drag at
+the commanded velocity rather than PhysX damping. Kinematic `velocity control`
+bypasses the model.
 
 Forces go through a rigid-body tensor view in newtons. The old `PhysxForceAPI`
 path defaulted to *acceleration* mode, so a Wrench was read as m/s².
 
 Other `control_params`:
-- `vel_topic` / `force_topic`: topic names, e.g. `"/cmd_vel"` for Nav2.
+- `vel_topic` / `force_topic` / `thruster_topic`: topic names, e.g. `"/cmd_vel"` for Nav2.
 - `stamped_cmd_vel: true`: subscribe `TwistStamped`. Use it with Nav2's
   `enable_stamped_cmd_vel` (the default from Kilted on).
 - `command_timeout`: dead-man timeout in seconds (default 2). A silent link

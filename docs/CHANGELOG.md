@@ -30,6 +30,17 @@ were tuned against real data.
 
 ### Added
 
+- **(output change)** Vehicle models: 6-DOF hydrodynamics (linear + quadratic
+  drag, added mass, weight and buoyancy with righting moment and partial
+  buoyancy at the surface) and thrusters (allocation, saturation, lag) for
+  `bluerov2`, the new `bluerov2_heavy`, and `deeptrekker_revolution`, replacing
+  the PhysX damping stand-in. BlueROV2 data from von Benzon et al. 2022 and the
+  T200 datasheet; the Revolution is estimated from its specs. The BlueROV2's
+  in-air mass is now 11.5 kg (was 5). Vehicles drift with their buoyancy when
+  idle. `robot.hydrodynamics: false` restores the old behaviour. See
+  `docs/subsections/vehicle_models.md`
+- ROS `thruster control` mode: normalised per-thruster commands on
+  `/oceansim/robot/thruster_cmd`
 - Opt-in sonar model terms for `make_sonar_data` / `sonar_params.model_params`, all
   off by default: spreading / absorption / TVG range gain, Gamma speckle with a
   correlation cell, Gaussian beam-pattern blur

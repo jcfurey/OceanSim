@@ -52,8 +52,13 @@ class MHL_Sensor_Example_Scenario():
         self._omni_ros_writers = []  # replicator ROS writers to detach on teardown
         self._cmd_vel_controller = None
 
+        # Platform hydrodynamics + thrusters (utils.vehicle_physics), if the
+        # caller passed the platform's VehicleModel.
+        self._vehicle = None
+
     def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode, sensor_viewports=True,
-                       control_params=None, imu=None, use_omnigraph_ros=False):
+                       control_params=None, imu=None, use_omnigraph_ros=False,
+                       vehicle_model=None):
         """use_omnigraph_ros=True wires upstream OceanSim's OmniGraph ROS2
         publishers (ros2_helpers.OmniHandler + the *_ROS sensor classes, which
         the caller must have constructed) and a /cmd_vel subscriber. The
@@ -79,6 +84,9 @@ class MHL_Sensor_Example_Scenario():
         self._DVL = DVL
         self._baro = baro
         self._ctrl_mode = ctrl_mode
+        if vehicle_model is not None:
+            from isaacsim.oceansim.utils.vehicle_physics import IsaacVehicle
+            self._vehicle = IsaacVehicle(rob, vehicle_model)
         # sensor_viewports=False skips the per-sensor GUI windows (sonar + UW camera)
         # AND their per-frame set_bytes_data_from_gpu readback, while still rendering
         # the AOVs for ROS publishing and keeping the main Isaac viewport. (Manually
@@ -223,9 +231,10 @@ class MHL_Sensor_Example_Scenario():
                 max_angular_vel=control_params.get("max_angular_vel"),
                 max_force=control_params.get("max_force"),
                 max_torque=control_params.get("max_torque"),
-                velocity_pi=control_params.get("velocity_pi"))
+                velocity_pi=control_params.get("velocity_pi"),
+                vehicle=self._vehicle)
 
-            topics = {k: control_params[k] for k in ("vel_topic", "force_topic")
+            topics = {k: control_params[k] for k in ("vel_topic", "force_topic", "thruster_topic")
                       if control_params.get(k)}
             self._ros2_control_receiver.initialize(
                 enable_ros2=True,
@@ -309,6 +318,10 @@ class MHL_Sensor_Example_Scenario():
         # clear the ROS2 control receiver
         if self._ros2_control_receiver is not None:
             _safe_teardown(self._ros2_control_receiver.close, "ROS2 control receiver")
+            self._ros2_control_receiver = None
+        if self._vehicle is not None:
+            _safe_teardown(self._vehicle.close, "vehicle model")
+            self._vehicle = None
 
         self._rob = None
         self._rob_rigid = None
@@ -419,13 +432,21 @@ class MHL_Sensor_Example_Scenario():
             # apply_forces_and_torques_at_pos takes newtons / N*m, so scale by the
             # body's mass and inertia diagonal (else a 26 kg vehicle would get
             # 1/26 of the thrust it had before).
-            force = (np.asarray(self._force_cmd._base_command, dtype=np.float32)
-                     * self._manual_mass).reshape(1, 3)
-            torque = (np.deg2rad(np.asarray(self._torque_cmd._base_command, dtype=np.float32))
-                      * self._manual_inertia).reshape(1, 3).astype(np.float32)
-            self._rob_view.apply_forces_and_torques_at_pos(
-                forces=force, torques=torque, is_global=False
-            )
+            if self._vehicle is not None:
+                # Same accelerations, demanded from the thrusters (with
+                # added mass), so thrust limits apply.
+                eff = self._vehicle.effective_mass()
+                self._vehicle.command_wrench(
+                    np.asarray(self._force_cmd._base_command, dtype=float) * eff[:3],
+                    np.deg2rad(np.asarray(self._torque_cmd._base_command, dtype=float)) * eff[3:])
+            else:
+                force = (np.asarray(self._force_cmd._base_command, dtype=np.float32)
+                         * self._manual_mass).reshape(1, 3)
+                torque = (np.deg2rad(np.asarray(self._torque_cmd._base_command, dtype=np.float32))
+                          * self._manual_inertia).reshape(1, 3).astype(np.float32)
+                self._rob_view.apply_forces_and_torques_at_pos(
+                    forces=force, torques=torque, is_global=False
+                )
         elif self._ctrl_mode=="Waypoints":
             if len(self.waypoints) > 0:
                 waypoints = self.waypoints[0]
@@ -445,6 +466,18 @@ class MHL_Sensor_Example_Scenario():
                 # Once, not every physics step (60 Hz of identical lines).
                 self._warned_no_receiver = True
                 print("[Scenario] ROS2 Control receiver is not initialized, skipping update.")
+
+        # Hydrodynamics + thrust, after the controllers set this step's command.
+        # Skipped while a kinematic mode overwrites the pose / velocity anyway.
+        if self._vehicle is not None and not self._kinematic_control():
+            self._safe_call(self._vehicle.step, step, name="vehicle dynamics")
+
+    def _kinematic_control(self):
+        """True when the active control sets the pose or velocity directly."""
+        if self._ctrl_mode == "Waypoints":
+            return True
+        return (self._ctrl_mode == "ROS control"
+                and self._ros2_control_mode == "velocity control")
 
     def _init_manual_control_view(self):
         """Create the manual-control RigidPrim view (post-play) and cache the

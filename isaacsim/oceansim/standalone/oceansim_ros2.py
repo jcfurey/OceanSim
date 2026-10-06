@@ -111,10 +111,13 @@ def load_config(args):
         "control_mode": "ROS control",
         # ROS control. ros2_mode: "velocity control" (kinematic: sets the body
         # velocity every step), "force control" (geometry_msgs/Wrench in N /
-        # N*m, body frame) or "dynamic velocity control" (cmd_vel tracked by a
+        # N*m, body frame), "dynamic velocity control" (cmd_vel tracked by a
         # PI loop through forces, so buoyancy / drag / collisions still act --
         # see ros2_control_math.BodyVelocityPI; velocity_pi overrides its
-        # gains). stamped_cmd_vel subscribes TwistStamped (Nav2
+        # gains) or "thruster control" (std_msgs/Float64MultiArray of
+        # normalised per-thruster commands on thruster_topic; needs the
+        # hydrodynamic model). With the model, force and dynamic velocity
+        # control go through the thrusters, so their limits apply. stamped_cmd_vel subscribes TwistStamped (Nav2
         # enable_stamped_cmd_vel). command_timeout is the dead-man timeout (s).
         # max_* clamp command / wrench magnitudes (direction-preserving); None =
         # unbounded -- no repo-documented physical limits exist yet.
@@ -123,6 +126,7 @@ def load_config(args):
                            "ros2_mode": "velocity control",
                            "vel_topic": "/oceansim/robot/vel_cmd",
                            "force_topic": "/oceansim/robot/force_cmd",
+                           "thruster_topic": "/oceansim/robot/thruster_cmd",
                            "stamped_cmd_vel": False, "command_timeout": 2.0,
                            "velocity_pi": {}},
         "scene_usd": "",
@@ -132,7 +136,14 @@ def load_config(args):
         # optional "robot" dict overrides individual fields (e.g. mass,
         # translation, usd_path, urdf_path, robot_description).
         "platform": "bluerov2",
+        # robot: per-field overrides of the platform spec (mass, translation,
+        # usd_path, urdf_path, ...). Hydrodynamics (utils.vehicle_dynamics):
+        # "hydrodynamics" (default true for platforms that have a model) applies
+        # drag, buoyancy, added mass and thrusters instead of the PhysX damping
+        # proxy; "thruster_voltage" (T200 platforms) and "drag_scale" tune it.
         "robot": {},
+        # Water density (kg/m^3) for buoyancy: 1000 fresh (the MHL tank), ~1025 sea.
+        "water_density": 1000.0,
         "sensors": {"sonar": True, "camera": True, "dvl": True, "baro": True},
         # Per-sensor GUI windows (sonar + UW camera viewports). False also skips
         # their per-frame set_bytes_data_from_gpu readback; AOVs still render for ROS
@@ -406,8 +417,10 @@ def main(argv):
     # Each field falls back to the platform spec unless explicitly overridden in
     # cfg["robot"]. (For bluerov2 the spec values equal the old hardcoded ones,
     # so this is behaviour-preserving.)
-    lin_d = float(rob_cfg.get("linear_damping", spec.linear_damping))
-    ang_d = float(rob_cfg.get("angular_damping", spec.angular_damping))
+    use_hydro = bool(rob_cfg.get("hydrodynamics", True)) and spec.hydro is not None
+    # With the hydrodynamic model the drag comes from it, not PhysX damping.
+    lin_d = 0.0 if use_hydro else float(rob_cfg.get("linear_damping", spec.linear_damping))
+    ang_d = 0.0 if use_hydro else float(rob_cfg.get("angular_damping", spec.angular_damping))
     spawn = np.array(rob_cfg.get("translation", spec.spawn_translation), dtype=float)
 
     # USD or URDF? An explicit robot.usd_path / robot.urdf_path wins, else the
@@ -481,6 +494,24 @@ def main(argv):
         rob_collider.set_collision_approximation(collision)
         SingleRigidPrim(prim_path=robot_path, mass=mass, translation=spawn)
     robot_prim = get_prim_at_path(robot_path)
+
+    vehicle_model = None
+    if use_hydro:
+        from isaacsim.oceansim.utils import vehicle_dynamics, vehicle_physics
+        mass = float(rob_cfg.get("mass", spec.mass))
+        vehicle_physics.configure_prim(robot_prim, spec, mass=mass)
+        vehicle_model = vehicle_dynamics.from_platform(
+            spec, rho=float(cfg.get("water_density", 1000.0)),
+            surface_z=cfg.get("water_surface_z"),
+            voltage=rob_cfg.get("thruster_voltage"),
+            drag_scale=float(rob_cfg.get("drag_scale", 1.0)), mass=mass)
+        _net = (vehicle_model.rho * spec.hydro.displaced_volume - mass) * vehicle_model.g
+        print(f"[oceansim_ros2] hydrodynamics: {spec.name}, {vehicle_model.thrusters.count} "
+              f"thrusters (max {vehicle_model.thrusters.max_forward.max():.1f} N fwd), "
+              f"net buoyancy {_net:+.1f} N, water density {vehicle_model.rho:g}")
+    else:
+        print(f"[oceansim_ros2] hydrodynamics off: PhysX damping {lin_d:g}/{ang_d:g} "
+              f"stands in for drag")
 
     # If the robot came from a URDF, let the URDF's sensor links define the mount
     # poses (a "sonar" / "camera" / "dvl" link's fixed-joint origin relative to
@@ -648,7 +679,8 @@ def main(argv):
     _sv = (not cfg["headless"]) if _sv is None else bool(_sv)
     scenario.setup_scenario(robot_prim, sonar, cam, dvl, baro, cfg["control_mode"],
                             sensor_viewports=_sv,
-                            control_params=cfg.get("control_params"))
+                            control_params=cfg.get("control_params"),
+                            vehicle_model=vehicle_model)
     # Throttle the heavy sensor compute to sensor_compute_rate (0 = every step).
     _scr = float(cfg.get("sensor_compute_rate", 0.0) or 0.0)
     scenario._sensor_update_period = (1.0 / _scr) if _scr > 0 else 0.0

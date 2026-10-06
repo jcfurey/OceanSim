@@ -389,6 +389,18 @@ class UIBuilder():
                             translation=np.array(spec.spawn_translation, dtype=float))
         self._rob = get_prim_at_path(robot_prim_path)
 
+        # Hydrodynamics + thrusters for platforms that have a model (drag,
+        # buoyancy, added mass, thrust limits) in place of the PhysX damping
+        # proxy set above.
+        self._vehicle_model = None
+        if spec.hydro is not None:
+            from isaacsim.oceansim.utils import vehicle_dynamics, vehicle_physics
+            vehicle_physics.configure_prim(self._rob, spec)
+            self._vehicle_model = vehicle_dynamics.from_platform(
+                spec, rho=1000.0, surface_z=self._water_surface)
+            print(f"[OceanSim] hydrodynamics: {spec.name}, "
+                  f"{self._vehicle_model.thrusters.count} thrusters")
+
         set_camera_view(eye=np.array([5, 0.6, 0.4]),
                         target=np.array(spec.spawn_translation, dtype=float))
 
@@ -502,7 +514,8 @@ class UIBuilder():
         self._scenario.teardown_scenario()
         self._scenario.setup_scenario(self._rob, self._sonar, self._cam, self._DVL, self._baro, self._ctrl_mode,
                                       imu=self._imu,
-                                      use_omnigraph_ros=getattr(self, "_scene_use_omnigraph_ros", False))
+                                      use_omnigraph_ros=getattr(self, "_scene_use_omnigraph_ros", False),
+                                      vehicle_model=getattr(self, "_vehicle_model", None))
     def _on_post_reset_btn(self):
         """
         This function is attached to the Reset Button as the post_reset_fn callback.
@@ -653,7 +666,8 @@ class UIBuilder():
                 self._ros2_control_mode_model = dropdown_builder(
                     label='ROS2 Control Mode',
                     default_val=0,
-                    items=['velocity control', 'force control', 'dynamic velocity control'],
+                    items=['velocity control', 'force control', 'dynamic velocity control',
+                           'thruster control'],
                     tooltip=('velocity control: sets the body velocity (kinematic); '
                              'force control: Wrench in N / N*m; dynamic velocity control: '
                              'cmd_vel tracked by a PI loop through forces'),

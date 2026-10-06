@@ -33,6 +33,7 @@ class ROS2_CONTROL_MODE(Enum):
     VEL = 1          # velocity control: kinematic, sets the body velocity each step
     FORCE = 2        # force control: body-frame Wrench applied as force / torque
     VEL_DYNAMIC = 3  # dynamic velocity control: cmd_vel -> PI -> force / torque
+    THRUSTER = 4     # thruster control: normalised per-thruster commands (needs a vehicle model)
 
 
 # Mode names as the GUI dropdown / runner config spell them.
@@ -40,6 +41,7 @@ CONTROL_MODE_NAMES = {
     "velocity control": ROS2_CONTROL_MODE.VEL,
     "force control": ROS2_CONTROL_MODE.FORCE,
     "dynamic velocity control": ROS2_CONTROL_MODE.VEL_DYNAMIC,
+    "thruster control": ROS2_CONTROL_MODE.THRUSTER,
 }
 
 class ROS2ControlReceiver:
@@ -51,7 +53,7 @@ class ROS2ControlReceiver:
     
     def __init__(self, robot_prim, name="ROS2ControlReceiver",
                  max_linear_vel=None, max_angular_vel=None,
-                 max_force=None, max_torque=None, velocity_pi=None):
+                 max_force=None, max_torque=None, velocity_pi=None, vehicle=None):
         """
         initialize ROS2 Control Receiver
 
@@ -72,6 +74,12 @@ class ROS2ControlReceiver:
                 ki_ang, i_limit_lin, i_limit_ang, damping_lin, damping_ang). The
                 damping feedforward defaults to the prim's PhysX linear /
                 angular damping.
+            vehicle (vehicle_physics.IsaacVehicle | None): the platform's
+                hydrodynamics + thruster model. When set, force and dynamic
+                velocity control command its thrusters (so thrust limits and
+                lag apply) instead of applying the wrench directly, the velocity
+                loop's feedforward is the model's drag, and thruster control is
+                available.
         """
         self._name = name
         self._robot_prim = robot_prim
@@ -131,12 +139,15 @@ class ROS2ControlReceiver:
         self._velocity_pi_params = dict(velocity_pi or {})
         self._vel_pi = None
         self._stamped_vel = False
+        self._vehicle = vehicle
+        self.thruster_cmd = None
+        self._ros2_thruster_node = None
         
         print(f"[{self._name}] Initialized for robot prim")
         
     def initialize(self, enable_ros2=True, vel_topic="/oceansim/robot/vel_cmd",
                    force_topic="/oceansim/robot/force_cmd", stamped_vel=False,
-                   command_timeout=None):
+                   command_timeout=None, thruster_topic="/oceansim/robot/thruster_cmd"):
         """
         initialize receiver function
         
@@ -148,8 +159,12 @@ class ROS2ControlReceiver:
                 of Twist on vel_topic (Nav2's enable_stamped_cmd_vel; the
                 default from Kilted on).
             command_timeout (float | None): dead-man timeout (s); None keeps 2.0.
+            thruster_topic (str): std_msgs/Float64MultiArray of normalised
+                per-thruster commands in [-1, 1] for thruster control (only
+                subscribed with a vehicle model).
         """
         self._enable_ros2 = enable_ros2
+        self._thruster_topic = thruster_topic
         self._vel_topic = vel_topic
         self._force_topic = force_topic
         self._stamped_vel = bool(stamped_vel)
@@ -223,9 +238,10 @@ class ROS2ControlReceiver:
             params.setdefault("damping_lin", lin_d)
             params.setdefault("damping_ang", ang_d)
             self._vel_pi = ros2_control_math.BodyVelocityPI(**params)
+            ff = ("drag from the vehicle model" if self._vehicle is not None
+                  else f"PhysX damping {self._vel_pi.damping[[0, 3]].tolist()} 1/s")
             print(f'[{self._name}] dynamic velocity control: kp={self._vel_pi.kp[[0, 3]].tolist()}, '
-                  f'ki={self._vel_pi.ki[[0, 3]].tolist()}, '
-                  f'damping feedforward={self._vel_pi.damping[[0, 3]].tolist()} 1/s')
+                  f'ki={self._vel_pi.ki[[0, 3]].tolist()}, feedforward: {ff}')
         return self._vel_pi
     
     def _setup_subscriber(self):
@@ -250,6 +266,14 @@ class ROS2ControlReceiver:
                 10
             )
 
+            # Per-thruster commands, when a vehicle model with thrusters exists
+            if self._vehicle is not None:
+                from std_msgs.msg import Float64MultiArray
+                node_name = f'oceansim_rob_thruster_control_{self._name.lower()}'.replace(' ', '_')
+                self._ros2_thruster_node = rclpy.create_node(node_name)
+                self._ros2_thruster_node.create_subscription(
+                    Float64MultiArray, self._thruster_topic, self._thruster_callback, 10)
+
             # Create force subscriber node
             node_name = f'oceansim_rob_force_control_{self._name.lower()}'.replace(' ', '_')
             self._ros2_force_node = rclpy.create_node(node_name)
@@ -266,7 +290,7 @@ class ROS2ControlReceiver:
             # node when force-node creation raises), or it leaks for the process
             # lifetime -- close()'s teardown was gated on _enable_ros2, which we
             # just set False.
-            for _attr in ("_ros2_vel_node", "_ros2_force_node"):
+            for _attr in ("_ros2_vel_node", "_ros2_force_node", "_ros2_thruster_node"):
                 _node = getattr(self, _attr, None)
                 if _node is not None:
                     try:
@@ -284,6 +308,10 @@ class ROS2ControlReceiver:
             return
         if new_mode == self._ros2_control_mode:
             return
+        if new_mode == ROS2_CONTROL_MODE.THRUSTER and self._vehicle is None:
+            print(f'[{self._name}] thruster control needs a vehicle model (platform '
+                  f'hydrodynamics); staying in {self._ros2_control_mode.name}')
+            return
         # Mode switch safety:
         # 1. Flush both nodes' queues with callbacks discarding, so a command
         #    queued while the OTHER mode was active (up to depth 10, arbitrarily
@@ -295,7 +323,7 @@ class ROS2ControlReceiver:
         # persists across the switch; the velocity loop's integral is reset.)
         self._discard_commands = True
         try:
-            for node in (self._ros2_vel_node, self._ros2_force_node):
+            for node in (self._ros2_vel_node, self._ros2_force_node, self._ros2_thruster_node):
                 if node is None:
                     continue
                 for _ in range(16):
@@ -307,8 +335,11 @@ class ROS2ControlReceiver:
         self.force_cmd = [0.0, 0.0, 0.0]
         self.torque_cmd = [0.0, 0.0, 0.0]
         self.last_command_time = time.monotonic() - (self.command_timeout + 1.0)
+        self.thruster_cmd = None
         if self._vel_pi is not None:
             self._vel_pi.reset()
+        if self._vehicle is not None:
+            self._vehicle.stop()
         self._ros2_control_mode = new_mode
     
     def _vel_callback(self, msg):
@@ -372,6 +403,21 @@ class ROS2ControlReceiver:
         except Exception as e:
             print(f'[{self._name}] force Receive Failed: {e}')
 
+    def _thruster_callback(self, msg):
+        """msg type: std_msgs/Float64MultiArray, one normalised command in
+        [-1, 1] per thruster (the platform's thruster order)."""
+        if self._discard_commands or not self._enable_ros2:
+            return
+        data = list(msg.data)
+        if self._vehicle is not None and len(data) != self._vehicle.thruster_count:
+            print(f'[{self._name}] thruster command has {len(data)} values, '
+                  f'expected {self._vehicle.thruster_count}; ignored')
+            return
+        self.thruster_cmd = data
+        self.last_command_time = time.monotonic()
+        self._stale_warned = False
+        self._rx_count += 1
+
     @staticmethod
     def _clamp_magnitude(vec, max_mag):
         """Clamp a 3-vector's magnitude to max_mag, preserving direction.
@@ -433,18 +479,42 @@ class ROS2ControlReceiver:
                 lin_b, ang_b = self._body_velocity(view)
                 acc_lin, acc_ang = self._ensure_vel_pi().update(
                     lin_cmd, ang_cmd, lin_b, ang_b, dt)
+                if self._vehicle is not None:
+                    # Thrust = (M_RB + M_A) a + the model's drag at the command.
+                    eff = self._vehicle.effective_mass()
+                    ff = self._vehicle.feedforward(np.concatenate([lin_cmd, ang_cmd]))
+                    wrench = eff * np.concatenate([acc_lin, acc_ang]) + ff
+                    self._vehicle.command_wrench(
+                        self._clamp_magnitude(wrench[:3], self._max_force),
+                        self._clamp_magnitude(wrench[3:], self._max_torque))
+                    return
                 force, torque = ros2_control_math.body_wrench(
                     acc_lin, acc_ang, self._mass, self._inertia)
                 self._apply_body_wrench(view, force, torque)
 
             elif self._ros2_control_mode == ROS2_CONTROL_MODE.FORCE: # force mode
                 self._drain_node(self._ros2_force_node)
+                if self._vehicle is not None:
+                    if self._is_command_stale():
+                        self._vehicle.stop()
+                    else:
+                        self._vehicle.command_wrench(
+                            self._clamp_magnitude(self.force_cmd, self._max_force),
+                            self._clamp_magnitude(self.torque_cmd, self._max_torque))
+                    return
                 if self._is_command_stale():
                     return  # view forces last one step: nothing applied = zero wrench
                 view = self._ensure_view()
                 if view is None:
                     return
                 self._apply_body_wrench(view, self.force_cmd, self.torque_cmd)
+
+            elif self._ros2_control_mode == ROS2_CONTROL_MODE.THRUSTER:
+                self._drain_node(self._ros2_thruster_node)
+                if self._is_command_stale() or self.thruster_cmd is None:
+                    self._vehicle.stop()
+                else:
+                    self._vehicle.command_thrusters(self.thruster_cmd)
 
         except Exception as e:
             print(f'[{self._name}] Control Update Failed: {e}')
@@ -522,6 +592,9 @@ class ROS2ControlReceiver:
             if self._ros2_force_node:
                 self._ros2_force_node.destroy_node()
                 self._ros2_force_node = None
+            if self._ros2_thruster_node:
+                self._ros2_thruster_node.destroy_node()
+                self._ros2_thruster_node = None
 
             self._update_count = 0
             self._view = None
