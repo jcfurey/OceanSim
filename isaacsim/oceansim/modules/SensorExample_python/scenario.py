@@ -49,6 +49,7 @@ class MHL_Sensor_Example_Scenario():
         # Upstream OmniGraph ROS2 publishers (opt-in, see setup_scenario)
         self._use_omnigraph_ros = False
         self.omni_ros = None
+        self._omni_ros_writers = []  # replicator ROS writers to detach on teardown
         self._cmd_vel_controller = None
 
     def setup_scenario(self, rob, sonar, cam, DVL, baro, ctrl_mode, sensor_viewports=True,
@@ -172,8 +173,10 @@ class MHL_Sensor_Example_Scenario():
                 include_unlabelled=True, viewport=sensor_viewports,
                 og_node=self.omni_ros._sonar_node
             )
-            ros2_helpers.publish_camera_info(self._sonar, approx_freq)
-            ros2_helpers.publish_pointcloud_from_depth(self._sonar, approx_freq)
+            self._omni_ros_writers.append(
+                ros2_helpers.publish_camera_info(self._sonar, approx_freq))
+            self._omni_ros_writers.append(
+                ros2_helpers.publish_pointcloud_from_depth(self._sonar, approx_freq))
             ros2_helpers.publish_camera_tf(self._sonar)
 
         if self._cam is not None:
@@ -183,11 +186,11 @@ class MHL_Sensor_Example_Scenario():
                 depth_og_node=self.omni_ros._depth_node,
                 pointcloud_og_node=self.omni_ros._pointcloud_node,
             )
-            ros2_helpers.publish_camera_info(
+            self._omni_ros_writers.append(ros2_helpers.publish_camera_info(
                 self._cam,
                 approx_freq,
                 topic_name="RGBCamera/camera_info",
-            )
+            ))
             ros2_helpers.publish_camera_tf(self._cam)
 
         if self._DVL is not None:
@@ -195,6 +198,16 @@ class MHL_Sensor_Example_Scenario():
 
         if self._baro is not None:
             self._baro.initialize(og_node=self.omni_ros._baro_node)
+
+    def _teardown_omnigraph_ros(self):
+        from isaacsim.oceansim.sensors import ros2_helpers
+
+        writers, self._omni_ros_writers = self._omni_ros_writers, []
+        ros2_helpers.detach_writers(writers)
+        ros2_helpers.remove_camera_tf_graph()
+        if self.omni_ros is not None:
+            self.omni_ros.destroy()
+            self.omni_ros = None
 
     def _setup_ros2_control(self, control_params=None):
         """setup ROS2 control receiver"""
@@ -264,6 +277,13 @@ class MHL_Sensor_Example_Scenario():
                 fn()
             except Exception as e:  # noqa: BLE001
                 print(f'[Scenario] {name} teardown warning: {e}')
+
+        # OmniGraph ROS: detach the replicator ROS writers while the sensors'
+        # render products still exist, then drop the TF + publisher graphs.
+        # Without this every RESET stacked another camera_info / pointcloud
+        # publisher and re-created the PublishTF_* nodes.
+        if self._use_omnigraph_ros or self._omni_ros_writers or self.omni_ros is not None:
+            _safe_teardown(self._teardown_omnigraph_ros, "OmniGraph ROS")
 
         # Because these two sensors create annotator cache in GPU,
         # close() will detach annotator from render product and clear the cache.

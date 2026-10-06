@@ -71,7 +71,9 @@ def publish_camera_info(camera: Camera, freq, topic_name=None):
 
     # Set step input of the Isaac Simulation Gate nodes upstream of ROS publishers to control their execution rate
     og.Controller.attribute(gate_path + ".inputs:step").set(step_size)
-    return
+    # Returned so the caller can detach it (detach_writers) before the render
+    # product goes away; otherwise every scenario RESET stacks another publisher.
+    return writer
 
 
 def publish_pointcloud_from_depth(camera: Camera, freq, topic_name=None):
@@ -107,7 +109,34 @@ def publish_pointcloud_from_depth(camera: Camera, freq, topic_name=None):
     )
     og.Controller.attribute(gate_path + ".inputs:step").set(step_size)
 
-    return
+    return writer
+
+
+def detach_writers(writers):
+    """Detach replicator ROS writers returned by publish_camera_info /
+    publish_pointcloud_from_depth. Best-effort: one failure doesn't stop the rest."""
+    for writer in writers or ():
+        try:
+            writer.detach()
+        except Exception as e:  # noqa: BLE001 - teardown must not raise
+            carb.log_warn(f"Failed to detach ROS writer {writer}: {e}")
+
+
+CAMERA_TF_GRAPH_PATH = "/CameraTFActionGraph"
+
+
+def remove_camera_tf_graph():
+    """Delete the shared camera TF action graph built by publish_camera_tf."""
+    _delete_prim_if_exists(CAMERA_TF_GRAPH_PATH)
+
+
+def _delete_prim_if_exists(prim_path):
+    try:
+        stage = omni.usd.get_context().get_stage()
+        if stage is not None and stage.GetPrimAtPath(prim_path):
+            omni.kit.commands.execute("DeletePrims", paths=[prim_path])
+    except Exception as e:  # noqa: BLE001 - teardown must not raise
+        carb.log_warn(f"Failed to delete {prim_path}: {e}")
 
 
 def publish_camera_tf(camera: Camera):
@@ -123,7 +152,7 @@ def publish_camera_tf(camera: Camera):
         camera_frame_id = camera_prim.split("/")[-1]
 
         # Generate an action graph associated with camera TF publishing.
-        ros_camera_graph_path = "/CameraTFActionGraph"
+        ros_camera_graph_path = CAMERA_TF_GRAPH_PATH
 
         # If a camera graph is not found, create a new one.
         if not is_prim_path_valid(ros_camera_graph_path):
@@ -150,65 +179,68 @@ def publish_camera_tf(camera: Camera):
             )
 
         # Generate 2 nodes associated with each camera: TF from world to ROS camera convention, and world frame.
-        og.Controller.edit(
-            ros_camera_graph_path,
-            {
-                og.Controller.Keys.CREATE_NODES: [
-                    (
-                        "PublishTF_" + camera_frame_id,
-                        "isaacsim.ros2.bridge.ROS2PublishTransformTree",
-                    ),
-                    (
-                        "PublishRawTF_" + camera_frame_id + "_world",
-                        "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
-                    ),
-                ],
-                og.Controller.Keys.SET_VALUES: [
-                    ("PublishTF_" + camera_frame_id + ".inputs:topicName", "/tf"),
-                    # Note if topic_name is changed to something else besides "/tf",
-                    # it will not be captured by the ROS tf broadcaster.
-                    (
-                        "PublishRawTF_" + camera_frame_id + "_world.inputs:topicName",
-                        "/tf",
-                    ),
-                    (
-                        "PublishRawTF_"
-                        + camera_frame_id
-                        + "_world.inputs:parentFrameId",
-                        camera_frame_id,
-                    ),
-                    (
-                        "PublishRawTF_"
-                        + camera_frame_id
-                        + "_world.inputs:childFrameId",
-                        camera_frame_id + "_world",
-                    ),
-                    # Static transform from ROS camera convention to world (+Z up, +X forward) convention:
-                    (
-                        "PublishRawTF_" + camera_frame_id + "_world.inputs:rotation",
-                        [0.5, -0.5, 0.5, 0.5],
-                    ),
-                ],
-                og.Controller.Keys.CONNECT: [
-                    (
-                        ros_camera_graph_path + "/OnTick.outputs:tick",
-                        "PublishTF_" + camera_frame_id + ".inputs:execIn",
-                    ),
-                    (
-                        ros_camera_graph_path + "/OnTick.outputs:tick",
-                        "PublishRawTF_" + camera_frame_id + "_world.inputs:execIn",
-                    ),
-                    (
-                        ros_camera_graph_path + "/IsaacClock.outputs:simulationTime",
-                        "PublishTF_" + camera_frame_id + ".inputs:timeStamp",
-                    ),
-                    (
-                        ros_camera_graph_path + "/IsaacClock.outputs:simulationTime",
-                        "PublishRawTF_" + camera_frame_id + "_world.inputs:timeStamp",
-                    ),
-                ],
-            },
-        )
+        # Skip if this camera's nodes already exist (e.g. a scenario reset that
+        # kept the graph): creating them again fails on the duplicate names.
+        if not is_prim_path_valid(ros_camera_graph_path + "/PublishTF_" + camera_frame_id):
+            og.Controller.edit(
+                ros_camera_graph_path,
+                {
+                    og.Controller.Keys.CREATE_NODES: [
+                        (
+                            "PublishTF_" + camera_frame_id,
+                            "isaacsim.ros2.bridge.ROS2PublishTransformTree",
+                        ),
+                        (
+                            "PublishRawTF_" + camera_frame_id + "_world",
+                            "isaacsim.ros2.bridge.ROS2PublishRawTransformTree",
+                        ),
+                    ],
+                    og.Controller.Keys.SET_VALUES: [
+                        ("PublishTF_" + camera_frame_id + ".inputs:topicName", "/tf"),
+                        # Note if topic_name is changed to something else besides "/tf",
+                        # it will not be captured by the ROS tf broadcaster.
+                        (
+                            "PublishRawTF_" + camera_frame_id + "_world.inputs:topicName",
+                            "/tf",
+                        ),
+                        (
+                            "PublishRawTF_"
+                            + camera_frame_id
+                            + "_world.inputs:parentFrameId",
+                            camera_frame_id,
+                        ),
+                        (
+                            "PublishRawTF_"
+                            + camera_frame_id
+                            + "_world.inputs:childFrameId",
+                            camera_frame_id + "_world",
+                        ),
+                        # Static transform from ROS camera convention to world (+Z up, +X forward) convention:
+                        (
+                            "PublishRawTF_" + camera_frame_id + "_world.inputs:rotation",
+                            [0.5, -0.5, 0.5, 0.5],
+                        ),
+                    ],
+                    og.Controller.Keys.CONNECT: [
+                        (
+                            ros_camera_graph_path + "/OnTick.outputs:tick",
+                            "PublishTF_" + camera_frame_id + ".inputs:execIn",
+                        ),
+                        (
+                            ros_camera_graph_path + "/OnTick.outputs:tick",
+                            "PublishRawTF_" + camera_frame_id + "_world.inputs:execIn",
+                        ),
+                        (
+                            ros_camera_graph_path + "/IsaacClock.outputs:simulationTime",
+                            "PublishTF_" + camera_frame_id + ".inputs:timeStamp",
+                        ),
+                        (
+                            ros_camera_graph_path + "/IsaacClock.outputs:simulationTime",
+                            "PublishRawTF_" + camera_frame_id + "_world.inputs:timeStamp",
+                        ),
+                    ],
+                },
+            )
     except Exception as e:
         carb.log_error(f"Failed to setup camera TF publishers: {e}")
 
@@ -255,7 +287,20 @@ class OmniHandler:
         self._use_imu = use_imu
         self._use_dvl = use_dvl
         self._use_baro = use_baro
+        self._graph_path = f"/UW_Publisher_{self._name}"
         self._setup_ros_graph()
+
+    def destroy(self):
+        """Delete this handler's publisher graph and drop the node handles."""
+        _delete_prim_if_exists(self._graph_path)
+        self._og_graph = None
+        self._rgb_node = None
+        self._depth_node = None
+        self._pointcloud_node = None
+        self._sonar_node = None
+        self._imu_node = None
+        self._dvl_node = None
+        self._baro_node = None
 
     @staticmethod
     def _add_sensor_publisher(
@@ -286,7 +331,7 @@ class OmniHandler:
         """Creates a standalone OmniGraph to drive the internal C++ ROS Bridge."""
         try:
             keys = og.Controller.Keys
-            graph_path = f"/UW_Publisher_{self._name}"
+            graph_path = self._graph_path
 
             if omni.usd.get_context().get_stage().GetPrimAtPath(graph_path):
                 omni.kit.commands.execute("DeletePrims", paths=[graph_path])
