@@ -89,6 +89,8 @@ to use the device's best resolution at a higher simulation cost. Set
 `sonar_params.model_params.beam_fwhm_deg` to zero to disable the approximate
 Gaussian beam response. Sonar presets use global ping normalisation so relative
 echo strength is preserved across ranges; explicit model parameters override it.
+On the Revolution the sonar looks out level from the pivot head, so command the
+head joint to tilt it towards the seabed.
 
 Check live ROS output and save camera/sonar captures from inside the service:
 

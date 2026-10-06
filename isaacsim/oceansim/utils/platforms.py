@@ -366,9 +366,15 @@ _BLUEROV2_HEAVY = PlatformSpec(
 # deeptrekker_revolution + settings_erdc/urdf/sensors.urdf.xacro), expressed in
 # base_link at pivot_head angle 0, so the sim places sensors where
 # robot_state_publisher's TF tree expects them:
-#   sonar:  base->pivot_head (0.215,0,0) + Oculus mount (0.0625,0,0.04, pitch 30)
-#           = (0.2775,0,0.04) pitch 30. NOTE the real sonar rides the articulated
-#           pivot_head (revolute joint); this static mount is exact only at angle 0.
+#   sonar:  base->pivot_head (0.215,0,0) + Oculus face (0.12,0,0.04), level
+#           = (0.335,0,0.04). It looks out of the head, level at head angle 0,
+#           so tilting pivot_head tilts the fan. The ROS stack's bracket origin
+#           (0.0625,0,0.04, pitch 30) lies inside pivot_head.stl, whose front is
+#           at x=0.111: the sonar's render camera saw only the head's inside.
+#           At x=0.12 the whole 130 x 20 deg fan clears the head, chassis and
+#           claw for head angles -105..+120 deg. NOTE the real sonar rides the
+#           articulated pivot_head (revolute joint); this static mount is exact
+#           only at angle 0.
 #   dvl:    Waterlinked A50 at (-0.209,0,-0.06).
 #   camera: child of the sonar connection link, ~(0.2675,0,0.0227).
 # These act as FALLBACKS: when the robot is imported from revolution.urdf the
@@ -386,7 +392,7 @@ _DEEPTREKKER_REVOLUTION = PlatformSpec(
     angular_damping=15.0,
     collision_approximation="boundingCube",
     spawn_translation=(-2.0, 0.0, -0.8),
-    sonar_mount=SensorMount((0.2775, 0.0, 0.04), (0.0, 30.0, 0.0)),
+    sonar_mount=SensorMount((0.335, 0.0, 0.04)),
     camera_mount=SensorMount((0.2675, 0.0, 0.0227)),
     dvl_mount=SensorMount((-0.209, 0.0, -0.06)),
     description="Deep Trekker REVOLUTION (mid-size inspection ROV, 26 kg, 6 thrusters).",

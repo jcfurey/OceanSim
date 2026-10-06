@@ -84,6 +84,13 @@ were tuned against real data.
 
 ### Fixed
 
+- **(output change)** The Revolution's sonar looks out level from the pivot
+  head: `sonar_link` moves to (0.12, 0, 0.04) in the head frame with no pitch
+  (was 0.0625, 0, 0.04, pitched 30° down). The old origin lay inside
+  `pivot_head.stl`; once the M3000d's 0.1 m minimum range pulled the render
+  camera's near clip in to 4 cm, the head's inside blocked 82% of the view and
+  the sonar showed no returns. The fan now clears the vehicle for head angles
+  from -105° to +120°; tilt the head to tilt the sonar.
 - Infinite background depths no longer trigger invalid-arithmetic warnings
   during sonar point reconstruction.
 - Docker launchers disable the optional Hub cache by default to avoid failed
