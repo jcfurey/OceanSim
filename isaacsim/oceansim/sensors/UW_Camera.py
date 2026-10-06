@@ -107,6 +107,7 @@ class UW_Camera(Camera):
                    UW_param: np.ndarray = np.array([0.0, 0.31, 0.24, 0.05, 0.05, 0.2, 0.05, 0.05, 0.05 ]),
                    depth_noise_sigma: float = 0.01,
                    max_range: float = 20.0,
+                   depth_visibility_threshold: float = 0.25,
                    viewport: bool = True,
                    writing_dir: str = None,
                    UW_yaml_path: str = None,
@@ -122,7 +123,9 @@ class UW_Camera(Camera):
     
         Args:
             UW_param (np.ndarray, optional): Underwater parameters array:
-                [0:3] - Backscatter value (RGB)
+                [0:3] - Backscatter value B_inf (RGB): the veiling-light colour of
+                        infinitely distant water as seen, sRGB in [0, 1]. The
+                        model itself runs in linear light (UWrenderer_utils).
                 [3:6] - Backscatter coefficients (RGB)
                 [6:9] - Attenuation coefficients (RGB)
                 Defaults to typical coastal water values.
@@ -131,6 +134,9 @@ class UW_Camera(Camera):
                 Only used when host frames are captured (UW_Camera_ROS).
             max_range (float, optional): Maximum depth range for turbidity
                 attenuation. Defaults to 20.0.
+            depth_visibility_threshold (float, optional): Degraded depth keeps a
+                pixel only if its direct signal is at least this fraction of the
+                light reaching the camera, D / (D + backscatter). Defaults to 0.25.
             viewport (bool, optional): Enable viewport visualization. Defaults to True.
             writing_dir (str, optional): Directory to save rendered images. Defaults to None.
             UW_yaml_path (str, optional): Path to YAML file with water properties. Defaults to None.
@@ -148,6 +154,7 @@ class UW_Camera(Camera):
         self._device = wp.get_preferred_device()
         self._depth_noise_sigma = wp.float32(depth_noise_sigma)
         self._max_range = max_range
+        self._depth_visibility_threshold = wp.float32(depth_visibility_threshold)
         super().initialize(physics_sim_view)
 
         if UW_yaml_path is not None:
@@ -462,6 +469,7 @@ class UW_Camera(Camera):
                 self._atten_coeff,
                 self._backscatter_coeff,
                 self._depth_noise_sigma,
+                self._depth_visibility_threshold,
                 int(self._id),
             ],
             outputs=[self._degraded_depth_buf],

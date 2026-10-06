@@ -1,4 +1,21 @@
+import math
+
 import warp as wp
+
+
+def water_coefficients(values, kind="beta"):
+    """Per-channel beta (1/m, as in exp(-beta z)) for one RGB water table entry.
+    kind="transmittance": the values are per-metre transmittances N (e.g. the
+    Jerlov water types, I = J N^z as in UWCNN), so beta = -ln(N), N in (0, 1].
+    kind="beta": the values are already beta and are returned unchanged."""
+    values = tuple(float(v) for v in values)
+    if kind == "transmittance":
+        if any(not (0.0 < v <= 1.0) for v in values):
+            raise ValueError(f"transmittance must be in (0, 1], got {values}")
+        return tuple(-math.log(v) for v in values)
+    if kind != "beta":
+        raise ValueError(f"unknown water coefficient kind {kind!r}")
+    return values
 
 
 @wp.func
@@ -9,6 +26,67 @@ def vec3_exp(exponent: wp.vec3):
 def vec3_mul(vec_1: wp.vec3,
             vec_2: wp.vec3):
     return wp.vec3(vec_1[0] * vec_2[0], vec_1[1] * vec_2[1], vec_1[2] * vec_2[2], dtype=type(vec_1[0]))
+
+@wp.func
+def srgb_to_linear(c: wp.float32):
+    """sRGB transfer function decode, c in [0, 1]."""
+    if c <= wp.float32(0.04045):
+        return c / wp.float32(12.92)
+    return wp.pow((c + wp.float32(0.055)) / wp.float32(1.055), wp.float32(2.4))
+
+
+@wp.func
+def linear_to_srgb(c: wp.float32):
+    """sRGB transfer function encode, c clamped to [0, 1]."""
+    c = wp.clamp(c, wp.float32(0.0), wp.float32(1.0))
+    if c <= wp.float32(0.0031308):
+        return c * wp.float32(12.92)
+    return wp.float32(1.055) * wp.pow(c, wp.float32(1.0) / wp.float32(2.4)) - wp.float32(0.055)
+
+
+@wp.func
+def srgb8_to_linear3(r: wp.uint8, g: wp.uint8, b: wp.uint8):
+    k = wp.float32(1.0) / wp.float32(255.0)
+    return wp.vec3(srgb_to_linear(wp.float32(r) * k),
+                   srgb_to_linear(wp.float32(g) * k),
+                   srgb_to_linear(wp.float32(b) * k))
+
+
+@wp.func
+def srgb_unit_to_linear3(c: wp.vec3):
+    return wp.vec3(srgb_to_linear(c[0]), srgb_to_linear(c[1]), srgb_to_linear(c[2]))
+
+
+@wp.func
+def linear3_to_srgb8(c: wp.vec3, out: wp.array(ndim=3, dtype=wp.uint8), i: int, j: int):
+    out[i, j, 0] = wp.uint8(linear_to_srgb(c[0]) * wp.float32(255.0) + wp.float32(0.5))
+    out[i, j, 1] = wp.uint8(linear_to_srgb(c[1]) * wp.float32(255.0) + wp.float32(0.5))
+    out[i, j, 2] = wp.uint8(linear_to_srgb(c[2]) * wp.float32(255.0) + wp.float32(0.5))
+
+
+@wp.func
+def uw_image_formation(raw_r: wp.uint8, raw_g: wp.uint8, raw_b: wp.uint8,
+                       depth: wp.float32,
+                       backscatter_value: wp.vec3,
+                       atten_coeff: wp.vec3,
+                       backscatter_coeff: wp.vec3):
+    """Akkaynak-Treibitz (revised) underwater image formation in LINEAR light:
+        I = J exp(-beta_D z) + B_inf (1 - exp(-beta_B z)),
+    z the range along the ray. LdrColor is sRGB-encoded, so J is decoded
+    first; applying the model to the encoded values (the old code) made the
+    effective beta ~2x the nominal one. backscatter_value (B_inf) is the
+    veiling-light colour as seen, i.e. sRGB in [0, 1] -- infinitely far water
+    renders exactly that colour. Returns linear RGB."""
+    if not wp.isfinite(depth):
+        # Background (no hit): +inf * a zero coefficient would be NaN; a large
+        # finite range gives exp(0) = 1 / exp(-large) = 0 per channel instead.
+        depth = wp.float32(1.0e4)
+    j_lin = srgb8_to_linear3(raw_r, raw_g, raw_b)
+    b_inf = srgb_unit_to_linear3(backscatter_value)
+    direct = vec3_mul(j_lin, vec3_exp(-depth * atten_coeff))
+    veil = vec3_mul(b_inf, wp.vec3(1.0, 1.0, 1.0) - vec3_exp(-depth * backscatter_coeff))
+    return direct + veil
+
 
 @wp.kernel
 def UW_render(raw_image: wp.array(ndim=3, dtype=wp.uint8),
@@ -22,21 +100,11 @@ def UW_render(raw_image: wp.array(ndim=3, dtype=wp.uint8),
     Render the UW image.
     """
     i,j = wp.tid()
-    raw_RGB = wp.vec3(wp.float32(raw_image[i,j,0]), wp.float32(raw_image[i,j,1]), wp.float32(raw_image[i,j,2]), dtype=wp.float32)
-    depth = depth_image[i,j]
-    # distance_to_camera returns +inf for background (no hit). With a zero
-    # attenuation/backscatter coefficient channel, -inf * 0 = NaN -> exp(NaN) =
-    # NaN -> wp.uint8(NaN) is undefined and corrupts the pixel. Clamp a non-finite
-    # depth to a large finite range so a 0 coefficient yields exp(0)=1 (pixel
-    # unchanged) and a positive coefficient yields exp(-large)=0 (fully attenuated).
-    if not wp.isfinite(depth):
-        depth = wp.float32(1.0e4)
-    exp_atten = vec3_exp(- depth * atten_coeff)
-    exp_back = vec3_exp(- depth * backscatter_coeff)
-    UW_RGB = vec3_mul(raw_RGB, exp_atten) + vec3_mul(backscatter_value * wp.float32(255), (wp.vec3f(1.0,1.0,1.0) - exp_back) )
-    uw_image[i,j,0] = wp.uint8(wp.clamp(UW_RGB[0], wp.float32(0), wp.float32(255)))
-    uw_image[i,j,1] = wp.uint8(wp.clamp(UW_RGB[1], wp.float32(0), wp.float32(255)))
-    uw_image[i,j,2] = wp.uint8(wp.clamp(UW_RGB[2], wp.float32(0), wp.float32(255)))
+    # distance_to_camera returns +inf for background (no hit); the model func
+    # guards it (a zero coefficient channel would otherwise give NaN).
+    lin = uw_image_formation(raw_image[i,j,0], raw_image[i,j,1], raw_image[i,j,2],
+                             depth_image[i,j], backscatter_value, atten_coeff, backscatter_coeff)
+    linear3_to_srgb8(lin, uw_image, i, j)
     uw_image[i,j,3] = raw_image[i,j,3]
 
 
@@ -49,18 +117,12 @@ def UW_render_2(raw_image: wp.array(ndim=3, dtype=wp.uint8),
              backscatter_coeff: wp.vec3,
              uw_image: wp.array(ndim=3, dtype=wp.uint8)):
     i,j = wp.tid()
-    raw_RGB = wp.vec3(wp.float32(raw_image[i,j,0]), wp.float32(raw_image[i,j,1]), wp.float32(raw_image[i,j,2]), dtype=wp.float32)
-    depth = depth_image[i,j]
-    # Same background guard as UW_render: +inf depth (no hit) times a zero
-    # coefficient channel is NaN -> undefined uint8.
-    if not wp.isfinite(depth):
-        depth = wp.float32(1.0e4)
-    exp_atten = vec3_exp(- depth * atten_coeff * scale)
-    exp_back = vec3_exp(- depth * backscatter_coeff * scale)
-    UW_RGB = vec3_mul(raw_RGB, exp_atten) + vec3_mul(backscatter_value * wp.float32(255), (wp.vec3f(1.0,1.0,1.0) - exp_back) )
-    uw_image[i,j,0] = wp.uint8(wp.clamp(UW_RGB[0], wp.float32(0), wp.float32(255)))
-    uw_image[i,j,1] = wp.uint8(wp.clamp(UW_RGB[1], wp.float32(0), wp.float32(255)))
-    uw_image[i,j,2] = wp.uint8(wp.clamp(UW_RGB[2], wp.float32(0), wp.float32(255)))
+    # Same linear-light model as UW_render; `scale` multiplies both
+    # coefficients (scene-scale randomisation in the SDG writer).
+    lin = uw_image_formation(raw_image[i,j,0], raw_image[i,j,1], raw_image[i,j,2],
+                             depth_image[i,j], backscatter_value,
+                             atten_coeff * scale, backscatter_coeff * scale)
+    linear3_to_srgb8(lin, uw_image, i, j)
     uw_image[i,j,3] = raw_image[i,j,3]
 
 @wp.func
@@ -308,36 +370,34 @@ def UW_depth_turbidity_attenuator(
     atten_coeff: wp.vec3,
     backscatter_coeff: wp.vec3,
     sigma: wp.float32,
+    min_visibility: wp.float32,
     seed: int,
     adjusted_depth: wp.array(ndim=2, dtype=wp.float32),
 ):
+    """Turbidity-limited depth: keep a pixel's depth (plus Gaussian noise,
+    std sigma) only where the surface is visible through the water -- its
+    attenuated direct signal D = J exp(-beta_D z) is at least min_visibility of
+    what reaches the camera, D / (D + B) with B = B_inf (1 - exp(-beta_B z))
+    the backscatter veil (linear light, channel means). The old gate compared
+    absolute sRGB brightness to 0.25, so dark surfaces were never measured even
+    at 0.1 m and the backscatter / max_range inputs were ignored."""
     i, j = wp.tid()
-    raw_RGB = wp.vec3(
-        wp.float32(raw_image[i, j, 0]),
-        wp.float32(raw_image[i, j, 1]),
-        wp.float32(raw_image[i, j, 2]),
-        dtype=wp.float32,
-    )
     depth = depth_image[i, j]
 
-    # No return past the sensor's range or without a hit (inf/NaN). max_range
-    # was a parameter but never applied, so far surfaces kept reporting depth.
+    # No return past the sensor's range or without a hit (inf/NaN).
     if not wp.isfinite(depth) or depth <= wp.float32(0.0) or depth > max_range:
         adjusted_depth[i, j] = wp.float32(0.0)
         return
 
-    # beer-lambert decay
-    exp_atten = vec3_exp(-depth * atten_coeff)
-    min_intens = wp.float32(0.25)
-    rgb_intens = vec3_mul(raw_RGB, exp_atten)
+    j_lin = srgb8_to_linear3(raw_image[i, j, 0], raw_image[i, j, 1], raw_image[i, j, 2])
+    b_inf = srgb_unit_to_linear3(backscatter_value)
+    direct = vec3_mul(j_lin, vec3_exp(-depth * atten_coeff))
+    veil = vec3_mul(b_inf, wp.vec3(1.0, 1.0, 1.0) - vec3_exp(-depth * backscatter_coeff))
+    d = (direct[0] + direct[1] + direct[2]) / wp.float32(3.0)
+    b = (veil[0] + veil[1] + veil[2]) / wp.float32(3.0)
+    visibility = d / (d + b + wp.float32(1e-6))
 
-    # average the RGB intensity per pixel
-    av_rgb_intens = (rgb_intens[0] + rgb_intens[1] + rgb_intens[2]) / (
-        wp.float32(3.0) * wp.float32(255.0)
-    )
-
-    # filter all depth points with too low of an intensity to be observable
-    if av_rgb_intens <= min_intens:
+    if visibility < min_visibility:
         adjusted_depth[i, j] = wp.float32(0.0)
     else:
         state = wp.rand_init(seed, i * depth_image.shape[1] + j)

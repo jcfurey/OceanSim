@@ -52,6 +52,13 @@ SEACLEAR_PARAM_DICT = {
 
     
 UW_PARAM_DICT = {
+    # The "backscatter" / "attenuation" tables below are Jerlov water types'
+    # per-metre TRANSMITTANCES N (RGB), as in UWCNN (Li et al.): I = J N^z. The
+    # renderer takes beta in exp(-beta z), so they are converted with
+    # beta = -ln(N) (see _water_coefficients). A UW_param without
+    # "coefficients": "transmittance" is taken as beta directly -- e.g. the
+    # SeaClear experiment configs, whose hand-tuned values (> 1) are betas.
+    "coefficients": "transmittance",
     "scale_range": (1.0, 1.0),
     "veiling": {
             "deep_sea": (0.0, 0.0, 0.28),
@@ -252,6 +259,14 @@ class UWCam_KittiWriter(Writer):
             ))
 
 
+    def _water_coefficients(self, values):
+        """beta (1/m) for one RGB table entry: -ln(N) when this UW_param holds
+        per-metre transmittances ("coefficients": "transmittance", e.g. the
+        default Jerlov tables), else the values are already beta. Using a
+        transmittance as beta rendered clear water (Type I, N ~0.9-0.98) murkier
+        than turbid water (Type 9) and made red the least attenuated channel."""
+        return water_coefficients(values, self._UW_param.get("coefficients", "beta"))
+
     def _get_anno_semantic_mapping(self):
         anno_semantic_mapping = {}
         for k, v in self.mapping_dict.items():
@@ -281,9 +296,11 @@ class UWCam_KittiWriter(Writer):
 
         self._scale = random.uniform(self._UW_param["scale_range"][0], self._UW_param["scale_range"][1])
         self._veiling = random.choice(list(self._UW_param["veiling"].values()))
-        self._backscatter = random.choice(list(self._UW_param["backscatter"].values()))
+        self._backscatter = self._water_coefficients(
+            random.choice(list(self._UW_param["backscatter"].values())))
         # self._attenuation = self._backscatter # Defaul the attentuation to be the same as the backscatter
-        self._attenuation = random.choice(list(self._UW_param["attenuation"].values()))
+        self._attenuation = self._water_coefficients(
+            random.choice(list(self._UW_param["attenuation"].values())))
         uw_image = data[rgb_annotator]
         if self._enable_caustics:
             _caustics_tex = wp.empty(shape=(height, width, 4), dtype=wp.uint8)
@@ -343,8 +360,10 @@ class UWCam_KittiWriter(Writer):
                         data[dist_to_cam_annotator],
                         self._scale,
                         self._veiling,
-                        self._backscatter,
+                        # UW_render_2(..., backscatter_value, atten_coeff, backscatter_coeff):
+                        # these two were passed the other way round.
                         self._attenuation,
+                        self._backscatter,
 
                     ],
                     outputs=[
@@ -360,8 +379,10 @@ class UWCam_KittiWriter(Writer):
                         data[dist_to_cam_annotator],
                         self._scale,
                         self._veiling,
-                        self._backscatter,
+                        # UW_render_2(..., backscatter_value, atten_coeff, backscatter_coeff):
+                        # these two were passed the other way round.
                         self._attenuation,
+                        self._backscatter,
 
                     ],
                     outputs=[
