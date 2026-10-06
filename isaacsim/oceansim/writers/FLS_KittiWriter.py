@@ -14,6 +14,7 @@ from isaacsim.replicator.writers.scripts.utils import calculate_truncation_ratio
 
 # Import sonar rendering kernel
 from isaacsim.oceansim.utils.ImagingSonar_kernels import *
+from isaacsim.oceansim.utils import sonar_scan_math
 from pxr import Gf
 import isaacsim.core.utils.rotations as rotations_utils
 
@@ -125,14 +126,19 @@ class FLS_KittiWriter(Writer):
                 device="cpu", 
                 do_array_copy=False
             ),
-            # We need pointcloud data as the result of rayquest
-            # NOTE (fork): the 'pointcloud' composite annotator crashed natively at
-            # world.play() on Isaac Sim 6.0.1 -- ImagingSonarSensor replaced it with
-            # primitive AOVs for that reason. This upstream SDG writer still uses
-            # it and is untested on Isaac 6.x.
+            # Ray-query points are rebuilt from per-pixel AOVs (depth + normals,
+            # with the semantic / instance ids from the segmentation annotators
+            # below) by compact_depth_points. This replaces the 'pointcloud'
+            # composite annotator, which crashed natively at world.play() on
+            # Isaac Sim 6.x (ImagingSonarSensor made the same switch).
             AnnotatorRegistry.get_annotator(
-                "pointcloud", init_params={"includeUnlabelled": include_unlabelled}, 
-                device=self._device, 
+                "distance_to_image_plane",
+                device=self._device,
+                do_array_copy=False
+            ),
+            AnnotatorRegistry.get_annotator(
+                "normals",
+                device=self._device,
                 do_array_copy=False
             ),
             AnnotatorRegistry.get_annotator(
@@ -222,18 +228,93 @@ class FLS_KittiWriter(Writer):
         
 
     
+    @staticmethod
+    def _annot_array(entry):
+        """Annotator payload -> its array (some AOVs arrive as {'data', 'info'})."""
+        return entry["data"] if isinstance(entry, dict) else entry
+
+    def _to_device(self, arr, wp_dtype, np_dtype):
+        """Contiguous Warp array of wp_dtype on self._device; reuses an
+        already-matching device array, otherwise converts through numpy."""
+        if (isinstance(arr, wp.array) and arr.dtype == wp_dtype
+                and str(arr.device) == self._device):
+            return arr.contiguous()
+        host = arr.numpy() if hasattr(arr, "numpy") else np.asarray(arr)
+        return wp.array(np.ascontiguousarray(host, dtype=np_dtype), dtype=wp_dtype, device=self._device)
+
+    def _gather_points(self, data, depth_annot, normals_annot, cameraParams_annot,
+                       semantic_seg_annot, instance_seg_annot, idToLabels):
+        """Rebuild the ray-query point set (world points, normals, semantic and
+        instance ids) from per-pixel AOVs with compact_depth_points."""
+        depth = self._to_device(self._annot_array(data[depth_annot]), wp.float32, np.float32)
+        if depth.ndim == 3:  # (H, W, 1)
+            depth = depth.reshape((depth.shape[0], depth.shape[1]))
+        height, width = depth.shape
+        normals = self._to_device(self._annot_array(data[normals_annot]), wp.float32, np.float32)
+        semantics = self._to_device(self._annot_array(data[semantic_seg_annot]), wp.uint32, np.uint32)
+        instances = self._to_device(self._annot_array(data[instance_seg_annot]), wp.uint32, np.uint32)
+        semantics = semantics.reshape((height, width))
+        instances = instances.reshape((height, width))
+
+        # include_unlabelled=False: drop UNLABELLED pixels, as the old
+        # pointcloud annotator's includeUnlabelled did.
+        exclude = np.zeros(1, dtype=np.uint8)
+        if not self._include_unlabelled:
+            unlabelled = [int(k) for k, v in idToLabels.items()
+                          if isinstance(v, dict) and v.get("class") == "UNLABELLED"]
+            if unlabelled:
+                exclude = np.zeros(max(unlabelled) + 1, dtype=np.uint8)
+                exclude[unlabelled] = 1
+
+        n_px = height * width
+        if getattr(self, "_pt_capacity", 0) < n_px:
+            self._pt_capacity = n_px
+            self._pt_pcl = wp.empty((n_px, 3), dtype=wp.float32, device=self._device)
+            self._pt_normals = wp.empty((n_px, 3), dtype=wp.float32, device=self._device)
+            self._pt_sem = wp.empty(n_px, dtype=wp.uint32, device=self._device)
+            self._pt_inst = wp.empty(n_px, dtype=wp.uint32, device=self._device)
+            self._pt_counter = wp.zeros(1, dtype=wp.int32, device=self._device)
+        self._pt_counter.zero_()
+
+        cam_to_world, fx, fy, cx, cy = sonar_scan_math.depth_unprojection_from_camera_params(
+            data[cameraParams_annot], width, height)
+        wp.launch(kernel=compact_depth_points,
+                  dim=(height, width),
+                  inputs=[
+                      depth,
+                      normals,
+                      semantics,
+                      instances,
+                      wp.array(exclude, dtype=wp.uint8, device=self._device),
+                      wp.mat44(cam_to_world.astype(np.float32)),
+                      float(fx), float(fy), float(cx), float(cy),
+                      float(self.min_range), float(self.max_range),
+                      self._pt_counter,
+                  ],
+                  outputs=[
+                      self._pt_pcl,
+                      self._pt_normals,
+                      self._pt_sem,
+                      self._pt_inst,
+                  ],
+                  device=self._device)
+        num_points = min(int(self._pt_counter.numpy()[0]), n_px)
+        return (self._pt_pcl[:num_points], self._pt_normals[:num_points],
+                self._pt_sem[:num_points], self._pt_inst[:num_points])
+
     def _render_sonar(self, 
                       data, 
-                      pointcloud_annot: str, 
+                      depth_annot: str,
+                      normals_annot: str,
                       cameraParams_annot: str, 
-                      semantic_seg_annot: str):
+                      semantic_seg_annot: str,
+                      instance_seg_annot: str):
 
-        pcl = data[pointcloud_annot]["data"]  # shape :(1,N,3) <class 'warp.types.array'>
-        normals = data[pointcloud_annot]['info']['pointNormals'] # shape :(1,N,4) <class 'warp.types.array'>
-        semantics = data[pointcloud_annot]['info']['pointSemantic'] # shape: (1, N) <class 'warp.types.array'>
-        instances = data[pointcloud_annot]['info']['pointInstance'] # shape: (1, N) <class 'warp.types.array'>
         viewTransform = data[cameraParams_annot]['cameraViewTransform'].reshape(4,4).T # 4 by 4 np.ndarray extrinsic matrix
         idToLabels = data[semantic_seg_annot]["info"]["idToLabels"] # dict {id (str): {class(str): label(str)}}
+        pcl, normals, semantics, instances = self._gather_points(
+            data, depth_annot, normals_annot, cameraParams_annot,
+            semantic_seg_annot, instance_seg_annot, idToLabels)
 
 
         num_points = pcl.shape[0]
@@ -791,7 +872,8 @@ class FLS_KittiWriter(Writer):
         render_products = [k for k in data.keys() if k.startswith("rp_")]
         if len(render_products) == 1:
             sub_dir = data[render_products[0]]["camera"].split("/")[-1]
-            self._render_sonar(data, "pointcloud", "camera_params", "semantic_segmentation")
+            self._render_sonar(data, "distance_to_image_plane", "normals", "camera_params",
+                               "semantic_segmentation", "instance_segmentation_fast")
             self._write_sonar_image(sub_dir)
             self._write_sonar_segmentation(data, sub_dir,  "instance_segmentation_fast")
             self._write_camera_param(data, sub_dir, "camera_params")
@@ -806,7 +888,11 @@ class FLS_KittiWriter(Writer):
             for render_product in render_products:
                 render_product_name = render_product[3:]
                 sub_dir = os.path.join(render_product_name, data[render_product]["camera"].split("/")[-1])
-                self._render_sonar(data, f"pointcloud-{render_product_name}", f"camera_params-{render_product_name}", f"semantic_segmentation-{render_product_name}")
+                self._render_sonar(data, f"distance_to_image_plane-{render_product_name}",
+                                   f"normals-{render_product_name}",
+                                   f"camera_params-{render_product_name}",
+                                   f"semantic_segmentation-{render_product_name}",
+                                   f"instance_segmentation_fast-{render_product_name}")
                 self._write_sonar_image(sub_dir)
                 self._write_sonar_segmentation(data, sub_dir,  f"instance_segmentation_fast-{render_product_name}")
                 self._write_camera_param(data, sub_dir, f"camera_params-{render_product_name}")

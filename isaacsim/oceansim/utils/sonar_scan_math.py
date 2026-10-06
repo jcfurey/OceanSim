@@ -69,3 +69,23 @@ def make_indexToProp_array(idToLabels, query_property):
                 except (TypeError, ValueError):
                     pass
     return indexToProp_array
+
+
+def depth_unprojection_from_camera_params(camera_params, width, height):
+    """Unprojection inputs for compact_depth_points from a CameraParams
+    annotator dict: ``(cam_to_world, fx, fy, cx, cy)``.
+
+    ``cameraViewTransform`` is the world->camera (USD camera frame) transform in
+    USD's row-vector layout, so its transpose is the column-vector form and
+    ``cam_to_world`` is that matrix's inverse. ``cameraProjection`` is the
+    render's perspective matrix; its diagonal gives P00 = 2f / h_aperture and
+    P11 = 2f / v_aperture, so fx = W * P00 / 2 and fy = H * P11 / 2 -- the
+    effective intrinsics the renderer used. The principal point is the image
+    centre, as Isaac's Camera.get_intrinsics_matrix() assumes.
+    """
+    view = np.asarray(camera_params["cameraViewTransform"], dtype=np.float64).reshape(4, 4).T
+    proj = np.asarray(camera_params["cameraProjection"], dtype=np.float64).reshape(4, 4)
+    cam_to_world = np.linalg.inv(view)
+    fx = 0.5 * float(width) * proj[0, 0]
+    fy = 0.5 * float(height) * proj[1, 1]
+    return cam_to_world, fx, fy, 0.5 * float(width), 0.5 * float(height)

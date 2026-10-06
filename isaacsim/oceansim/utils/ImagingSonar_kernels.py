@@ -427,6 +427,62 @@ def compact_in_range(depth: wp.array(ndim=1, dtype=wp.float32),
             out_sem[i] = semantics[tid]
 
 
+
+@wp.kernel
+def compact_depth_points(depth: wp.array(ndim=2, dtype=wp.float32),
+                         normals: wp.array(ndim=3, dtype=wp.float32),
+                         semantics: wp.array(ndim=2, dtype=wp.uint32),
+                         instances: wp.array(ndim=2, dtype=wp.uint32),
+                         exclude_sem: wp.array(ndim=1, dtype=wp.uint8),
+                         cam_to_world: wp.mat44,
+                         fx: wp.float32,
+                         fy: wp.float32,
+                         cx: wp.float32,
+                         cy: wp.float32,
+                         min_range: wp.float32,
+                         max_range: wp.float32,
+                         counter: wp.array(ndim=1, dtype=wp.int32),
+                         out_pcl: wp.array(ndim=2, dtype=wp.float32),
+                         out_normals: wp.array(ndim=2, dtype=wp.float32),
+                         out_sem: wp.array(ndim=1, dtype=wp.uint32),
+                         out_inst: wp.array(ndim=1, dtype=wp.uint32)):
+    """Per-pixel replacement for the 'pointcloud' composite annotator (which
+    crashed at world.play() on Isaac Sim 6.x): unproject the
+    distance_to_image_plane AOV to WORLD points and append the in-range,
+    finite ones -- with their normals, semantic and instance ids -- through an
+    atomic counter (order arbitrary; the binning kernels don't care).
+
+    Same unprojection as Isaac's Camera.get_pointcloud() depth fallback: pixel
+    centres (u+0.5, v+0.5), pinhole intrinsics fx/fy/cx/cy, ROS optical frame
+    (+x right, +y down, +z forward) flipped to the USD camera frame (+y up, -z
+    forward), then cam_to_world (column-vector form, i.e. the inverse of the
+    transposed CameraParams cameraViewTransform). Pixels whose semantic id has
+    exclude_sem[id] != 0 are dropped (the old annotator's includeUnlabelled=False);
+    pass a one-element zero array to keep everything. counter[0] holds the kept
+    count after the launch; out_* must hold >= H*W points."""
+    v, u = wp.tid()
+    d = depth[v, u]
+    sem = semantics[v, u]
+    excluded = False
+    if sem < wp.uint32(exclude_sem.shape[0]):
+        excluded = exclude_sem[wp.int32(sem)] != wp.uint8(0)
+    if (not excluded) and wp.isfinite(d) and d > min_range and d < max_range:
+        x_ros = (wp.float32(u) + wp.float32(0.5) - cx) * d / fx
+        y_ros = (wp.float32(v) + wp.float32(0.5) - cy) * d / fy
+        p = cam_to_world @ wp.vec4(x_ros, -y_ros, -d, wp.float32(1.0))
+        if wp.isfinite(p[0]) and wp.isfinite(p[1]) and wp.isfinite(p[2]):
+            i = wp.atomic_add(counter, 0, 1)
+            if i < out_pcl.shape[0]:
+                out_pcl[i, 0] = p[0]
+                out_pcl[i, 1] = p[1]
+                out_pcl[i, 2] = p[2]
+                out_normals[i, 0] = normals[v, u, 0]
+                out_normals[i, 1] = normals[v, u, 1]
+                out_normals[i, 2] = normals[v, u, 2]
+                out_sem[i] = sem
+                out_inst[i] = instances[v, u]
+
+
 ## THis kernel not used ##
 
 # ImagingSonarSensor.py

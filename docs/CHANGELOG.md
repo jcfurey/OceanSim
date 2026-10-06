@@ -16,6 +16,13 @@
   longer exports it), with the old path as a fallback
 - Colorpicker caustics sliders get explicit bounds; Isaac Sim 6.1.0's slider clamp
   would otherwise force Max Depth / Time Speed / decal positions into 0..1
+- FLS_KittiWriter rebuilds its ray-query points from per-pixel depth / normals /
+  segmentation AOVs (new `compact_depth_points` kernel) instead of the `pointcloud`
+  composite annotator, which crashed at `world.play()` on Isaac Sim 6.x
+- OmniGraph ROS mode: scenario RESET detaches the replicator ROS writers and removes
+  the TF / publisher graphs instead of stacking duplicate publishers
+- Merge upstream `feature/remove_scenario_namespacing`: the OmniGraph ROS topics
+  are now fixed names (`/RGBCamera/image`, `/ImagingSonar/image`, `/IMU`, `/DVL`, ...)
 
 ## [0.3.0] - 2025-09-06
 
