@@ -449,6 +449,11 @@ class OceanSimSensorPublisher:
                 f"{[m.child_frame_id for m in msgs]}")
 
     # --------------------------------------------------------------- per-step
+    def sonar_due(self, sim_time: float) -> bool:
+        """True if publish(sim_time) will send a sonar image -- so the runner
+        can scan only on publish ticks (the scan feeds nothing else headless)."""
+        return self._sonar_pub is not None and self._sonar_gate.due(sim_time)
+
     def publish(self, sim_time: float):
         """Publish all due sensor messages for the current sim time (seconds)."""
         if self._node is None:

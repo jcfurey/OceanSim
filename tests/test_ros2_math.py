@@ -194,3 +194,21 @@ def test_uint8_payload_matches_tobytes(m, arr):
     out = m.uint8_payload(arr)
     assert isinstance(out, _array.array) and out.typecode == "B"
     assert out.tobytes() == np.ascontiguousarray(arr).tobytes()
+
+
+def test_rate_gate_due_predicts_ready_without_consuming(m):
+    """due(t) must equal what ready(t) returns, and calling due() (any number of
+    times) must not change the gate's schedule."""
+    probe = m.RateGate(5.0)
+    ref = m.RateGate(5.0)
+    dt = 1.0 / 60.0
+    times = [i * dt for i in range(300)] + [0.5 + i * dt for i in range(60)]  # incl. a reset
+    for t in times:
+        d1, d2 = probe.due(t), probe.due(t)
+        assert d1 == d2
+        assert probe.ready(t) == d1 == ref.ready(t)
+
+
+def test_rate_gate_due_always_true_when_unthrottled(m):
+    g = m.RateGate(0)
+    assert all(g.due(t) and g.ready(t) for t in (0.0, 0.0, 1e-9, 5.0))

@@ -758,9 +758,23 @@ def main(argv):
     _sonar_gating = (sonar is not None and _sonar_render_period > 0.0
                       and _sonar_backend == "oceansim")
     _last_sonar_scan = -1e9
+    # Scan-on-publish: headless with no sonar viewport, the synchronous oceansim
+    # sonar's scan only feeds the ROS publisher, so scan exactly on the ticks
+    # the publisher will send a sonar image (sonar_rate) instead of at
+    # sensor_compute_rate -- 2/3 fewer scans at the 15 Hz / 5 Hz defaults, and
+    # the published frame is captured on its publish tick. Not with render
+    # gating (it drives sonar_tick itself) or async compute (whose worker needs
+    # the lead time).
+    # Needs a positive sonar_rate: with 0 (publish every tick) it would scan
+    # every physics step, above the sensor_compute_rate throttle.
+    _scan_on_publish = (sonar is not None and not _sonar_gating and not _sv
+                        and _sonar_backend == "oceansim"
+                        and not getattr(sonar, "async_compute", False)
+                        and float(publisher._cfg.get("sonar_rate", 0.0) or 0.0) > 0.0)
     print("[oceansim_ros2] simulation running; publishing ROS2 sensor data"
           + (f" (sonar render gated, cap={_sonar_render_rate or 'worker'} Hz)"
-             if _sonar_gating else ""))
+             if _sonar_gating else "")
+          + (" (sonar scans on publish ticks)" if _scan_on_publish else ""))
     try:
         while sim_app.is_running() and running["flag"]:
             # Decide -- before the step that would render it -- whether to render +
@@ -784,7 +798,9 @@ def main(argv):
                 if step <= 0.0:
                     step = fixed_dt    # first tick / after a reset
                 prev_time = now
-                if sonar_tick:
+                if _scan_on_publish:
+                    sonar_tick = publisher.sonar_due(now)
+                if sonar_tick and _sonar_gating:
                     # Record on the SAME clock the decision compares against
                     # (pre-step time): recording the post-step `now` stretched
                     # the effective period to period + one step per scan.

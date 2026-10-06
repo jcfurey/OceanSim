@@ -3,7 +3,7 @@
 Working notes on where the OceanSim sensor pipeline spends time and which
 optimizations are done vs. still on the table. Focused on the sonars (the
 dominant cost) but the camera / DVL paths are noted too. Targets Isaac Sim
-6.0.1.
+6.1.0.
 
 Each item lists the **lever**, the expected **payoff**, the **risk**, and its
 **status**. "Hardware-gated" means it can't be validated in CI (needs a GPU +
@@ -26,6 +26,26 @@ the gate and the compaction kernel. Falls back to a host fetch for the labels
 only if a build omits `info` from the device dict, so it is strictly
 non-regressive. **Payoff:** removes one full-image host readback + sim-thread
 stall per scan (helps odom/imu jitter; does *not* raise GPU-bound framerate).
+
+### Pass 2 (Isaac Sim 6.1.0): output-identical host-side wins
+- **Scan / render only on publish ticks (headless runner).** With no sensor
+  viewport and the sync sonar, the scan only feeds the ROS publisher, so the
+  runner now scans exactly when the sonar publish is due
+  (`publisher.sonar_due()` via the non-mutating `RateGate.due()`), and
+  `UW_Camera.render()` skips the annotator fetch + `UW_render` for frames its
+  own publish gate won't send. At the 15 Hz compute / 5 Hz publish defaults
+  that is 2/3 fewer scans and camera renders, and published frames are
+  captured on their publish tick. (Not with render gating, async sonar, a
+  sonar_rate of 0, or viewports.)
+- **ROS `uint8[]` payloads as `array('B')`** (`ros2_math.uint8_payload`):
+  rosidl takes it as-is, whereas `bytes` is checked element by element in
+  Python on Humble (~0.4 s per 1080p rgb8 frame); one copy instead of two.
+- **GUI sonar uses `gpu_point_filter=True`** like the runner (the numpy path
+  copied ~89 MB to the host and spent ~80 ms per scan at `hori_res=4000`).
+- **KITTI writers:** single-pass instance segmentation export (782 -> 165 ms
+  per 1080p frame at 100 ids, bit-exact), debug-only annotators, reused
+  buffers, cached reflectivity upload, constant JSON written once; cached
+  sonar segmentation palette.
 
 ---
 
@@ -86,12 +106,33 @@ precision trade; noted only for completeness.
 
 ---
 
-## Outstanding — camera / DVL (unaudited)
+### Concrete design for item 1: render only on sensor steps (hardware-gated)
+`world.step(render=True)` raytraces every render product (sonar + camera) on
+every physics step. Step physics with `render=False` and render only on steps
+where a sensor is due (Isaac Lab's `render_interval` is the precedent). Unlike
+`set_updates_enabled()` this actually removes the raytrace: up to ~4x less RTX
+work at the defaults (~12x if aligned to the 5 Hz publish). Check on hardware:
+whether `get_data()` after one render returns that frame or the previous one
+(render two consecutive steps if it lags), whether `world.current_time`
+advances on `render=False` steps (stamps / rate gates depend on it), and
+TAA/DLSS ghosting on sparse camera frames. Headless only.
 
-Not yet reviewed for performance this pass; listed so they aren't forgotten:
+### Item 2 update
+`compact_depth_points` + `sonar_scan_math.depth_unprojection_from_camera_params`
+(now used by `FLS_KittiWriter`, unit-tested against Isaac's own unprojection)
+can replace `get_pointcloud()` + `compact_in_range` in `_scan_gpu_compact`.
+Besides the second depth fetch and four `.contiguous()` copies, it makes the
+points use the render-time camera pose like intensity / binning already do
+(`get_pointcloud()` uses the current USD pose; a 1 deg / 1 cm lag shifts
+targets 3-4 beams / 2 range bins). Changes the default sonar path.
 
-- **`UW_Camera`** — check for redundant annotator `get_data()` host readbacks
-  and per-frame allocations on the publish path, mirroring the sonar audit.
+## Outstanding — camera / ROS plumbing
+
+Audited in pass 2; what remains:
+
+- **`rclpy.spin_once(node)`** (`ros2_sensors`, `ros2_control`, `UW_Camera`)
+  adds/removes the node from the global executor on every call; one persistent
+  executor with the nodes added once would save ~0.1-0.3 ms per call (estimate).
 - **JPEG encode on the sim thread** (previously flagged) — image compression on
   the render/sim thread applies backpressure; a worker-thread encode (like the
   sonar's `async_compute`) would decouple it.

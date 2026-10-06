@@ -73,7 +73,9 @@ class RateGate:
         self._period = (1.0 / hz) if hz and hz > 0 else 0.0
         self._last = None
 
-    def ready(self, now):
+    def due(self, now):
+        """Whether ready(now) would fire, WITHOUT consuming the tick -- lets a
+        producer skip work for a frame the publisher won't send."""
         if self._period <= 0.0:
             return True
         # Reset if sim time jumped backward (world reset) so publishing resumes.
@@ -82,8 +84,12 @@ class RateGate:
         # elapsed (now - last) a few ULPs BELOW the period on alternating ticks,
         # and a strict >= then skips every other publish -- halving the rate.
         tol = self._period * 1e-6
-        if self._last is None or now < self._last or (now - self._last) >= self._period - tol:
-            self._last = now
+        return self._last is None or now < self._last or (now - self._last) >= self._period - tol
+
+    def ready(self, now):
+        if self.due(now):
+            if self._period > 0.0:
+                self._last = now
             return True
         return False
 

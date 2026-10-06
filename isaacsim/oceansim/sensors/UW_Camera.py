@@ -385,6 +385,15 @@ class UW_Camera(Camera):
             - Updates viewport display if enabled
             - Saves image to disk if writing_dir was specified
         """
+        # Headless runner: when the ROS publisher is the only consumer (no
+        # viewport, no disk writes, no host frames for a subclass), skip the
+        # annotator fetch + UW_render for frames its rate gate won't publish.
+        # (sim_time is only passed by the runner; the GUI path is unchanged.)
+        if (sim_time is not None and getattr(self, "_enable_ros2_pub", False)
+                and not self._viewport and not self._writing
+                and not self._capture_host_frames
+                and not self._sim_rate_gate.due(sim_time)):
+            return
         raw_rgba = self._rgba_annot.get_data()
         depth = self._depth_annot.get_data()
         if raw_rgba.size !=0:
