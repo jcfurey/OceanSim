@@ -27,10 +27,23 @@ RUNNER="$OCEANSIM_ROOT/isaacsim/oceansim/standalone/oceansim_ros2.py"
 # namespace package (PEP 420).  Inside Isaac Sim, OceanSim is normally loaded as
 # a registered extension; for the standalone runner we expose it on PYTHONPATH.
 export PYTHONPATH="$OCEANSIM_ROOT:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 if [ ! -f "$RUNNER" ]; then
   echo "ERROR: runner not found at $RUNNER" >&2
   exit 1
+fi
+
+# Non-interactive shells (including `docker/run.sh -lc ...`) do not read the
+# /etc/bash.bashrc hook installed by the Dockerfile. Source an external ROS 2
+# installation explicitly so its shared libraries and Python packages are
+# visible before Isaac starts the ROS bridge. Keep Isaac's bundled ROS fallback
+# untouched when no matching external installation exists.
+if [ -n "${ROS_DISTRO:-}" ] && [ -f "/opt/ros/${ROS_DISTRO}/setup.bash" ]; then
+  set +u
+  # shellcheck disable=SC1090 -- ROS_DISTRO selects the installed distribution.
+  source "/opt/ros/${ROS_DISTRO}/setup.bash"
+  set -u
 fi
 
 find_isaac_python() {

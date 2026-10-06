@@ -125,8 +125,13 @@ class DVLsensor:
         # the existing list, corrupting the depth/noise indexing (loops assume
         # exactly 4 beams at fixed indices).
         self._beam_paths = []
-        self._rigid_body_prim = SingleRigidPrim(prim_path=self._rigid_body_path)
+        # Create the physics wrapper lazily on the first reading. attachDVL is
+        # normally called before world.reset()/world.play(); a wrapper created
+        # here keeps the old (then invalidated) SimulationView and get_com()
+        # subsequently warns on every DVL sample.
+        self._rigid_body_prim = None
         self._lever_arm_body = None  # recomputed for the new mount (_get_lever_arm_body)
+        self._warned_missing_com = False
         sensor_prim_path = rigid_body_path + "/" + self._name
         self._DVL = BaseSensor(prim_path=sensor_prim_path,
                                position=position,
@@ -330,9 +335,10 @@ class DVLsensor:
             return np.zeros(3)
         self.last_dropout = False
 
-        world_vel = self._rigid_body_prim.get_linear_velocity()
-        world_ang_vel = self._rigid_body_prim.get_angular_velocity()
-        _, world_orient = self._rigid_body_prim.get_world_pose()
+        rigid_body = self._ensure_rigid_body_prim()
+        world_vel = rigid_body.get_linear_velocity()
+        world_ang_vel = rigid_body.get_angular_velocity()
+        _, world_orient = rigid_body.get_world_pose()
         rot_m = quat_to_rot_matrix(world_orient)
         # The DVL sees the velocity of its mount point, not the centre of mass:
         # add omega x r for the mount's lever arm (dvl_math). Without it a
@@ -358,6 +364,23 @@ class DVLsensor:
             depth = self.get_depth()
         return dvl_math.altitude_from_beam_ranges(depth, self._elevation)
 
+    def _ensure_rigid_body_prim(self):
+        """Create and initialize the rigid-body view after physics is live.
+
+        DVL attachment happens before the world's reset/play transition. Isaac
+        Sim invalidates physics tensor views across that transition, so keeping
+        the wrapper created by attachDVL makes velocity reads fall back to USD
+        attributes and leaves get_com() without a SimulationView.
+        """
+        if self._rigid_body_prim is None:
+            rigid_body = SingleRigidPrim(prim_path=self._rigid_body_path)
+            # First DVL reads happen after world.play() and world.step(), when a
+            # physics SimulationView exists. Publish only a fully initialized
+            # wrapper so a failed attempt can be retried on the next sample.
+            rigid_body.initialize()
+            self._rigid_body_prim = rigid_body
+        return self._rigid_body_prim
+
     def _get_lever_arm_body(self):
         """Mount position minus centre-of-mass position, in the body frame.
 
@@ -374,13 +397,17 @@ class DVLsensor:
         com = np.zeros(3)
         com_known = False
         try:
-            com_pos, _ = self._rigid_body_prim.get_com()
+            com_pos, _ = self._ensure_rigid_body_prim().get_com()
             com_pos = np.asarray(com_pos, dtype=float).reshape(-1)[:3]
             if com_pos.shape == (3,) and np.all(np.isfinite(com_pos)):
                 com, com_known = com_pos, True
         except Exception as exc:  # noqa: BLE001
-            carb.log_warn(f"[{self._name}] centre of mass unavailable ({exc}); "
-                          f"using the body origin for the DVL lever arm")
+            # Keep retrying so a view that becomes available one tick later can
+            # replace the fallback, but report the degraded lever arm only once.
+            if not self._warned_missing_com:
+                self._warned_missing_com = True
+                carb.log_warn(f"[{self._name}] centre of mass unavailable ({exc}); "
+                              f"using the body origin for the DVL lever arm")
         lever_arm = mount - com
         # Only cache once the physics view has answered; before play() retry.
         if com_known:

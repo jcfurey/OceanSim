@@ -1,0 +1,11 @@
+{
+  "seed": 24,
+  "meters_per_unit": 1,
+  "up_axis": "Z",
+  "water_surface_z": 0,
+  "environments": [
+    "environments/inspection_site.usdc",
+    "environments/rocky_reef.usdc"
+  ],
+  "generator": "scripts/build_demo_assets.py"
+}

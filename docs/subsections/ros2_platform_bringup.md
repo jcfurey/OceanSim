@@ -29,6 +29,22 @@ spawn pose, sensor mount poses, and the default robot description. Select it:
 ./scripts/run_oceansim_ros2.sh --platform deeptrekker_revolution
 ```
 
+For a first run, use the dedicated launcher. It selects the REVOLUTION,
+publishes standalone sensor TF, and loads the scanned MHL environment when an
+asset pack is mounted. Without that pack it uses the repository's textured
+subsea inspection site and local CAD, with a generated URDF hull as a fallback:
+
+```bash
+./scripts/run_deeptrekker_revolution.sh
+```
+
+Set `OCEANSIM_ASSETS` to an asset-pack directory to have the same command load
+the MHL scene and detailed REVOLUTION USD when available. Select explicitly
+with `--environment auto|builtin|reef|mhl|/path/to/scene.usd`. See
+[demo assets](demo_assets.md) for local CAD staging and Docker Compose. Extra runner flags are
+forwarded, for example
+`./scripts/run_deeptrekker_revolution.sh --no-sonar --no-camera`.
+
 The asset itself lives under your registered asset root
 (`<asset_root>/<usd_subpath>` / `<urdf_subpath>`), or override per run with
 `--urdf` / config `robot.usd_path` / `robot.urdf_path`.
@@ -233,4 +249,3 @@ planner. The simulator side is already there:
 - the Twist's `linear.z` and angular rates are honoured in both velocity modes;
 - the camera depth gives true 3D points;
 - odometry, TF and the clock are published as above.
-

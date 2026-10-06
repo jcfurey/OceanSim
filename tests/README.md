@@ -4,6 +4,10 @@ gtest-style (pytest) tests for the parts of OceanSim that are pure computation
 and so can be validated **without launching Isaac Sim**.
 
 ## What's covered today (no Isaac Sim needed)
+- `test_demo_assets.py` — bundled USD geometry indices, local texture dependencies,
+  collision geometry and seabed clearance (requires `usd-core`).
+- `test_runner_config.py` — camera resolution, finite smoke-run configuration and
+  CLI override validation before the GPU renderer starts.
 - `test_imaging_sonar_kernels.py` — the imaging-sonar **Warp kernels** run on the
   CPU device. Locks down the bin-index bounds check, the global-normalization
   ÷0 guard, the `make_sonar_image` column flip / no-out-of-bounds write, the
@@ -36,7 +40,7 @@ CI runs them on every push / PR (`.github/workflows/tests.yml`, Python 3.10 &
 ## Running
 ```bash
 # standalone (CI / dev box)
-pip install warp-lang numpy pytest
+pip install warp-lang numpy pytest usd-core
 pytest tests/
 
 # inside the OceanSim / Isaac Sim container (warp + numpy already present)

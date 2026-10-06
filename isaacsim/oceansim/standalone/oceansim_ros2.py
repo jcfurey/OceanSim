@@ -105,6 +105,10 @@ def parse_args(argv):
     p.add_argument("--no-camera", dest="camera", action="store_false", default=None)
     p.add_argument("--no-dvl", dest="dvl", action="store_false", default=None)
     p.add_argument("--no-baro", dest="baro", action="store_false", default=None)
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Stop cleanly after this many simulation steps (smoke tests).")
+    p.add_argument("--camera-resolution", type=int, nargs=2, metavar=("WIDTH", "HEIGHT"),
+                   help="Underwater camera resolution; default 1920 1080.")
     return p.parse_args(argv)
 
 
@@ -207,6 +211,8 @@ def load_config(args):
         # have the sensor frames in the TF tree.
         "publish_static_tf": False,
         "water_surface_z": 1.43389,
+        "max_steps": 0,
+        "camera_resolution": [1920, 1080],
     }
     if args.config:
         with open(args.config, "r") as f:
@@ -238,6 +244,17 @@ def load_config(args):
         cfg["publish_static_tf"] = args.publish_static_tf
     if args.sensor_compute_rate is not None:
         cfg["sensor_compute_rate"] = args.sensor_compute_rate
+    if args.max_steps is not None:
+        if args.max_steps <= 0:
+            raise ValueError("--max-steps must be positive")
+        cfg["max_steps"] = args.max_steps
+    if args.camera_resolution is not None:
+        cfg["camera_resolution"] = args.camera_resolution
+    if len(cfg["camera_resolution"]) != 2 or any(
+            type(v) is not int or v <= 0 for v in cfg["camera_resolution"]):
+        raise ValueError("camera_resolution must contain two positive integers")
+    if type(cfg["max_steps"]) is not int or cfg["max_steps"] < 0:
+        raise ValueError("max_steps must be a non-negative integer")
     for key, val in (("sonar", args.sonar), ("camera", args.camera),
                      ("dvl", args.dvl), ("baro", args.baro)):
         if val is not None:
@@ -261,8 +278,12 @@ def maybe_register_assets(asset_path):
     file, so an explicit override was silently ignored after the first run."""
     if not asset_path:
         return
-    import isaacsim.oceansim.utils as _utils_pkg
-    json_path = os.path.join(os.path.dirname(_utils_pkg.__file__), "asset_path.json")
+    # Derive this from the runner's own location instead of importing
+    # isaacsim.oceansim. Isaac Sim 6.1 makes ``isaacsim`` a regular package;
+    # the runner extends that package's __path__ only after SimulationApp has
+    # booted, so importing OceanSim here is too early in standalone launches.
+    json_path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "utils", "asset_path.json"))
     abspath = os.path.abspath(asset_path)
     if os.path.isfile(json_path):
         try:
@@ -402,6 +423,17 @@ def main(argv):
     # ---- scene (mirrors ui_builder._setup_scene) --------------------------
     if cfg["scene_usd"]:
         add_reference_to_stage(usd_path=cfg["scene_usd"], prim_path="/World/scene")
+        # Portable demo assets store acoustic response as a plain USD attribute.
+        # Register it with Isaac's segmentation system after the reference loads.
+        from pxr import Usd
+        _label_count = 0
+        for _prim in Usd.PrimRange(get_prim_at_path("/World/scene")):
+            _response = _prim.GetAttribute("oceansim:reflectivity")
+            if _response and _response.HasAuthoredValueOpinion():
+                add_labels(_prim, labels=[str(_response.Get())], instance_name="reflectivity")
+                _label_count += 1
+        if _label_count:
+            print(f"[oceansim_ros2] acoustic reflectivity registered on {_label_count} scene prims")
         print(f"[oceansim_ros2] loaded user scene: {cfg['scene_usd']}")
     else:
         from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
@@ -422,6 +454,14 @@ def main(argv):
         SingleRigidPrim(prim_path=rock_path, translation=np.array([1.0, 0.1, -1.5]),
                         orientation=euler_angles_to_quat(np.array([0.0, 0.0, 90]),
                                                          degrees=True))
+
+    # The demo preset uses null to take its water level from scene metadata.
+    # External MHL/custom scenes without metadata retain the original water level.
+    if cfg["water_surface_z"] is None:
+        _scene_prim = get_prim_at_path("/World/scene")
+        _surface = (_scene_prim.GetCustomDataByKey("oceansim:waterSurface")
+                    if _scene_prim.IsValid() else None)
+        cfg["water_surface_z"] = float(1.43389 if _surface is None else _surface)
 
     # ---- robot (selected platform from utils.platforms) -------------------
     from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
@@ -716,7 +756,7 @@ def main(argv):
         # image orientation no longer matched the robot_state_publisher TF frame
         # consumers reproject against. UW_Camera takes a quaternion orientation.
         cam = UW_Camera(prim_path=_cam_parent + "/UW_camera",
-                        resolution=[1920, 1080], translation=_cam_translation,
+                        resolution=cfg["camera_resolution"], translation=_cam_translation,
                         orientation=euler_angles_to_quat(_cam_rpy, degrees=True))
         if spec.camera_hfov_deg:
             from isaacsim.oceansim.utils import sensor_presets
@@ -756,6 +796,13 @@ def main(argv):
 
     # ---- scenario + sensor publisher --------------------------------------
     world.reset()
+    if not cfg["headless"]:
+        from omni.kit.viewport.utility import get_active_viewport
+        _overview_camera = "/World/scene/Cameras/Overview"
+        _viewport = get_active_viewport()
+        if _viewport is not None and get_prim_at_path(_overview_camera).IsValid():
+            _viewport.camera_path = _overview_camera
+            print(f"[oceansim_ros2] GUI viewport camera: {_overview_camera}")
     scenario = MHL_Sensor_Example_Scenario()
     # sensor_viewports: None (default) = auto -- per-sensor GUI windows only make
     # sense with a GUI, and in headless mode they still paid the per-frame
@@ -916,6 +963,7 @@ def main(argv):
           + (f" (sonar render gated, cap={_sonar_render_rate or 'worker'} Hz)"
              if _sonar_gating else "")
           + (" (sonar scans on publish ticks)" if _scan_on_publish else ""))
+    _steps = 0
     try:
         while sim_app.is_running() and running["flag"]:
             # Decide -- before the step that would render it -- whether to render +
@@ -948,6 +996,10 @@ def main(argv):
                     _last_sonar_scan = _decision_time
                 scenario.update_scenario(step, now, sonar_tick=sonar_tick)
                 publisher.publish(now)
+                _steps += 1
+                if cfg["max_steps"] and _steps >= cfg["max_steps"]:
+                    print(f"[oceansim_ros2] completed {_steps} simulation steps")
+                    break
     finally:
         print("[oceansim_ros2] shutting down")
         # Best-effort teardown: a failure in publisher.close() or

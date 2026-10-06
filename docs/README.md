@@ -70,6 +70,15 @@ Before the OceanSim extension is activated, the `isaacsim.ros2.bridge` extension
 ### Platform bringup (description, joints & sensors)
 To publish a vehicle to ROS2 as a fully articulated robot — its URDF on `/robot_description`, joints on `/joint_states` (driven from `/oceansim/robot/joint_command`), and sensors placed at the URDF's sensor frames — see [ROS2 Platform Bringup](subsections/ros2_platform_bringup.md). It covers selecting a platform (11 vehicles, from the BlueROV2 to the Saab Seaeye Falcon), importing from a URDF, the full topic/QoS table, and a `robot_state_publisher` + RViz launch (`scripts/oceansim_bringup.launch.py`). Each vehicle's hydrodynamics, buoyancy, thrusters and payload options (sonars, DVLs, altimeter, grippers), where the numbers come from, and URDF import / export are described in [Vehicle Models](subsections/vehicle_models.md).
 
+Start the bundled Deep Trekker REVOLUTION inspection demo with
+`docker compose up -d`, or run `./scripts/run_deeptrekker_revolution.sh` inside
+Isaac Sim. It includes textured terrain, a corroded pipeline and inspection
+structures, with a second rocky reef scene. Local Nautilus CAD can supply the
+articulated vehicle; a generated URDF remains available as a fallback. See
+[demo assets and quick start](subsections/demo_assets.md) for launch commands,
+CAD staging, previews and ROS settings. The optional external asset pack still
+provides the scanned MHL scene and vehicle models.
+
 ### ROS2 control
 We provide an example util at `isaacsim/oceansim/utils/ros2_control.py` to consult and develop on. It extends the control mode to **ROS control** in the **sensor_example** extension.
 

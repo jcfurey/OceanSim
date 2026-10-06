@@ -44,7 +44,7 @@ jobs:
           python -m pip install --upgrade pip
           # Pinned-major deps used by the tests (see tests/README.md). Warp runs
           # on the CPU device here, so no CUDA/GPU is required on the runner.
-          pip install "numpy>=1.24" "warp-lang>=1.0" "pytest>=7.0"
+          pip install "numpy>=1.24" "warp-lang>=1.0" "pytest>=7.0" "usd-core>=24.11"
 
       - name: Show versions
         run: python -c "import numpy, warp, pytest; print('numpy', numpy.__version__); print('warp', warp.__version__); print('pytest', pytest.__version__)"

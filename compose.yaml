@@ -1,0 +1,35 @@
+services:
+  oceansim:
+    image: ${OCEANSIM_IMAGE:-oceansim:6.1.0}
+    build: .
+    gpus: all
+    network_mode: host
+    init: true
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "source /opt/ros/jazzy/setup.bash && python3 scripts/check_demo_ros2.py --clock-only --timeout 5"]
+      interval: 30s
+      timeout: 12s
+      start_period: 180s
+      retries: 3
+    entrypoint: ["bash", "-lc"]
+    working_dir: /isaac-sim/extsUser/OceanSim
+    command:
+      - exec ./scripts/run_deeptrekker_revolution.sh --environment "$${OCEANSIM_ENVIRONMENT}"
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      NVIDIA_DRIVER_CAPABILITIES: all
+      NVIDIA_VISIBLE_DEVICES: all
+      OCEANSIM_ROOT: /isaac-sim/extsUser/OceanSim
+      OCEANSIM_ENVIRONMENT: ${OCEANSIM_ENVIRONMENT:-builtin}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-71}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - .:/isaac-sim/extsUser/OceanSim
+      - ./.local/isaac-sim/cache/kit:/isaac-sim/kit/cache
+      - ./.local/isaac-sim/cache/main:/isaac-sim/.cache
+      - ./.local/isaac-sim/cache/computecache:/isaac-sim/.nv/ComputeCache
+      - ./.local/isaac-sim/logs:/isaac-sim/.nvidia-omniverse/logs
+      - ./.local/isaac-sim/hub:/var/cache/hub

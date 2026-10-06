@@ -52,6 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-std-msgs \
         ros-${ROS_DISTRO}-vision-msgs \
         ros-${ROS_DISTRO}-cv-bridge \
+        ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
         ros-${ROS_DISTRO}-rmw-zenoh-cpp \
         ros-${ROS_DISTRO}-marine-acoustic-msgs \
         python3-opencv \
@@ -75,6 +76,10 @@ COPY . ${OCEANSIM_PATH}
 # already import cv2 (two packages both providing cv2 would shadow each other).
 RUN /isaac-sim/python.sh -c "import cv2" 2>/dev/null \
     || /isaac-sim/python.sh -m pip install --no-cache-dir opencv-python-headless
+
+# Keep the documented in-container test command usable with Isaac's bundled
+# interpreter (the apt-provided pytest belongs to Ubuntu's system Python).
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir "pytest>=7.0"
 
 # Source ROS 2 automatically in interactive shells.
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc

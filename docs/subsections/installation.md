@@ -36,7 +36,7 @@ Please download previous release and the installation is exactly the same as abo
 ### Isaac Sim 6.1.0 notes
 Moving from 6.0.1 to 6.1.0 needs no OceanSim code changes beyond this release, but a few Isaac Sim behaviours changed:
 - **TF aggregation**: the ROS 2 TF publisher nodes now merge their output into one `TFMessage` per topic (`isaacsim.ros2.nodes` setting `tfAggregation.enabled`, on by default). Launch with `--/exts/isaacsim.ros2.nodes/tfAggregation/enabled=false` for the old per-node messages.
-- **`python.sh` sets up ROS itself**: when `ROS_DISTRO` / `RMW_IMPLEMENTATION` are unset it picks the bundled distro and `rmw_fastrtps_cpp`. The Docker image sets both (Zenoh); on bare metal export `RMW_IMPLEMENTATION=rmw_zenoh_cpp` before `scripts/run_oceansim_ros2.sh` if your stack runs Zenoh.
+- **`python.sh` sets up ROS itself**: when `ROS_DISTRO` / `RMW_IMPLEMENTATION` are unset it picks the bundled distro and `rmw_fastrtps_cpp`. The Docker image defaults to Zenoh and also installs Cyclone DDS; on bare metal export the `RMW_IMPLEMENTATION` used by your ROS 2 graph before running `scripts/run_oceansim_ros2.sh`.
 - **CPU threads**: `SimulationApp`'s default `limit_cpu_threads` dropped from 32 to 16.
 
 ## Running in Docker (Isaac Sim 6.1.0 + ROS 2 Jazzy)
@@ -52,12 +52,42 @@ docker build -t oceansim:6.1.0 .
 ./docker/run.sh
 ```
 
-The [`docker/run.sh`](../../docker/run.sh) helper handles display passthrough for you: it runs `xhost +local:root` to authorize the container against your host X server, forwards `DISPLAY`, mounts `/tmp/.X11-unix` and your `.Xauthority`, and requests the GPU via `--runtime=nvidia --gpus all`. Inside the container, start the GUI with `./isaac-sim.sh`. To pass your downloaded USD assets, set `OCEANSIM_ASSETS=/path/to/OceanSim_assets` before running, then inside the container run `python3 config/register_asset_path.py /isaac-sim/OceanSim_assets` from the OceanSim directory (`/isaac-sim/extsUser/OceanSim`).
+To start a headless Deep Trekker REVOLUTION simulation immediately after the
+build, without downloading the optional asset pack:
+
+```bash
+RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ./docker/run.sh -lc \
+  'cd /isaac-sim/extsUser/OceanSim && ./scripts/run_deeptrekker_revolution.sh'
+```
+
+This uses the repository's textured subsea pipeline-inspection environment and
+selects locally staged REVOLUTION CAD when available, otherwise generating a
+URDF from the built-in vehicle dimensions, hydrodynamics and six-thruster layout.
+See [demo assets](demo_assets.md) for CAD staging, Docker Compose, rendered
+previews and the rocky reef environment. The command selects Cyclone DDS so a standalone run does not
+need a Zenoh router. Omit the environment override when connecting to a
+Zenoh-based robot stack, and ensure the stack's router is running. Set
+`OCEANSIM_ASSETS=/path/to/OceanSim_assets` when launching the container to use
+the scanned MHL environment and detailed `DeepTrekker/revolution.usd` model
+instead. The launcher supports
+`--environment auto|builtin|reef|mhl|/path/to/scene.usd`; `auto` is the default.
+
+The [`docker/run.sh`](../../docker/run.sh) helper mounts the current checkout and handles display passthrough: when `DISPLAY` is set it runs `xhost +local:root`, forwards `DISPLAY`, mounts `/tmp/.X11-unix` and your existing `.Xauthority`, and requests the GPU. Set `OCEANSIM_HEADLESS=1` to skip X11 authorization. Caches live in `.local/isaac-sim`; set `OCEANSIM_CACHE_ROOT=$HOME/docker/isaac-sim` to reuse an older cache directory. Inside the container, start the GUI with `./isaac-sim.sh`. To pass downloaded USD assets, set `OCEANSIM_ASSETS=/path/to/OceanSim_assets` before running. The helper mounts that directory at `/isaac-sim/OceanSim_assets` and exports its container path for the REVOLUTION launcher. For the GUI extension, register it once with `python3 config/register_asset_path.py /isaac-sim/OceanSim_assets` from `/isaac-sim/extsUser/OceanSim`.
 
 When you are done, you can revoke the X server grant with `xhost -local:root`.
 
-### ROS 2 middleware (Zenoh)
-The container defaults to `RMW_IMPLEMENTATION=rmw_zenoh_cpp` so the sim joins the same Zenoh graph as the rest of the robot stack. With Zenoh, multicast discovery is **off** by default — nodes discover each other via a **Zenoh router**, which must be running before any ROS 2 node (the OceanSim publishers, RViz, `robot_localization`, `sonar_image_proc`, …) can see each other.
+### ROS 2 middleware (Zenoh, Cyclone DDS, or Fast DDS)
+The container defaults to `RMW_IMPLEMENTATION=rmw_zenoh_cpp` so the sim joins the same Zenoh graph as the rest of the robot stack. The Docker image also includes Cyclone DDS, and Isaac Sim includes Fast DDS. `docker/run.sh` forwards an explicitly set `RMW_IMPLEMENTATION`, plus `ROS_DOMAIN_ID` and `CYCLONEDDS_URI`, into the container. When `CYCLONEDDS_URI` is a `file://` URI, the helper mounts that host file read-only at the same path inside the container:
+
+```bash
+# Cyclone DDS (no router required)
+RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ./docker/run.sh
+
+# Fast DDS
+RMW_IMPLEMENTATION=rmw_fastrtps_cpp ./docker/run.sh
+```
+
+With Zenoh, multicast discovery is **off** by default — nodes discover each other via a **Zenoh router**, which must be running before any ROS 2 node (the OceanSim publishers, RViz, `robot_localization`, `sonar_image_proc`, …) can see each other.
 
 - In a real deployment the router belongs to the robot stack; its endpoint config (`ROS_DOMAIN_ID`, peer/router endpoints) is sourced at runtime from the workspace's `bashrc.d/99-zenoh_configs.bashrc`, not baked into the image.
 - To run OceanSim **standalone** (a dev box / smoke test) where no stack router exists, start one in a separate terminal:
