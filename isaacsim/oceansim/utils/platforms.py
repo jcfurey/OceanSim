@@ -19,6 +19,7 @@ path in config) and the platform imports by name.
 Pure data + stdlib only (no Isaac/USD imports) so it is unit tested in CI.
 """
 
+import math
 import os
 from collections import namedtuple
 from dataclasses import dataclass, field
@@ -72,13 +73,86 @@ class HydroSpec:
     battery_voltage: float = None
     thruster_time_constant: float = 0.06
     sources: str = ""
+    # Centre of gravity relative to the prim origin (m). (0, 0, 0) for the
+    # bare vehicles; payloads move it (vehicle_dynamics.resolve_hydro).
+    cog: tuple = (0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class HydroEstimate:
+    """Inputs for ESTIMATING a vehicle's hydrodynamics from published specs
+    when no measured model exists (vehicle_dynamics.resolve_hydro turns it into
+    a HydroSpec, using the platform's mass and dimensions):
+
+    * drag: quadratic coefficients chosen so the thrusters' maximum along each
+      axis reaches the listed top speed (surge, sway, heave; m/s), with linear
+      terms of ``linear_fraction`` (m/s) x the quadratic ones. Axes without a
+      listed speed use ``drag_coefficients`` on the box's projected area.
+      Rotational drag by strip theory from the resulting drag coefficients.
+    * added mass: Lamb's ellipsoid coefficients for the bounding ellipsoid.
+    * inertia: ``inertia_factor`` x a uniform box of the platform's mass.
+    * displaced volume: weight x (1 + net_buoyancy) in fresh water; CoB
+      ``cob_height`` above the CoG.
+    * unknown thrust (thrusters with max_forward None): drag from
+      ``drag_coefficients`` on all axes, then horizontal thrusters sized so
+      surge reaches the listed surge speed and vertical ones so heave reaches
+      the listed heave speed (or, without one, as strong as the horizontal)."""
+    thrusters: tuple
+    top_speeds: tuple = (None, None, None)
+    drag_coefficients: tuple = (1.0, 1.0, 1.0)
+    linear_fraction: float = 0.1
+    net_buoyancy: float = 0.005
+    cob_height: float = 0.02
+    inertia_factor: float = 0.6
+    thruster_model: str = None
+    battery_voltage: float = None
+    thruster_time_constant: float = 0.08
+    sources: str = ""
+
+
+def vectored_thrusters(x, y, z=0.0, max_forward=None, max_reverse=None, angle_deg=45.0):
+    """Four horizontal thrusters at (+-x, +-y, z) in the usual vectored-X
+    layout (BlueROV2-style), each angled ``angle_deg`` off the x axis: each
+    one's forward thrust has a +x component, so surge uses all four in their
+    forward direction. max_forward None = unknown (estimated from speed)."""
+    c, s = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
+    rev = max_forward if max_reverse is None else max_reverse
+    return (ThrusterSpec((x, -y, z), (c, s, 0.0), max_forward, rev),
+            ThrusterSpec((x, y, z), (c, -s, 0.0), max_forward, rev),
+            ThrusterSpec((-x, -y, z), (c, -s, 0.0), max_forward, rev),
+            ThrusterSpec((-x, y, z), (c, s, 0.0), max_forward, rev))
+
+
+def forward_thrusters(x, y, z=0.0, max_forward=None, max_reverse=None):
+    """Two horizontal thrusters at (x, +-y, z) pointing straight ahead
+    (surge + yaw only; DTG3 / VideoRay Pro style)."""
+    rev = max_forward if max_reverse is None else max_reverse
+    return (ThrusterSpec((x, -y, z), (1.0, 0.0, 0.0), max_forward, rev),
+            ThrusterSpec((x, y, z), (1.0, 0.0, 0.0), max_forward, rev))
+
+
+def vector_angle_from_thrust(forward, lateral, reverse=None):
+    """Vector angle (deg) of a 4-thruster vectored-X layout from its published
+    forward and lateral thrust. Pure sway runs two thrusters forward and two in
+    reverse at equal magnitude, so it is bounded by the weaker direction:
+    lateral = 4 f_min sin(a) and forward = 4 f_fwd cos(a), i.e.
+    tan(a) = lateral / min(forward, reverse) in thrust units."""
+    rev = forward if reverse is None else reverse
+    return math.degrees(math.atan2(lateral, min(forward, rev)))
+
+
+def vertical_thrusters(points, max_forward=None, max_reverse=None):
+    """Vertical thrusters (forward thrust pushes up) at the given (x, y, z)."""
+    rev = max_forward if max_reverse is None else max_reverse
+    return tuple(ThrusterSpec(tuple(p), (0.0, 0.0, 1.0), max_forward, rev) for p in points)
 
 
 @dataclass(frozen=True)
 class PlatformSpec:
     """Everything needed to import a vehicle and place its sensors."""
     name: str
-    usd_subpath: str                 # relative to the OceanSim asset root
+    usd_subpath: str                 # relative to the OceanSim asset root (None: no
+                                     # asset -- the sim imports a generated URDF)
     mass: float                      # kg (in-air mass)
     linear_damping: float            # PhysX linear damping: water-drag proxy, used
     angular_damping: float           # only when the hydrodynamic model is off
@@ -92,13 +166,53 @@ class PlatformSpec:
     # Published on /robot_description so robot_state_publisher / RViz can consume
     # the model. Optional -- None if the platform ships no URDF.
     urdf_subpath: str = None
-    # Hydrodynamics + thrusters (utils.vehicle_dynamics). None -> the PhysX
-    # damping proxy above.
-    hydro: HydroSpec = None
+    # Hydrodynamics + thrusters (utils.vehicle_dynamics): a measured HydroSpec
+    # or a HydroEstimate. None -> the PhysX damping proxy above.
+    hydro: object = None
+    # Overall length x width x height (m): the generated URDF's hull box and the
+    # basis of estimated hydrodynamics.
+    dimensions: tuple = None
+    manufacturer: str = ""
+    # Mount poses for payload kinds other than sonar / camera / dvl (e.g.
+    # "altimeter", "gripper", "usbl", "light"); missing kinds get a default
+    # from the hull dimensions (see mount()).
+    extra_mounts: dict = field(default_factory=dict)
+    # Payload catalogue names (utils.payloads) commonly fitted to this vehicle,
+    # and the ones fitted by default (its standard configuration).
+    payload_options: tuple = ()
+    default_payloads: tuple = ()
+    # Built-in camera's horizontal field of view underwater (deg); None keeps
+    # the simulator's default lens.
+    camera_hfov_deg: float = None
 
     def usd_path(self, asset_root):
-        """Absolute USD path for this platform under ``asset_root``."""
+        """Absolute USD path for this platform under ``asset_root`` (None if the
+        platform ships no USD asset)."""
+        if not self.usd_subpath:
+            return None
         return os.path.join(asset_root, self.usd_subpath)
+
+    def mount(self, kind):
+        """SensorMount for payload ``kind`` in the body frame."""
+        if kind == "sonar":
+            return self.sonar_mount
+        if kind == "camera":
+            return self.camera_mount
+        if kind == "dvl":
+            return self.dvl_mount
+        if kind in self.extra_mounts:
+            return self.extra_mounts[kind]
+        length, width, height = self.dimensions or (0.4, 0.3, 0.25)
+        defaults = {
+            # beam along the mount's -z, i.e. straight down (like the DVL beams)
+            "altimeter": SensorMount((0.25 * length, 0.0, -0.5 * height)),
+            "gripper": SensorMount((0.5 * length, 0.0, -0.4 * height)),
+            "usbl": SensorMount((-0.35 * length, 0.0, 0.5 * height)),
+            "light": SensorMount((0.5 * length, 0.0, 0.25 * height)),
+            "laser": SensorMount((0.5 * length, 0.0, 0.0)),
+            "skid": SensorMount((0.0, 0.0, -0.5 * height)),
+        }
+        return defaults.get(kind, SensorMount((0.0, 0.0, 0.0)))
 
     def urdf_path(self, asset_root):
         """Absolute URDF path under ``asset_root``, or None if this platform has
@@ -194,6 +308,12 @@ _BLUEROV2 = PlatformSpec(
     description="Blue Robotics BlueROV2 (small observation-class ROV).",
     urdf_subpath=os.path.join("Bluerov", "bluerov2.urdf"),
     hydro=_BLUEROV2_HYDRO,
+    dimensions=(0.457, 0.338, 0.254),
+    manufacturer="Blue Robotics",
+    camera_hfov_deg=110.0,       # BlueROV2 page: 110 deg horizontal underwater
+    default_payloads=("lumen_light_pair",),
+    payload_options=("ping360", "ping2", "oculus_m750d", "oculus_m1200d", "waterlinked_a50",
+                     "waterlinked_a125", "newton_gripper", "lumen_light_pair"),
 )
 
 _BLUEROV2_HEAVY = PlatformSpec(
@@ -210,6 +330,11 @@ _BLUEROV2_HEAVY = PlatformSpec(
     description="Blue Robotics BlueROV2 Heavy (8 thrusters, controllable pitch).",
     urdf_subpath=_BLUEROV2.urdf_subpath,
     hydro=_BLUEROV2_HEAVY_HYDRO,
+    dimensions=(0.46, 0.58, 0.38),
+    manufacturer="Blue Robotics",
+    camera_hfov_deg=110.0,
+    default_payloads=("lumen_light_pair",),
+    payload_options=_BLUEROV2.payload_options + ("tritech_gemini_720is",),
 )
 
 # DeepTrekker REVOLUTION: 26 kg in air, 717 x 440 x 235 mm, 6 thrusters (two
@@ -265,33 +390,199 @@ _DEEPTREKKER_REVOLUTION = PlatformSpec(
     dvl_mount=SensorMount((-0.209, 0.0, -0.06)),
     description="Deep Trekker REVOLUTION (mid-size inspection ROV, 26 kg, 6 thrusters).",
     urdf_subpath=os.path.join("DeepTrekker", "revolution.urdf"),
-    hydro=HydroSpec(
-        inertia=(0.3235, 0.7401, 0.92),
-        displaced_volume=0.02613,
-        cob=(0.0, 0.0, 0.02),
-        height=0.235,
-        added_mass=(4.575, 10.354, 34.246, 0.1045, 0.5211, 0.0804),
-        linear_damping=(4.642, 10.135, 4.642, 0.01236, 0.05347, 0.11675),
-        quadratic_damping=(46.42, 101.35, 46.42, 0.1236, 0.5347, 1.1675),
-        thrusters=(
-            ThrusterSpec((0.25, -0.16, 0.0), (_S, _S, 0.0), 41.62, 41.62),
-            ThrusterSpec((0.25, 0.16, 0.0), (_S, -_S, 0.0), 41.62, 41.62),
-            ThrusterSpec((-0.25, -0.16, 0.0), (_S, -_S, 0.0), 41.62, 41.62),
-            ThrusterSpec((-0.25, 0.16, 0.0), (_S, _S, 0.0), 41.62, 41.62),
-            ThrusterSpec((0.0, -0.17, 0.0), (0.0, 0.0, 1.0), 58.86, 58.86),
-            ThrusterSpec((0.0, 0.17, 0.0), (0.0, 0.0, 1.0), 58.86, 58.86),
-        ),
+    dimensions=(0.717, 0.44, 0.235),
+    manufacturer="Deep Trekker",
+    payload_options=("oculus_m750d", "oculus_m1200d", "oculus_c550d", "waterlinked_a50"),
+    hydro=HydroEstimate(
+        thrusters=vectored_thrusters(0.25, 0.16, 0.0, 41.62)
+        + vertical_thrusters([(0.0, -0.17, 0.0), (0.0, 0.17, 0.0)], 58.86),
+        top_speeds=(3 * 0.514444, 2 * 0.514444, 3 * 0.514444),
+        net_buoyancy=0.005,
+        cob_height=0.02,
         thruster_time_constant=0.1,
         sources="Deep Trekker REVOLUTION spec sheet (mass, size, thruster count); "
                 "third-party listings (12 kgf / 3 kn); estimates as documented above",
     ),
 )
 
-PLATFORMS = {
-    _BLUEROV2.name: _BLUEROV2,
-    _BLUEROV2_HEAVY.name: _BLUEROV2_HEAVY,
-    _DEEPTREKKER_REVOLUTION.name: _DEEPTREKKER_REVOLUTION,
-}
+
+
+# ---------------------------------------------------------------------------
+# More vehicles. None of these makers publish hydrodynamic data, so every one
+# is a HydroEstimate (see HydroEstimate for the method) from the published
+# mass, size, thrust and speed; thruster positions are placed on the hull and
+# are estimates. They have no 3D asset: the sim imports a URDF generated from
+# this data (urdf_export), with primitive shapes.
+# ---------------------------------------------------------------------------
+_KN = 0.514444            # m/s per knot
+_KGF = 9.80665            # N per kgf
+
+
+def _std_mounts(length, height, sonar_pitch=15.0):
+    """Sonar high at the bow pitched down, camera at the bow, DVL underneath."""
+    return dict(sonar_mount=SensorMount((0.42 * length, 0.0, 0.3 * height), (0.0, sonar_pitch, 0.0)),
+                camera_mount=SensorMount((0.48 * length, 0.0, 0.0)),
+                dvl_mount=SensorMount((-0.2 * length, 0.0, -0.5 * height)))
+
+
+def _estimated(name, mass, dims, hydro, description, manufacturer, payload_options=(),
+               default_payloads=(), camera_hfov_deg=None, **mounts):
+    return PlatformSpec(
+        name=name, usd_subpath=None, mass=mass, linear_damping=10.0, angular_damping=10.0,
+        collision_approximation="boundingCube", spawn_translation=(-2.0, 0.0, -0.8),
+        description=description, hydro=hydro, dimensions=dims, manufacturer=manufacturer,
+        payload_options=payload_options, default_payloads=default_payloads,
+        camera_hfov_deg=camera_hfov_deg, **(mounts or _std_mounts(dims[0], dims[2])))
+
+
+# Deep Trekker DTG3: 8.5 kg, 279 x 325 x 258 mm, 200 m (DT spec sheet); two main
+# thrusters + an optional rear vertical "precision thruster"; 2.5 kgf forward /
+# backward / vertical and 2.5 kn forward / up / down (geo-matching listing).
+# The real vehicle climbs and dives by pitching its body (patented pitch
+# system); here a vertical thruster at the centre provides the listed vertical
+# thrust instead. No lateral thruster: sway is uncontrollable.
+_DTG3 = _estimated(
+    "deeptrekker_dtg3", 8.5, (0.279, 0.325, 0.258),
+    HydroEstimate(
+        thrusters=forward_thrusters(-0.05, 0.14, 0.0, 2.5 * _KGF / 2)
+        + vertical_thrusters([(0.0, 0.0, 0.0)], 2.5 * _KGF),
+        top_speeds=(2.5 * _KN, None, 2.5 * _KN),
+        sources="Deep Trekker DTG3 spec sheet (mass, size); geo-matching DTG3 listing "
+                "(2.5 kgf, 2.5 kn); estimates"),
+    "Deep Trekker DTG3 (compact 3-thruster ROV, 8.5 kg; vertical by pitching in reality).",
+    "Deep Trekker", payload_options=("oculus_c550d", "oculus_c550d_hf"))
+
+# Deep Trekker PIVOT: 23.6 kg (DT spec sheet; other sources 21.7 and 16.8 kg),
+# 576 x 360 x 310 mm, 305 m, six vectored thrusters (layout not published --
+# REVOLUTION-like 4 vectored + 2 vertical assumed). Thrust not published; 2 kn
+# forward, 1 kn vertical (geo-matching listing), so thrusters are sized to
+# reach those speeds with drag coefficient 1.
+_PIVOT = _estimated(
+    "deeptrekker_pivot", 23.6, (0.576, 0.36, 0.31),
+    HydroEstimate(
+        thrusters=vectored_thrusters(0.2, 0.14, 0.0)
+        + vertical_thrusters([(0.0, -0.15, 0.0), (0.0, 0.15, 0.0)]),
+        top_speeds=(2.0 * _KN, None, 1.0 * _KN),
+        sources="Deep Trekker PIVOT spec sheet (mass, size, 6 thrusters); geo-matching listing "
+                "(2 kn / 1 kn); thrust and layout estimated"),
+    "Deep Trekker PIVOT (mid-size ROV with pivoting tool platform, 6 thrusters).",
+    "Deep Trekker", payload_options=("oculus_m1200d", "oculus_c550d", "waterlinked_a50"))
+
+# VideoRay Mission Specialist Pro 5 (successor to the Pro 4): 11.8 kg (datasheet;
+# product page 10 kg), 515 x 330 x 257 mm, 300 m; 2 horizontal + 1 vertical
+# thrusters; forward 20.3 kgf, reverse 13.0 kgf; 4.4 kn forward, 0.8 m/s vertical
+# (VideoRay Pro 5 datasheet 2025). The listed 1.4 kg "lift" is ambiguous, so the
+# vertical thruster is sized to the 0.8 m/s.
+_PRO5 = _estimated(
+    "videoray_pro5", 11.8, (0.515, 0.33, 0.257),
+    HydroEstimate(
+        thrusters=forward_thrusters(-0.15, 0.13, 0.0, 20.3 * _KGF / 2, 13.0 * _KGF / 2)
+        + vertical_thrusters([(0.0, 0.0, 0.0)]),
+        top_speeds=(4.4 * _KN, None, 0.8),
+        sources="VideoRay Mission Specialist Pro 5 datasheet (AV_Pro5_Datasheet_250825)"),
+    "VideoRay Mission Specialist Pro 5 (portable 3-thruster inspection ROV).",
+    "VideoRay", payload_options=("oculus_m750d", "oculus_m1200d", "tritech_gemini_720im",
+                                 "tritech_gemini_720is", "videoray_pro5_manipulator"))
+
+# VideoRay Mission Specialist Defender: 17.2 kg, 711 x 394 x 238 mm (2025
+# datasheet); 4 vectored horizontal + 3 vertical (2 forward, 1 aft) thrusters.
+# Thrust forward 23.6 kgf (2025; 2022 sheet 26.7), reverse 15.0, lateral 8.6,
+# vertical up 23.1 / down 12.9 kgf; 3.8 kn forward, 0.9 kn sway, 0.8 m/s
+# vertical. The vector angle (not published) follows from lateral vs reverse
+# thrust: 30 deg. Aft vertical thruster placed so the three balance in pitch.
+_DEF_ANGLE = vector_angle_from_thrust(23.6, 8.6, 15.0)
+_DEF_COS = math.cos(math.radians(_DEF_ANGLE))
+_DEFENDER = _estimated(
+    "videoray_defender", 17.2, (0.711, 0.394, 0.238),
+    HydroEstimate(
+        thrusters=vectored_thrusters(0.25, 0.15, 0.0, 23.6 * _KGF / (4 * _DEF_COS),
+                                     15.0 * _KGF / (4 * _DEF_COS), _DEF_ANGLE)
+        + vertical_thrusters([(0.15, -0.14, 0.0), (0.15, 0.14, 0.0), (-0.3, 0.0, 0.0)],
+                             23.1 * _KGF / 3, 12.9 * _KGF / 3),
+        top_speeds=(3.8 * _KN, 0.9 * _KN, 0.8),
+        sources="VideoRay Defender datasheets (2025 commercial, 2022 MSS) and manual"),
+    "VideoRay Mission Specialist Defender (modular 7-thruster ROV).",
+    "VideoRay", payload_options=("oculus_m750d", "oculus_m1200d", "blueview_m900",
+                                 "tritech_gemini_720is", "nortek_dvl500",
+                                 "videoray_rotating_manipulator"))
+
+# Chasing M2 Pro Max: ~8 kg, 608 x 294 x 196 mm, 200 m; 8 vectored thrusters
+# (layout not published -- 4 vectored horizontal + 4 vertical assumed, giving
+# the advertised free pitch / roll). "Load" forward / upward / sideways 5.7 /
+# 4.0 / 3.6 kgf (Chasing spec page), taken as thrust; vector angle from forward
+# vs sideways: 32 deg. 1.5 m/s (3 kn) forward (dealer; original M2 spec).
+# (For every estimated vehicle the top yaw rate at full thrust is fast --
+# rotational drag scales with L^4 -- with the same tip-speed / sway-speed ratio
+# as the measured BlueROV2; real vehicles limit yaw rate in their controllers.)
+_M2_ANGLE = vector_angle_from_thrust(5.7, 3.6)
+_M2_PRO_MAX = _estimated(
+    "chasing_m2_pro_max", 8.0, (0.608, 0.294, 0.196),
+    HydroEstimate(
+        thrusters=vectored_thrusters(0.22, 0.11, 0.0,
+                                     5.7 * _KGF / (4 * math.cos(math.radians(_M2_ANGLE))),
+                                     angle_deg=_M2_ANGLE)
+        + vertical_thrusters([(0.18, -0.12, 0.0), (0.18, 0.12, 0.0),
+                              (-0.18, -0.12, 0.0), (-0.18, 0.12, 0.0)], 4.0 * _KGF / 4),
+        top_speeds=(1.5, None, None),
+        sources="Chasing M2 Pro Max spec page; dealer (3 kn); layout estimated"),
+    "Chasing M2 Pro Max (8-thruster prosumer / light-industrial ROV).",
+    "Chasing", payload_options=("oculus_m750d", "tritech_gemini_720im", "waterlinked_a50",
+                                "ping360", "chasing_grabber_arm_2"))
+
+# QYSEA FIFISH V6 Expert: 4.6 kg, 383 x 331 x 143 mm, 100 m, 1.5 m/s (QYSEA
+# store); "6 vectored thrusters" (dealer) -- layout and thrust not published:
+# 4 vectored + 2 vertical assumed, sized to 1.5 m/s. The real vehicle's free
+# pitch / roll is not reproduced by this layout. Camera 96 deg underwater.
+_FIFISH_V6 = _estimated(
+    "qysea_fifish_v6_expert", 4.6, (0.383, 0.331, 0.143),
+    HydroEstimate(
+        thrusters=vectored_thrusters(0.13, 0.12, 0.0)
+        + vertical_thrusters([(0.0, -0.13, 0.0), (0.0, 0.13, 0.0)]),
+        top_speeds=(1.5, None, None),
+        sources="QYSEA FIFISH V6 Expert store page; layout and thrust estimated"),
+    "QYSEA FIFISH V6 Expert (compact 6-thruster omnidirectional ROV).",
+    "QYSEA", payload_options=("oculus_m750d", "qysea_2finger_arm"), camera_hfov_deg=96.0)
+
+# Saab Seaeye Falcon (300 m): 60 kg, 1000 x 600 x 500 mm, 14 kg payload; 4
+# vectored horizontal + 1 vertical thrusters; forward 42, lateral 25, vertical
+# 13 kgf; > 3 kn (Saab Falcon page and brochure rev 19.3, 2024). Vector angle
+# from forward vs lateral: 31 deg.
+_FALCON_ANGLE = vector_angle_from_thrust(42.0, 25.0)
+_FALCON = _estimated(
+    "saab_seaeye_falcon", 60.0, (1.0, 0.6, 0.5),
+    HydroEstimate(
+        thrusters=vectored_thrusters(0.35, 0.22, 0.0,
+                                     42.0 * _KGF / (4 * math.cos(math.radians(_FALCON_ANGLE))),
+                                     angle_deg=_FALCON_ANGLE)
+        + vertical_thrusters([(0.0, 0.0, 0.0)], 13.0 * _KGF),
+        top_speeds=(3.0 * _KN, None, None),
+        thruster_time_constant=0.15,
+        sources="Saab Seaeye Falcon product page and brochure rev 19.3 (2024)"),
+    "Saab Seaeye Falcon (electric light-work-class ROV, 60 kg).",
+    "Saab Seaeye", payload_options=("tritech_gemini_720is", "blueview_m900", "nortek_dvl500",
+                                    "teledyne_pathfinder"))
+
+# Teledyne SeaBotix vLBV300 (discontinued March 2025; widely fielded): 18 kg,
+# 625 x 390 x 390 mm, 300 m; 4 vectored (45 / 35 / 20 deg settings) + 2 vertical;
+# forward 18.1-22.5, lateral 7.3-15.2, vertical 9 kgf; 3 kn (Teledyne brochure
+# rev 3, 2016). Modelled at the 45 deg setting (18.1 forward / 15.2 lateral --
+# lateral bounded by reverse thrust, so reverse = 15.2 kgf).
+_VLBV_COS = math.cos(math.radians(45.0))
+_VLBV300 = _estimated(
+    "seabotix_vlbv300", 18.0, (0.625, 0.39, 0.39),
+    HydroEstimate(
+        thrusters=vectored_thrusters(0.22, 0.14, 0.0, 18.1 * _KGF / (4 * _VLBV_COS),
+                                     15.2 * _KGF / (4 * _VLBV_COS))
+        + vertical_thrusters([(0.0, -0.15, 0.0), (0.0, 0.15, 0.0)], 9.0 * _KGF / 2),
+        top_speeds=(3.0 * _KN, None, None),
+        sources="Teledyne SeaBotix brochure rev 3 (2016); EOL notice 2025"),
+    "Teledyne SeaBotix vLBV300 (6-thruster inspection ROV; discontinued 2025).",
+    "Teledyne SeaBotix", payload_options=("tritech_gemini_720is", "blueview_m900",
+                                          "teledyne_pathfinder"))
+
+PLATFORMS = {p.name: p for p in (
+    _BLUEROV2, _BLUEROV2_HEAVY, _DEEPTREKKER_REVOLUTION, _DTG3, _PIVOT, _PRO5, _DEFENDER,
+    _M2_PRO_MAX, _FIFISH_V6, _FALCON, _VLBV300)}
 
 # Convenience aliases so common spellings resolve to a canonical platform.
 _ALIASES = {
@@ -302,6 +593,18 @@ _ALIASES = {
     "revolution": "deeptrekker_revolution",
     "deeptrekker": "deeptrekker_revolution",
     "deep_trekker_revolution": "deeptrekker_revolution",
+    "dtg3": "deeptrekker_dtg3",
+    "pivot": "deeptrekker_pivot",
+    "pro5": "videoray_pro5",
+    "videoray": "videoray_defender",
+    "defender": "videoray_defender",
+    "m2_pro_max": "chasing_m2_pro_max",
+    "chasing": "chasing_m2_pro_max",
+    "fifish": "qysea_fifish_v6_expert",
+    "fifish_v6": "qysea_fifish_v6_expert",
+    "falcon": "saab_seaeye_falcon",
+    "seaeye_falcon": "saab_seaeye_falcon",
+    "vlbv300": "seabotix_vlbv300",
 }
 
 DEFAULT_PLATFORM = "bluerov2"

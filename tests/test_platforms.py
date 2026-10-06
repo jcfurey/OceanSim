@@ -27,9 +27,16 @@ def p():
 
 # --- registry --------------------------------------------------------------
 
+ALL_PLATFORMS = ["bluerov2", "bluerov2_heavy", "deeptrekker_revolution", "deeptrekker_dtg3",
+                 "deeptrekker_pivot", "videoray_pro5", "videoray_defender", "chasing_m2_pro_max",
+                 "qysea_fifish_v6_expert", "saab_seaeye_falcon", "seabotix_vlbv300"]
+
+
 def test_platforms_registered(p):
-    assert set(p.available_platforms()) == {"bluerov2", "bluerov2_heavy", "deeptrekker_revolution"}
+    assert set(p.available_platforms()) == set(ALL_PLATFORMS)
     assert p.get_platform("bluerov2heavy").name == "bluerov2_heavy"
+    assert p.get_platform("Falcon").name == "saab_seaeye_falcon"
+    assert p.get_platform("fifish").name == "qysea_fifish_v6_expert"
 
 
 def test_lookup_is_case_and_alias_insensitive(p):
@@ -199,23 +206,27 @@ def _top_speed(vd, plat, axis, sign=1.0):
     return (-lin + (lin * lin + 4 * q * f) ** 0.5) / (2 * q)
 
 
-@pytest.mark.parametrize("name", ["bluerov2", "bluerov2_heavy", "deeptrekker_revolution"])
+@pytest.mark.parametrize("name", ALL_PLATFORMS)
 def test_hydro_models_are_physical(p, vd, name):
     import numpy as np
     plat = p.get_platform(name)
-    h = plat.hydro
-    assert h is not None and h.sources
+    h = vd.resolve_hydro(plat)
+    assert h["sources"]
     model = vd.from_platform(plat)
     # near neutral: |net buoyancy| within 2% of weight in fresh water
-    net = 1000.0 * h.displaced_volume - plat.mass
+    net = 1000.0 * h["displaced_volume"] - plat.mass
     assert abs(net) < 0.02 * plat.mass
-    assert h.cob[2] > 0.0                                  # statically stable
-    assert all(v > 0 for v in h.inertia)
-    assert all(v >= 0 for v in h.added_mass + h.linear_damping + h.quadratic_damping)
-    rank = np.linalg.matrix_rank(model.thrusters.B)
-    assert rank == (6 if name == "bluerov2_heavy" else 5)   # 6-thruster frames: no pitch
-    for axis in (0, 1, 2, 5):
-        assert np.abs(model.max_wrench(np.eye(6)[axis])[axis]) > 1.0
+    assert h["cob"][2] > 0.0                               # statically stable
+    assert all(v > 0 for v in h["inertia"])
+    assert all(v >= 0 for v in h["added_mass"] + h["linear_damping"] + h["quadratic_damping"])
+    assert np.all(model.thrusters.max_forward > 0) and np.all(model.thrusters.max_reverse > 0)
+    assert plat.dimensions and plat.manufacturer
+    assert _top_speed(vd, plat, 0) > 0.3                   # every vehicle can surge
+    # controllable axes = what the thruster layout can produce on its own
+    B = model.thrusters.B
+    controllable = {i for i in range(6)
+                    if np.allclose(B @ np.linalg.pinv(B) @ np.eye(6)[i], np.eye(6)[i], atol=1e-6)}
+    assert controllable == CONTROLLABLE[name]
 
 
 def test_bluerov2_speeds_bracketed_by_measurement_and_claim(p, vd):
@@ -237,11 +248,18 @@ def test_revolution_matches_listed_speeds(p, vd):
     assert np.abs(vd.from_platform(rev).max_wrench(np.eye(6)[0])[0]) == pytest.approx(12 * 9.81, rel=1e-3)
 
 
-def test_revolution_added_mass_is_the_ellipsoid_estimate(p, vd):
-    rev = p.get_platform("deeptrekker_revolution")
-    est = vd.ellipsoid_added_mass(0.717 / 2, 0.44 / 2, 0.235 / 2, 1000.0,
-                                  rev.hydro.displaced_volume)
-    assert list(rev.hydro.added_mass) == pytest.approx(est.tolist(), rel=2e-3)
+def test_revolution_estimate_reproduces_documented_values(p, vd):
+    """The HydroEstimate path must give the values derived by hand when the
+    Revolution model was first written (regression lock on the method)."""
+    h = vd.resolve_hydro(p.get_platform("deeptrekker_revolution"))
+    assert h["displaced_volume"] == pytest.approx(0.02613)
+    assert list(h["inertia"]) == pytest.approx([0.3235, 0.7401, 0.92], rel=1e-3)
+    assert list(h["added_mass"]) == pytest.approx(
+        [4.575, 10.354, 34.246, 0.1045, 0.5211, 0.0804], rel=2e-3)
+    assert list(h["quadratic_damping"]) == pytest.approx(
+        [46.42, 101.35, 46.42, 0.1236, 0.5347, 1.1675], rel=2e-3)
+    assert list(h["linear_damping"]) == pytest.approx(
+        [4.642, 10.135, 4.642, 0.01236, 0.05347, 0.11675], rel=2e-3)
 
 
 def test_thruster_voltage_and_drag_overrides(p, vd):
@@ -258,7 +276,7 @@ def test_strip_theory_rotational_drag_checked_on_bluerov2(p):
     measured translational drag coefficients, the same formulas land within a
     factor of two of its measured rotational coefficients."""
     rho, length, width, height = 1000.0, 0.46, 0.58, 0.38
-    q = p.get_platform("bluerov2_heavy").hydro.quadratic_damping
+    q = p.get_platform("bluerov2_heavy").hydro.quadratic_damping   # measured HydroSpec
     cd_y = 2 * q[1] / (rho * 0.1131)          # A_v
     cd_z = 2 * q[2] / (rho * 0.2049)          # A_w
     strip = (rho * cd_z * length * width ** 4 / 64,
@@ -266,3 +284,58 @@ def test_strip_theory_rotational_drag_checked_on_bluerov2(p):
              rho * cd_y * height * length ** 4 / 64)
     for est, measured in zip(strip, q[3:]):
         assert 0.5 < est / measured < 2.0
+
+
+ALL6 = {0, 1, 2, 3, 4, 5}
+CONTROLLABLE = {                              # surge sway heave roll pitch yaw
+    "bluerov2": {0, 1, 2, 3, 5},              # no pitch (6-thruster frame)
+    "bluerov2_heavy": ALL6,
+    "deeptrekker_revolution": {0, 1, 2, 3, 5},
+    "deeptrekker_dtg3": {0, 2, 5},            # 2 forward + 1 vertical
+    "deeptrekker_pivot": {0, 1, 2, 3, 5},
+    "videoray_pro5": {0, 2, 5},
+    "videoray_defender": ALL6,                # 4 vectored + 3 vertical
+    "chasing_m2_pro_max": ALL6,               # 4 vectored + 4 vertical
+    "qysea_fifish_v6_expert": {0, 1, 2, 3, 5},
+    "saab_seaeye_falcon": {0, 1, 2, 5},       # single vertical thruster
+    "seabotix_vlbv300": {0, 1, 2, 3, 5},
+}
+
+# Published figures each estimated model must reproduce (kgf thrust per axis,
+# top speeds in kn or m/s), from the sources cited in platforms.py.
+PUBLISHED = {
+    "deeptrekker_dtg3": dict(surge_kgf=2.5, heave_kgf=2.5, surge_kn=2.5, heave_kn=2.5),
+    "deeptrekker_pivot": dict(surge_kn=2.0, heave_kn=1.0),
+    "videoray_pro5": dict(surge_kgf=20.3, reverse_kgf=13.0, surge_kn=4.4, heave_ms=0.8),
+    "videoray_defender": dict(surge_kgf=23.6, reverse_kgf=15.0, sway_kgf=8.6, heave_kgf=23.1,
+                              down_kgf=12.9, surge_kn=3.8, sway_kn=0.9, heave_ms=0.8),
+    "chasing_m2_pro_max": dict(surge_kgf=5.7, sway_kgf=3.6, heave_kgf=4.0, surge_ms=1.5),
+    "qysea_fifish_v6_expert": dict(surge_ms=1.5),
+    "saab_seaeye_falcon": dict(surge_kgf=42.0, sway_kgf=25.0, heave_kgf=13.0, surge_kn=3.0),
+    "seabotix_vlbv300": dict(surge_kgf=18.1, sway_kgf=15.2, heave_kgf=9.0, surge_kn=3.0),
+}
+_AXIS = {"surge": (0, 1.0), "reverse": (0, -1.0), "sway": (1, 1.0), "heave": (2, 1.0),
+         "down": (2, -1.0)}
+
+
+@pytest.mark.parametrize("name", sorted(PUBLISHED))
+def test_estimated_vehicles_reproduce_published_figures(p, vd, name):
+    import numpy as np
+    plat = p.get_platform(name)
+    model = vd.from_platform(plat)
+    for key, value in PUBLISHED[name].items():
+        what, unit = key.rsplit("_", 1)
+        axis, sign = _AXIS[what]
+        if unit == "kgf":
+            d = np.zeros(6)
+            d[axis] = sign
+            assert abs(model.max_wrench(d)[axis]) == pytest.approx(value * 9.80665, rel=2e-3), key
+        else:
+            want = value * KNOT if unit == "kn" else value
+            assert _top_speed(vd, plat, axis, sign) == pytest.approx(want, rel=0.01), key
+
+
+def test_vector_angle_from_thrust(p):
+    assert p.vector_angle_from_thrust(10.0, 10.0) == pytest.approx(45.0)
+    # sway is bounded by the weaker (reverse) direction
+    assert p.vector_angle_from_thrust(23.6, 8.6, 15.0) == pytest.approx(29.83, abs=0.01)

@@ -22,6 +22,7 @@ DEFAULT_SENSOR_LINKS = {
     "camera": ["camera", "camera_link", "cam", "uw_camera", "camera0", "front_camera"],
     "dvl": ["dvl", "dvl_link", "dvl0", "doppler"],
     "baro": ["baro", "barometer", "pressure", "pressure_sensor", "depth"],
+    "altimeter": ["altimeter", "altimeter_link", "echosounder", "ping", "ping2"],
 }
 
 

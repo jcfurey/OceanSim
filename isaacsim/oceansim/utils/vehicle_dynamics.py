@@ -229,12 +229,16 @@ class VehicleModel:
     ``command_thrusters`` (normalised per-thruster commands in [-1, 1], through
     the thrust curve). The latest command holds until replaced."""
 
-    def __init__(self, hydro, thrusters, rho=1000.0, g=GRAVITY, surface_z=None):
+    def __init__(self, hydro, thrusters, rho=1000.0, g=GRAVITY, surface_z=None,
+                 cog=(0.0, 0.0, 0.0)):
         self.hydro = hydro
         self.thrusters = thrusters
         self.rho = float(rho)
         self.g = float(g)
         self.surface_z = surface_z
+        # CoG relative to the prim origin: positions are reported for the
+        # origin, everything else in this model is about the CoG.
+        self.cog = np.asarray(cog, dtype=float).reshape(3)
         self._wrench_cmd = np.zeros(6)
         self._thruster_cmd = None
         self.last_submerged = 1.0
@@ -272,7 +276,8 @@ class VehicleModel:
         else:
             f_cmd = self.thrusters.allocate(self._wrench_cmd)
         self.thrusters.step(f_cmd, dt)
-        z_cob = float(np.asarray(position, float).reshape(3)[2] + (rot_wb @ self.hydro.cob)[2])
+        z_cob = float(np.asarray(position, float).reshape(3)[2]
+                      + (rot_wb @ (self.cog + self.hydro.cob))[2])
         self.last_submerged = submerged_fraction(z_cob, self.surface_z, self.hydro.height)
         tau = (self.thrusters.wrench() + self.hydro.damping(nu)
                + self.hydro.restoring(rot_wb, self.rho, self.g, self.last_submerged))
@@ -310,27 +315,229 @@ def ellipsoid_added_mass(a, b, c, rho, volume, samples=20000):
     return np.array([k_lin[0] * m, k_lin[1] * m, k_lin[2] * m, i_x, i_y, i_z])
 
 
-def from_platform(spec, rho=1000.0, g=GRAVITY, surface_z=None, voltage=None,
-                  drag_scale=1.0, mass=None):
-    """VehicleModel for a ``platforms.PlatformSpec`` with a ``hydro`` entry.
-    voltage overrides the T200 supply voltage; drag_scale multiplies both
-    damping terms (for calibrating against your own vehicle); mass overrides
-    the in-air mass (the displaced volume, and so the buoyancy, is kept)."""
+def _thruster_limits(thrusters, thruster_model, voltage):
+    if thruster_model == "T200":
+        fwd, rev = t200_max_thrust(voltage)
+        return [fwd] * len(thrusters), [rev] * len(thrusters)
+    fwd = [t.max_forward for t in thrusters]
+    rev = [t.max_reverse if t.max_reverse is not None else t.max_forward for t in thrusters]
+    if any(v is None for v in fwd):
+        raise ValueError("thrusters need max_forward unless thruster_model is 'T200'")
+    return fwd, rev
+
+
+def estimate_hydro(spec, rho=1000.0):
+    """Hydrodynamic parameters estimated from a platform's ``HydroEstimate``
+    (see platforms.HydroEstimate for the method). Returns a HydroSpec-like
+    dict (keys as HydroSpec fields)."""
+    est = spec.hydro
+    length, width, height = spec.dimensions
+    mass = float(spec.mass)
+    volume = mass * (1.0 + est.net_buoyancy) / rho
+    voltage = est.battery_voltage
+    areas = (width * height, length * height, length * width)
+    speeds = list(est.top_speeds or (None, None, None))
+    thruster_specs = est.thrusters
+    if est.thruster_model is None:
+        vertical = [abs(t.direction[2]) > 0.7 for t in est.thrusters]
+        h_unknown = any(t.max_forward is None for t, v in zip(est.thrusters, vertical) if not v)
+        v_unknown = any(t.max_forward is None for t, v in zip(est.thrusters, vertical) if v)
+        if h_unknown or v_unknown:
+            thruster_specs = _size_thrusters(est, areas, speeds, rho, h_unknown, v_unknown)
+            # axes whose thrust was sized from the drag model keep that drag
+            if h_unknown:
+                speeds[0] = speeds[1] = None
+            if v_unknown:
+                speeds[2] = None
+    fwd, rev = _thruster_limits(thruster_specs, est.thruster_model, voltage)
+    thrusters = ThrusterArray([t.position for t in thruster_specs],
+                              [t.direction for t in thruster_specs], fwd, rev)
+    quad = []
+    cds = []
+    for axis in range(3):
+        speed = speeds[axis]
+        if speed:
+            d = np.zeros(6)
+            d[axis] = 1.0
+            force = float(thrusters.wrench(thrusters.allocate(d * 1e6))[axis])
+            q = force / (speed * speed + est.linear_fraction * speed)
+            cd = 2.0 * q / (rho * areas[axis])
+        else:
+            cd = float(est.drag_coefficients[axis])
+            q = 0.5 * rho * cd * areas[axis]
+        quad.append(q)
+        cds.append(cd)
+    quad += [rho * cds[2] * length * width ** 4 / 64.0,      # roll: heave strips across W
+             rho * cds[2] * width * length ** 4 / 64.0,      # pitch: heave strips along L
+             rho * cds[1] * height * length ** 4 / 64.0]     # yaw: sway strips along L
+    box = mass / 12.0
+    inertia = tuple(est.inertia_factor * box * v for v in
+                    (width ** 2 + height ** 2, length ** 2 + height ** 2, length ** 2 + width ** 2))
+    added = ellipsoid_added_mass(length / 2, width / 2, height / 2, rho, volume)
+    return dict(inertia=inertia, displaced_volume=volume, cob=(0.0, 0.0, est.cob_height),
+                height=height, added_mass=tuple(float(v) for v in added),
+                linear_damping=tuple(est.linear_fraction * q for q in quad),
+                quadratic_damping=tuple(float(q) for q in quad),
+                thrusters=thruster_specs, thruster_model=est.thruster_model,
+                battery_voltage=est.battery_voltage,
+                thruster_time_constant=est.thruster_time_constant,
+                sources=est.sources, cog=(0.0, 0.0, 0.0),
+                drag_coefficients=tuple(cds))
+
+
+FOAM_DENSITY = 350.0      # kg/m^3, syntactic trim foam (shallow-rated)
+LEAD_DENSITY = 11340.0
+
+
+def _size_thrusters(est, areas, speeds, rho, h_unknown, v_unknown):
+    """Limits for thrusters whose thrust is unpublished: the force the drag
+    model (drag_coefficients) needs at the listed surge (horizontal) / heave
+    (vertical) speed, shared by that group (symmetric limits). Vertical
+    thrusters without a listed heave speed get the horizontal per-thruster
+    limit (same motors assumed)."""
+    vertical = [abs(t.direction[2]) > 0.7 for t in est.thrusters]
+
+    def _need(axis, speed):
+        q = 0.5 * rho * float(est.drag_coefficients[axis]) * areas[axis]
+        return q * speed * speed + est.linear_fraction * q * speed
+
+    def _per_unit(axis, group):
+        # wrench along axis per newton of limit, using only the group's thrusters
+        idx = [i for i, g in enumerate(vertical) if g == group]
+        if not idx:
+            return 0.0
+        sub = ThrusterArray([est.thrusters[i].position for i in idx],
+                            [est.thrusters[i].direction for i in idx], 1.0, 1.0)
+        d = np.zeros(6)
+        d[axis] = 1.0
+        return float(sub.wrench(sub.allocate(d * 1e6))[axis])
+
+    h_limit = v_limit = None
+    if h_unknown:
+        if not speeds[0]:
+            raise ValueError("unpublished horizontal thrust needs a listed surge speed")
+        h_limit = _need(0, speeds[0]) / _per_unit(0, False)
+    if v_unknown:
+        if speeds[2]:
+            v_limit = _need(2, speeds[2]) / _per_unit(2, True)
+        else:
+            known = [t.max_forward for t, v in zip(est.thrusters, vertical)
+                     if not v and t.max_forward is not None]
+            v_limit = h_limit if h_limit is not None else (sum(known) / len(known) if known else None)
+            if v_limit is None:
+                raise ValueError("unpublished vertical thrust needs a heave speed or horizontal thrust")
+    out = []
+    for t, v in zip(est.thrusters, vertical):
+        if t.max_forward is not None:
+            out.append(t)
+        else:
+            lim = v_limit if v else h_limit
+            out.append(type(t)(t.position, t.direction, lim, lim))
+    return tuple(out)
+
+
+def resolve_hydro(spec, payloads=(), rho=1000.0, mass=None, trim=True):
+    """The vehicle's hydrodynamic parameters with ``payloads`` fitted, as a
+    dict of HydroSpec fields plus "mass" and "trim".
+
+    Measured HydroSpecs are used as given, HydroEstimates estimated. Each
+    payload (utils.payloads.PayloadSpec, mounted at the platform's mount for
+    its kind) adds its mass and displaced volume at its mount point -- moving
+    the CoG and CoB, with parallel-axis inertia -- and drag over its projected
+    area (Cd 1). Positions in the result (thrusters, cob) are relative to the
+    new CoG; ``cog`` is the CoG's offset from the prim origin.
+
+    ``trim`` re-ballasts like an operator does after fitting payloads: it
+    restores the bare vehicle's net buoyancy fraction (in water of density
+    ``rho``) with syntactic foam at the top of the frame, or lead at the
+    bottom if the payloads made it lighter. The result's "trim" entry says
+    what was added (kind, mass, volume)."""
     h = spec.hydro
     if h is None:
         raise ValueError(f"platform {spec.name!r} has no hydrodynamic parameters")
-    hydro = HydroModel(spec.mass if mass is None else float(mass), h.inertia, h.added_mass,
-                       np.asarray(h.linear_damping) * drag_scale,
-                       np.asarray(h.quadratic_damping) * drag_scale,
-                       h.displaced_volume, h.cob, h.height)
-    pos = [t.position for t in h.thrusters]
-    dirs = [t.direction for t in h.thrusters]
-    if h.thruster_model == "T200":
-        fwd, rev = t200_max_thrust(voltage if voltage is not None else h.battery_voltage)
-        max_fwd = [fwd] * len(pos)
-        max_rev = [rev] * len(pos)
+    if hasattr(h, "top_speeds"):
+        base = estimate_hydro(spec, rho)
     else:
-        max_fwd = [t.max_forward for t in h.thrusters]
-        max_rev = [t.max_reverse for t in h.thrusters]
-    thrusters = ThrusterArray(pos, dirs, max_fwd, max_rev, h.thruster_time_constant)
-    return VehicleModel(hydro, thrusters, rho=rho, g=g, surface_z=surface_z)
+        base = {f: getattr(h, f) for f in (
+            "inertia", "displaced_volume", "cob", "height", "added_mass", "linear_damping",
+            "quadratic_damping", "thrusters", "thruster_model", "battery_voltage",
+            "thruster_time_constant", "sources", "cog")}
+    m0 = float(spec.mass if mass is None else mass)
+    r0 = np.asarray(base["cog"], dtype=float)
+    v0 = float(base["displaced_volume"])
+    cob0 = r0 + np.asarray(base["cob"], dtype=float)          # CoB relative to the origin
+    masses = [(m0, r0)]
+    volumes = [(v0, cob0)]
+    quad = np.asarray(base["quadratic_damping"], dtype=float).copy()
+    for p in payloads:
+        mount = spec.mount(p.kind)
+        r = np.asarray(mount.translation, dtype=float) + np.asarray(p.offset, dtype=float)
+        masses.append((float(p.mass), r))
+        volumes.append((float(p.volume), r))
+        length, width, height = p.size
+        quad[:3] += 0.5 * rho * 1.0 * np.array([width * height, length * height, length * width])
+    trim_info = None
+    if trim and payloads:
+        net0 = (rho * v0 - m0) / m0                      # bare vehicle's trim
+        lift = (1.0 + net0) * sum(m for m, _ in masses) - rho * sum(v for v, _ in volumes)
+        height = float(base["height"])
+        # (rho (V + v) - (M + m)) / (M + m) = net0 with the trim's own (m, v)
+        if lift > 1e-9:          # heavier: foam high on the frame
+            vol = lift / (rho - FOAM_DENSITY * (1.0 + net0))
+            at = r0 + np.array([0.0, 0.0, 0.4 * height])
+            masses.append((FOAM_DENSITY * vol, at))
+            volumes.append((vol, at))
+            trim_info = dict(kind="foam", mass=FOAM_DENSITY * vol, volume=vol, position=tuple(at))
+        elif lift < -1e-9:       # lighter: lead low on the frame
+            m_b = -lift / (1.0 + net0 - rho / LEAD_DENSITY)
+            at = r0 + np.array([0.0, 0.0, -0.4 * height])
+            masses.append((m_b, at))
+            volumes.append((m_b / LEAD_DENSITY, at))
+            trim_info = dict(kind="lead", mass=m_b, volume=m_b / LEAD_DENSITY, position=tuple(at))
+    m_tot = sum(m for m, _ in masses)
+    cog = sum(m * r for m, r in masses) / m_tot
+    v_tot = sum(v for v, _ in volumes)
+    cob = sum(v * r for v, r in volumes) / v_tot
+    inertia = np.asarray(base["inertia"], dtype=float) + m0 * _parallel_axis(r0 - cog)
+    for m, r in masses[1:]:
+        inertia = inertia + m * _parallel_axis(r - cog)
+    shift = cog - r0
+    thrusters = tuple(type(t)(tuple(np.asarray(t.position, float) - shift), t.direction,
+                              t.max_forward, t.max_reverse) for t in base["thrusters"])
+    lin = np.asarray(base["linear_damping"], dtype=float)
+    # payload drag keeps the vehicle's linear / quadratic ratio
+    ratio = np.divide(lin[:3], np.asarray(base["quadratic_damping"], float)[:3],
+                      out=np.zeros(3), where=np.asarray(base["quadratic_damping"], float)[:3] > 0)
+    lin = lin.copy()
+    lin[:3] = ratio * quad[:3]
+    out = dict(base)
+    out.update(mass=m_tot, inertia=tuple(float(v) for v in inertia), displaced_volume=v_tot,
+               cob=tuple(float(v) for v in cob - cog), cog=tuple(float(v) for v in cog),
+               thrusters=thrusters, quadratic_damping=tuple(float(v) for v in quad),
+               linear_damping=tuple(float(v) for v in lin), trim=trim_info)
+    return out
+
+
+def _parallel_axis(d):
+    d = np.asarray(d, dtype=float)
+    return np.array([d[1] ** 2 + d[2] ** 2, d[0] ** 2 + d[2] ** 2, d[0] ** 2 + d[1] ** 2])
+
+
+def from_platform(spec, rho=1000.0, g=GRAVITY, surface_z=None, voltage=None,
+                  drag_scale=1.0, mass=None, payloads=(), trim=True):
+    """VehicleModel for a ``platforms.PlatformSpec`` with hydrodynamics, with
+    ``payloads`` fitted. voltage overrides the T200 supply voltage; drag_scale
+    multiplies both damping terms (for calibrating against your own vehicle);
+    mass overrides the bare vehicle's in-air mass (its displaced volume, and so
+    its buoyancy, is kept)."""
+    h = resolve_hydro(spec, payloads, rho=rho, mass=mass, trim=trim)
+    hydro = HydroModel(h["mass"], h["inertia"], h["added_mass"],
+                       np.asarray(h["linear_damping"]) * drag_scale,
+                       np.asarray(h["quadratic_damping"]) * drag_scale,
+                       h["displaced_volume"], h["cob"], h["height"])
+    thr = h["thrusters"]
+    v = voltage if voltage is not None else h["battery_voltage"]
+    fwd, rev = _thruster_limits(thr, h["thruster_model"], v)
+    thrusters = ThrusterArray([t.position for t in thr], [t.direction for t in thr],
+                              fwd, rev, h["thruster_time_constant"])
+    return VehicleModel(hydro, thrusters, rho=rho, g=g, surface_z=surface_z, cog=h["cog"])
