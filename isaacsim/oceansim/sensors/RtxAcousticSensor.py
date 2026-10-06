@@ -44,8 +44,8 @@ in [0, 1], consumed by ``OceanSimSensorPublisher``), exposing the same interface
 
 STATUS: EXPERIMENTAL.  Range is now calibrated (sample index -> range via the
 sensor's sampleDuration). REMAINING: azimuth resolution == number of signal ways
-(no per-sample azimuth; needs delay-and-sum beamforming -- see RTX_SONAR_BACKENDS.md
-item #2), the ~6 m air-medium range cap, and the 90deg sensor FOV vs Oculus 130deg.
+(the grid's beams between them are linearly interpolated; no per-sample azimuth;
+needs delay-and-sum beamforming -- see RTX_SONAR_BACKENDS.md item #2), the ~6 m air-medium range cap, and the 90deg sensor FOV vs Oculus 130deg.
 """
 
 from __future__ import annotations

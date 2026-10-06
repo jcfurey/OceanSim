@@ -97,12 +97,11 @@ the results are all-zero and contribute nothing downstream.
   but must zero the buffers once (they're currently fully overwritten each
   frame, so a naive skip would leak stale values into the image). Low priority.
 
-### 4. `fold_gmo_to_grid` dtype (micro, low value)
-`rtx_acoustic_math.fold_gmo_to_grid` upcasts the already-`float32` GMO amplitude
-buffer to `float64` for `np.abs` + the scatter. Keeping it `float32` halves the
-intermediate footprint, but `np.bincount` weights return `float64` regardless
-and the wider accumulation is slightly more accurate. **Verdict:** not worth the
-precision trade; noted only for completeness.
+### 4. `fold_gmo_to_grid` — done
+The fold now resamples the A-scans with two cached float32 weight matrices
+(range, then azimuth; `rtx_acoustic_math._linear_bin_weights`): ~1.0 ms per
+frame at the runner defaults vs ~2.6 ms for the old `float64` scatter, while
+filling every bin (see CHANGELOG).
 
 ---
 
