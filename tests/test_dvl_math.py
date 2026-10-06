@@ -102,3 +102,91 @@ def test_dt_nan_range_falls_back_to_min_freq(m):
     dt = m.adaptive_sensor_dt(float('nan'), FB, RB, SS)
     assert np.isfinite(dt)
     assert dt == pytest.approx(1 / 5.0)
+
+
+# --- mount_point_velocity_body (lever arm) ---------------------------------
+
+def _rot_z(deg):
+    a = np.deg2rad(deg)
+    return np.array([[np.cos(a), -np.sin(a), 0.0], [np.sin(a), np.cos(a), 0.0], [0.0, 0.0, 1.0]])
+
+
+def test_lever_arm_zero_rotation_is_plain_body_velocity(m):
+    rot = _rot_z(30.0)
+    v_world = np.array([0.4, -0.2, 0.1])
+    out = m.mount_point_velocity_body(v_world, np.zeros(3), rot, [0.3, 0.1, -0.2])
+    assert np.allclose(out, rot.T @ v_world)
+
+
+def test_lever_arm_yaw_rate_adds_sway(m):
+    """0.5 m/s surge with 0.5 rad/s yaw; DVL 0.209 m behind the centre of mass
+    (the case from the audit): the mount moves sideways at -omega * x."""
+    out = m.mount_point_velocity_body([0.5, 0.0, 0.0], [0.0, 0.0, 0.5], np.eye(3),
+                                      [-0.209, 0.0, -0.06])
+    assert out == pytest.approx([0.5, -0.1045, 0.0])
+
+
+def test_lever_arm_matches_finite_difference_of_mount_position(m):
+    """Independent check: differentiate the mount's world position along a
+    rigid motion (constant v, omega) and express it in the body frame."""
+    rng = np.random.default_rng(3)
+    for _ in range(20):
+        v = rng.normal(size=3)
+        w = rng.normal(size=3)
+        r_body = rng.normal(size=3)
+        yaw0 = rng.uniform(0, 360)
+        rot0 = _rot_z(yaw0) @ np.array([[1, 0, 0], [0, np.cos(0.3), -np.sin(0.3)],
+                                        [0, np.sin(0.3), np.cos(0.3)]])
+        dt = 1e-6
+
+        def mount_world(t):
+            # rotation R(t) = exp([w]x t) R0 (world-frame angular velocity)
+            th = np.linalg.norm(w) * t
+            k = w / np.linalg.norm(w)
+            kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+            r_t = np.eye(3) + np.sin(th) * kx + (1 - np.cos(th)) * kx @ kx
+            return v * t + r_t @ rot0 @ r_body
+
+        fd = (mount_world(dt) - mount_world(-dt)) / (2 * dt)
+        out = m.mount_point_velocity_body(v, w, rot0, r_body)
+        assert np.allclose(out, rot0.T @ fd, atol=1e-6)
+
+
+# --- velocity_covariance / altitude_from_beam_ranges -----------------------
+
+def test_velocity_covariance_matches_sampled_noise(m):
+    """T Sigma T^T must equal the empirical covariance of T @ beam_noise."""
+    t = m.beam_velocity_transform(22.5)
+    l = np.diag([0.02, 0.03, 0.025, 0.02])
+    l[1, 0] = 0.01  # correlated beams
+    rng = np.random.default_rng(7)
+    samples = (t @ (l @ rng.standard_normal((4, 200000)))).T
+    assert np.allclose(m.velocity_covariance(t, l), np.cov(samples.T), atol=2e-5)
+
+
+def test_velocity_covariance_isotropic_scaling(m):
+    """Isotropic beam variance s^2 -> s^2/(2 sin^2) in x/y and s^2/(4 cos^2) in z."""
+    s2 = 0.01
+    cov = m.velocity_covariance(m.beam_velocity_transform(22.5), np.sqrt(s2) * np.eye(4))
+    e = np.deg2rad(22.5)
+    assert cov[0, 0] == pytest.approx(s2 / (2 * np.sin(e) ** 2))
+    assert cov[2, 2] == pytest.approx(s2 / (4 * np.cos(e) ** 2))
+    assert cov[0, 1] == pytest.approx(0.0) and cov[0, 2] == pytest.approx(0.0)
+
+
+def test_velocity_covariance_zero_for_noise_free(m):
+    assert not np.any(m.velocity_covariance(m.beam_velocity_transform(22.5), np.zeros((4, 4))))
+
+
+def test_altitude_is_vertical_not_slant_range(m):
+    h = 4.0
+    slant = h / np.cos(np.deg2rad(22.5))
+    assert m.altitude_from_beam_ranges([slant] * 4, 22.5) == pytest.approx(h)
+
+
+def test_altitude_ignores_missed_beams(m):
+    h = 2.5
+    slant = h / np.cos(np.deg2rad(30.0))
+    out = m.altitude_from_beam_ranges([slant, float("nan"), slant, float("inf")], 30.0)
+    assert out == pytest.approx(h)
+    assert np.isnan(m.altitude_from_beam_ranges([float("nan")] * 4, 22.5))

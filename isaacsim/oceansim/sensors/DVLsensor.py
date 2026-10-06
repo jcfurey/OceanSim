@@ -35,7 +35,8 @@ class DVLsensor:
 
         Args:
             name (str): Identifier for the sensor. Defaults to "DVL".
-            elevation (float): Beam elevation angle from horizontal in degrees. Defaults to 22.5°.
+            elevation (float): Beam angle from the DVL's vertical (-Z) axis in degrees, shared by the
+                                four Janus beams. Defaults to 22.5°.
             rotation (float): Beam rotation about Z-axis in degrees. Defaults to 45° (Janus configuration).
             vel_cov (float): Velocity measurement noise covariance. Defaults to 0 (no noise).
             depth_cov (float): Depth measurement noise covariance. Defaults to 0 (no noise).
@@ -125,6 +126,7 @@ class DVLsensor:
         # exactly 4 beams at fixed indices).
         self._beam_paths = []
         self._rigid_body_prim = SingleRigidPrim(prim_path=self._rigid_body_path)
+        self._lever_arm_body = None  # recomputed for the new mount (_get_lever_arm_body)
         sensor_prim_path = rigid_body_path + "/" + self._name
         self._DVL = BaseSensor(prim_path=sensor_prim_path,
                                position=position,
@@ -329,15 +331,61 @@ class DVLsensor:
         self.last_dropout = False
 
         world_vel = self._rigid_body_prim.get_linear_velocity()
+        world_ang_vel = self._rigid_body_prim.get_angular_velocity()
         _, world_orient = self._rigid_body_prim.get_world_pose()
         rot_m = quat_to_rot_matrix(world_orient)
-        vel = rot_m.T @ world_vel
+        # The DVL sees the velocity of its mount point, not the centre of mass:
+        # add omega x r for the mount's lever arm (dvl_math). Without it a
+        # yawing vehicle reported no sway at an off-centre DVL.
+        vel = dvl_math.mount_point_velocity_body(
+            world_vel, world_ang_vel, rot_m, self._get_lever_arm_body())
         if (self._mvn_vel.is_uncertain()):
             # vel += transform @ beam_noise (the old double loop, vectorised).
             vel = vel + self._transform @ self._mvn_vel.sample_array()
 
         return vel
     
+
+    def get_velocity_covariance(self):
+        """3x3 body-frame covariance of get_linear_vel()'s noise (T Sigma T^T
+        of the beam-space vel_cov); all zeros for a noise-free DVL."""
+        return dvl_math.velocity_covariance(self._transform, self._mvn_vel.get_sqrt_cov())
+
+    def get_altitude(self, depth=None):
+        """Altitude above the bottom (m) from the beam ranges (get_depth(), or
+        the ranges passed in); NaN without any beam return."""
+        if depth is None:
+            depth = self.get_depth()
+        return dvl_math.altitude_from_beam_ranges(depth, self._elevation)
+
+    def _get_lever_arm_body(self):
+        """Mount position minus centre-of-mass position, in the body frame.
+
+        The DVL prim is a direct child of the rigid body (attachDVL), so its
+        local translation is the mount offset in the body frame. The centre of
+        mass comes from the physics view (body-local); both are constant, so
+        this is computed once. Falls back to the body origin as the centre of
+        mass if the physics view can't report it."""
+        cached = getattr(self, "_lever_arm_body", None)
+        if cached is not None:
+            return cached
+        mount, _ = self._DVL.get_local_pose()
+        mount = np.asarray(mount, dtype=float).reshape(3)
+        com = np.zeros(3)
+        com_known = False
+        try:
+            com_pos, _ = self._rigid_body_prim.get_com()
+            com_pos = np.asarray(com_pos, dtype=float).reshape(-1)[:3]
+            if com_pos.shape == (3,) and np.all(np.isfinite(com_pos)):
+                com, com_known = com_pos, True
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[{self._name}] centre of mass unavailable ({exc}); "
+                          f"using the body origin for the DVL lever arm")
+        lever_arm = mount - com
+        # Only cache once the physics view has answered; before play() retry.
+        if com_known:
+            self._lever_arm_body = lever_arm
+        return lever_arm
 
     def get_linear_vel_fd(self, physics_dt: float):
         """Frequency-dependent version of get_linear_vel() that respects sensor update rate.

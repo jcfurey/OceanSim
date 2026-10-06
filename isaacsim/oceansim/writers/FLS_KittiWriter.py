@@ -401,7 +401,7 @@ class FLS_KittiWriter(Writer):
             kernel=normal_2d,
             dim=self.bin_sum.shape,
             inputs=[
-                self._frame_id,   # use frame id for RNG seed increment
+                2 * self._frame_id,       # even seed half; see the Rayleigh launch
                 0.0,
                 self.gau_noise_param
             ],
@@ -416,7 +416,11 @@ class FLS_KittiWriter(Writer):
             kernel=range_dependent_rayleigh_2d,
             dim=self.bin_sum.shape,
             inputs=[
-                self._frame_id,   # use frame num for RNG seed increment
+                # Odd seed half. Both noise kernels seed per cell as
+                # rand_init(seed, i*W+j), so one shared seed made the Gaussian
+                # field the Rayleigh field's first draw (corr ~0.7). Same split
+                # as ImagingSonarSensor.
+                2 * self._frame_id + 1,
                 self.r,
                 self.azi,
                 self.max_range,
@@ -495,7 +499,9 @@ class FLS_KittiWriter(Writer):
     def _write_sonar_image(self, sub_dir: str):
         sonar_dir_name = "sonar_image_02" if self._use_kitti_dir_names else "sonar_image"
         sonar_file_path = os.path.join(sub_dir, sonar_dir_name, f"{self._frame_id}.png")
-        self._backend.schedule(F.write_image, data=self.sonar_image, path=sonar_file_path)
+        # Snapshot to host: the backend writes asynchronously and sonar_image is
+        # the reused device buffer the next frame overwrites (torn PNGs).
+        self._backend.schedule(F.write_image, data=self.sonar_image.numpy(), path=sonar_file_path)
 
 
 

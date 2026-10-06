@@ -51,13 +51,7 @@ class BarometerSensor_ROS(BarometerSensor):
         super().initialize(physics_sim_view)
 
     def _compute_variance(self) -> float:
-        sqrt_cov = np.asarray(self._mvn_press.get_sqrt_cov(), dtype=np.float64)
-        if sqrt_cov.shape != (1, 1):
-            return 0.0
-        variance = float(sqrt_cov[0, 0] ** 2)
-        if not np.isfinite(variance) or variance < 0.0:
-            return 0.0
-        return variance
+        return self.get_pressure_variance()
 
     def _build_payload(self) -> dict:
         sim_time = float(omni.timeline.get_timeline_interface().get_current_time())

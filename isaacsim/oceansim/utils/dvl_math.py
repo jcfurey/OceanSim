@@ -66,3 +66,47 @@ def adaptive_sensor_dt(min_range, freq_bound, range_bound, sound_speed):
     else:
         freq = lo_f
     return 1.0 / freq
+
+
+def mount_point_velocity_body(v_com_world, omega_world, rot_world_from_body, lever_arm_body):
+    """Velocity of the DVL mount point, expressed in the vehicle body frame.
+
+    A DVL measures the velocity of the point it is mounted at, not of the
+    vehicle's centre of mass:  v_mount = v_com + omega x r, with r the vector
+    from the centre of mass to the mount. In the body frame that is
+
+        R^T v_com + (R^T omega) x r_body
+
+    ``v_com_world`` / ``omega_world`` are the rigid body's world-frame linear
+    (centre-of-mass) and angular (rad/s) velocities, ``rot_world_from_body``
+    the 3x3 body->world rotation, and ``lever_arm_body`` = mount position minus
+    centre-of-mass position, both in the body frame.
+    """
+    rot = np.asarray(rot_world_from_body, dtype=float).reshape(3, 3)
+    v_body = rot.T @ np.asarray(v_com_world, dtype=float).reshape(3)
+    w_body = rot.T @ np.asarray(omega_world, dtype=float).reshape(3)
+    return v_body + np.cross(w_body, np.asarray(lever_arm_body, dtype=float).reshape(3))
+
+
+def velocity_covariance(transform, beam_sqrt_cov):
+    """Body-frame velocity covariance T Sigma T^T for beam-space noise with
+    covariance Sigma = L L^T (L = ``beam_sqrt_cov``, 4x4) pushed through the
+    3x4 Janus transform T. With 22.5 deg beams an isotropic per-beam variance
+    becomes ~3.4x larger in x/y and ~0.29x in z."""
+    t = np.asarray(transform, dtype=float).reshape(3, 4)
+    l = np.asarray(beam_sqrt_cov, dtype=float).reshape(4, 4)
+    sigma = l @ l.T
+    return t @ sigma @ t.T
+
+
+def altitude_from_beam_ranges(ranges, elevation_deg):
+    """Altitude above the bottom from the four slant beam ranges: the mean
+    vertical component r_i * cos(beam angle from vertical) of the beams that
+    hit. The minimum SLANT range (the old estimate) overstates altitude by
+    1/cos(elevation) -- +8.2% for 22.5 deg beams over a flat bottom. Returns NaN
+    when no beam has a finite range."""
+    r = np.asarray(ranges, dtype=float).reshape(-1)
+    r = r[np.isfinite(r)]
+    if r.size == 0:
+        return float("nan")
+    return float(np.mean(r) * np.cos(np.deg2rad(elevation_deg)))

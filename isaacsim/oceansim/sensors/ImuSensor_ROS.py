@@ -2,6 +2,8 @@ import omni.graph.core as og
 import omni.timeline
 from isaacsim.sensors.physics import IMUSensor
 
+from isaacsim.oceansim.utils.ros2_math import quat_wxyz_to_xyzw
+
 
 class ImuSensor_ROS(IMUSensor):
     """OceanSim IMU wrapper that publishes IMU data via OmniGraph ROS2PublishImu."""
@@ -45,7 +47,10 @@ class ImuSensor_ROS(IMUSensor):
         og.Controller.attribute(
             self._og_node.get_attribute("inputs:linearAcceleration")
         ).set(imu_data["lin_acc"])
+        # IMUSensor reports (w, x, y, z); ROS2PublishImu's orientation input is
+        # IJKR (x, y, z, w) -- it reads GetImaginary()/GetReal(). Passing wxyz
+        # straight through published identity as a 180 deg roll.
         og.Controller.attribute(
             self._og_node.get_attribute("inputs:orientation")
-        ).set(imu_data["orientation"])
+        ).set(list(quat_wxyz_to_xyzw(imu_data["orientation"])))
         return imu_data

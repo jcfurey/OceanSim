@@ -161,3 +161,23 @@ def test_oculus_beamwidths_bands(m):
     assert az == pytest.approx(math.radians(0.4))
     az, el = m.oculus_beamwidths(999.0)     # unrecognised -> 1.2 MHz defaults
     assert az == pytest.approx(math.radians(0.6))
+
+
+def test_sonar_beam_directions_bin_centres(m):
+    """With the sensor's angular_res, beam j points at its bin centre
+    -fov/2 + (j+0.5)*res (the grid bins azimuth from the fan edge)."""
+    fov, res = 130.0, 0.25
+    n = int(np.ceil(fov / res))
+    dirs = m.sonar_beam_directions(fov, n, res)
+    az = np.degrees(np.arctan2([-d[1] for d in dirs], [d[2] for d in dirs]))
+    assert az[0] == pytest.approx(-65.0 + 0.125)
+    assert np.allclose(np.diff(az), res)
+
+
+def test_sonar_ranges_follow_sensor_grid(m):
+    """The sensor grid is np.arange(min, max, range_res); published centres
+    must follow that grid even when the span isn't a whole number of bins."""
+    lo, hi, res = 0.2, 3.0, 0.03
+    grid_edges = np.arange(lo, hi, res)
+    r = m.sonar_ranges(lo, hi, len(grid_edges), res)
+    assert np.allclose(r, grid_edges + res / 2, atol=1e-6)

@@ -72,6 +72,12 @@ class ImagingSonarSensor_ROS(ImagingSonarSensor):
             if_array_copy=if_array_copy,
             **kwargs,
         )
+        # Publish in the sonar's own frame (its prim name), matching its
+        # camera_info and TF, not the OmniHandler graph name.
+        if self._og_node is not None:
+            og.Controller.attribute(
+                self._og_node.get_attribute("inputs:frameId")
+            ).set(self.prim_path.split("/")[-1])
 
     def make_sonar_data(self, *args, **kwargs):
         if kwargs.get("_skip_scan"):

@@ -144,7 +144,12 @@ class Colorpicker_Scenario():
                     inputs=[
                         self.depth_image,
                         wp.mat44f(self.camera_param["cameraProjection"].reshape(4, 4)),
-                        wp.mat44f(self.camera_param["cameraViewTransform"].reshape(4, 4)),
+                        # camera->world (column form), not the raw world->camera
+                        # row-layout cameraViewTransform (that put points at -C,
+                        # so the caustics moved with the camera).
+                        wp.mat44f(np.linalg.inv(np.asarray(
+                            self.camera_param["cameraViewTransform"],
+                            dtype=np.float64).reshape(4, 4).T).astype(np.float32)),
                         self.width,
                         self.height
                     ],

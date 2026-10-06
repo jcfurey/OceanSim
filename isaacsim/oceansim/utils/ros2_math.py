@@ -86,31 +86,43 @@ class RateGate:
         return False
 
 
-def sonar_beam_directions(hori_fov_deg, n_beams):
+def sonar_beam_directions(hori_fov_deg, n_beams, angular_res_deg=None):
     """Per-beam unit directions in the imaging-sonar optical convention.
 
     Azimuth lives in -y, range/forward in +z (so az = atan2(-y, z)) -- matches the
     real Oculus driver / sonar_image_proc / sonar_proc.
+
+    With ``angular_res_deg`` (the sensor's beam-bin width) each beam points at
+    its bin CENTRE, -fov/2 + (j + 0.5) * res -- the grid bins azimuth from the
+    -fov/2 edge in steps of res. Without it the beams span edge to edge
+    (linspace), which is half a bin off at the fan edges.
     """
     half = math.radians(hori_fov_deg) / 2.0
     # n_beams == 1: a single beam points straight ahead (bearing 0), not at the
     # fan edge -- np.linspace(-half, half, 1) returns [-half].
     if int(n_beams) <= 1:
         bearings = np.array([0.0])
+    elif angular_res_deg:
+        res = math.radians(float(angular_res_deg))
+        bearings = -half + (np.arange(int(n_beams)) + 0.5) * res
     else:
         bearings = np.linspace(-half, half, n_beams)
     return [(0.0, float(-math.sin(b)), float(math.cos(b))) for b in bearings]
 
 
-def sonar_ranges(min_range, max_range, n_range):
+def sonar_ranges(min_range, max_range, n_range, range_res=None):
     """Per-bin range CENTRES (metres) for a ProjectedSonarImage.
 
     Oculus convention (oculus_sonar_driver/ping_to_sonar_image.h):
-    ``range(i) = (i + 0.5) * rangeResolution`` -- bin centres, not edges. We use
-    ``rangeResolution = (max - min) / n_range`` and add the sensor's ``min_range``
-    offset (the real driver assumes 0; our sensor has a non-zero near range).
+    ``range(i) = (i + 0.5) * rangeResolution`` -- bin centres, not edges. We add
+    the sensor's ``min_range`` offset (the real driver assumes 0; our sensor has
+    a non-zero near range). Pass the sensor's actual ``range_res``: its grid is
+    np.arange(min, max, range_res), so (max - min) / n_range drifts from it
+    whenever the span isn't a whole number of bins (19.9 mm by the last bin at
+    range_res = 0.03). Without it, (max - min) / n_range is used.
     """
-    res = (float(max_range) - float(min_range)) / max(int(n_range), 1)
+    res = (float(range_res) if range_res
+           else (float(max_range) - float(min_range)) / max(int(n_range), 1))
     return (float(min_range) + (np.arange(int(n_range)) + 0.5) * res).astype(np.float32).tolist()
 
 

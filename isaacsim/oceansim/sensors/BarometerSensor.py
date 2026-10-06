@@ -86,6 +86,17 @@ class BarometerSensor(BaseSensor):
         
 
     
+    def get_pressure_variance(self) -> float:
+        """Variance (Pa^2) of get_pressure()'s noise, i.e. the configured
+        noise_cov; 0 for a noise-free barometer."""
+        sqrt_cov = np.asarray(self._mvn_press.get_sqrt_cov(), dtype=np.float64)
+        if sqrt_cov.shape != (1, 1):
+            return 0.0
+        variance = float(sqrt_cov[0, 0] ** 2)
+        if not np.isfinite(variance) or variance < 0.0:
+            return 0.0
+        return variance
+
     def get_pressure(self) -> float:
         """Calculate the total pressure at the sensor's current position, including hydrostatic pressure and noise.
 

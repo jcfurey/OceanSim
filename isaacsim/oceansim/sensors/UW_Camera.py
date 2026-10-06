@@ -459,7 +459,7 @@ class UW_Camera(Camera):
         )
         self._uw_frame = uw_image.numpy()
         self._degraded_depth_frame = np.ascontiguousarray(
-            self._degraded_depth_buf.numpy(), dtype=np.float32
+            np.squeeze(self._degraded_depth_buf.numpy()), dtype=np.float32
         )
 
     def _build_pointcloud(self, stride: int = 4) -> np.ndarray:

@@ -51,6 +51,10 @@ def UW_render_2(raw_image: wp.array(ndim=3, dtype=wp.uint8),
     i,j = wp.tid()
     raw_RGB = wp.vec3(wp.float32(raw_image[i,j,0]), wp.float32(raw_image[i,j,1]), wp.float32(raw_image[i,j,2]), dtype=wp.float32)
     depth = depth_image[i,j]
+    # Same background guard as UW_render: +inf depth (no hit) times a zero
+    # coefficient channel is NaN -> undefined uint8.
+    if not wp.isfinite(depth):
+        depth = wp.float32(1.0e4)
     exp_atten = vec3_exp(- depth * atten_coeff * scale)
     exp_back = vec3_exp(- depth * backscatter_coeff * scale)
     UW_RGB = vec3_mul(raw_RGB, exp_atten) + vec3_mul(backscatter_value * wp.float32(255), (wp.vec3f(1.0,1.0,1.0) - exp_back) )
@@ -209,9 +213,11 @@ def blend_caustics(
     # Blend factor
     blend_factor = wp.clamp(blend_weight * ndotl * depth_weight, 0.0, 1.0)
 
-    # World-space planar UV projection (XZ plane) with separate scaling
+    # World-space planar UV projection onto the horizontal (XY) plane -- Isaac
+    # stages are Z-up and caustics are cast down from the surface. (Projecting
+    # on XZ sampled a single texture row across a flat seafloor: stripes.)
     u = pos.x * uv_scale_x
-    v = pos.z * uv_scale_y
+    v = pos.y * uv_scale_y
     
     # Add aspect ratio correction to prevent stretching
     aspect_ratio = wp.float32(tex_w) / wp.float32(tex_h)
@@ -251,29 +257,13 @@ def intrinsics_from_proj(P:wp.mat44f, width:int, height:int):
     cy = (1.0 + P[1,2]) * wp.float32(height) / 2.0
     return fx, fy, cx, cy
 
-
-@wp.func
-def intrinsics_from_proj(P:wp.mat44f, width:int, height:int):
-    fx = P[0,0] * wp.float32(width) / 2.0
-    fy = P[1,1] * wp.float32(height) / 2.0
-    cx = (1.0 - P[0,2]) * wp.float32(width) / 2.0
-    cy = (1.0 + P[1,2]) * wp.float32(height) / 2.0
-    return fx, fy, cx, cy
-
-
-@wp.func
-def intrinsics_from_proj(P:wp.mat44f, width:int, height:int):
-    fx = P[0,0] * wp.float32(width) / 2.0
-    fy = P[1,1] * wp.float32(height) / 2.0
-    cx = (1.0 - P[0,2]) * wp.float32(width) / 2.0
-    cy = (1.0 + P[1,2]) * wp.float32(height) / 2.0
-    return fx, fy, cx, cy
-
 @wp.kernel
 def depth_to_world_pos(
     depth: wp.array(ndim=2, dtype=wp.float32),           # (H, W) depth buffer in world units
     proj_matrix: wp.mat44f,     # (4, 4) projection matrix
-    view_matrix: wp.mat44f,     # (4, 4) camera->world matrix
+    view_matrix: wp.mat44f,     # (4, 4) camera->world matrix, column-vector form, i.e.
+                                # inv(cameraViewTransform.reshape(4, 4).T) -- NOT the
+                                # raw CameraParams cameraViewTransform (world->camera)
     H: int,
     W: int,
     world_points: wp.array(ndim=3, dtype=wp.float32),
@@ -329,6 +319,12 @@ def UW_depth_turbidity_attenuator(
         dtype=wp.float32,
     )
     depth = depth_image[i, j]
+
+    # No return past the sensor's range or without a hit (inf/NaN). max_range
+    # was a parameter but never applied, so far surfaces kept reporting depth.
+    if not wp.isfinite(depth) or depth <= wp.float32(0.0) or depth > max_range:
+        adjusted_depth[i, j] = wp.float32(0.0)
+        return
 
     # beer-lambert decay
     exp_atten = vec3_exp(-depth * atten_coeff)

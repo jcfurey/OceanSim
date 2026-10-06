@@ -270,8 +270,10 @@ class UWCam_KittiWriter(Writer):
 
         if self._debug_mode:
             self._debug_data["raw_rgb"] = data[rgb_annotator].numpy()
-        width, height = data[rgb_annotator].shape[:2]
-        uw_image = wp.empty(shape=data[rgb_annotator].shape, dtype=wp.uint8)
+        # Image arrays are (H, W, C). (This read them as (W, H), so the caustics
+        # launches indexed past the end of the (H, W) buffers.) The unused
+        # per-frame wp.empty that followed is gone too (uw_image is reassigned).
+        height, width = data[rgb_annotator].shape[:2]
         uw_rgb_dir_name = "uw_image_02" if self._use_kitti_dir_names else "uw_rgb"
         uw_rgb_file_path = os.path.join(sub_dir, uw_rgb_dir_name, f"{self._frame_id}.png")
 
@@ -299,7 +301,11 @@ class UWCam_KittiWriter(Writer):
                 inputs=[
                     data[dist_to_cam_annotator],
                     wp.mat44(data[camera_param_annotator]["cameraProjection"].reshape(4, 4)),
-                    wp.mat44(data[camera_param_annotator]["cameraViewTransform"].reshape(4, 4)),
+                    # camera->world (column form); the raw cameraViewTransform is
+                    # world->camera in row layout and put the points at -C.
+                    wp.mat44(np.linalg.inv(np.asarray(
+                        data[camera_param_annotator]["cameraViewTransform"],
+                        dtype=np.float64).reshape(4, 4).T).astype(np.float32)),
                     width,
                     height
                 ],

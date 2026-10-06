@@ -703,8 +703,25 @@ class OceanSimSensorPublisher:
         msg.twist.twist.linear.x = float(vel[0])
         msg.twist.twist.linear.y = float(vel[1])
         msg.twist.twist.linear.z = float(vel[2])
-        msg.twist.covariance = self._diag6(1e-2, 1e-2, 1e-2, 1e9, 1e9, 1e9)
+        msg.twist.covariance = self._dvl_twist_covariance()
         self._dvl_pub.publish(msg)
+
+    def _dvl_twist_covariance(self):
+        """6x6 twist covariance: the DVL's true body-frame velocity covariance
+        (T Sigma T^T of its beam noise) in the linear block, angular unknown
+        (1e9). A noise-free DVL keeps the 1e-2 floor it always had, so EKFs
+        tuned against it see no change and never get a singular zero block."""
+        cov = self._diag6(1e-2, 1e-2, 1e-2, 1e9, 1e9, 1e9)
+        try:
+            lin = np.asarray(self._dvl.get_velocity_covariance(), dtype=float)
+        except Exception:  # noqa: BLE001 - an older DVL object without it
+            return cov
+        if lin.shape == (3, 3) and np.all(np.isfinite(lin)) and np.any(lin != 0.0):
+            cov = list(cov)
+            for r in range(3):
+                for c in range(3):
+                    cov[r * 6 + c] = float(lin[r, c])
+        return cov
 
     def _publish_baro(self, stamp):
         from sensor_msgs.msg import FluidPressure
@@ -712,7 +729,7 @@ class OceanSimSensorPublisher:
         msg.header.stamp = stamp
         msg.header.frame_id = self._cfg["baro_frame_id"]
         msg.fluid_pressure = float(self._baro.get_pressure())  # Pascals
-        msg.variance = 0.0
+        msg.variance = float(getattr(self._baro, "get_pressure_variance", lambda: 0.0)())  # Pa^2
         self._baro_pub.publish(msg)
 
     def _publish_sonar(self, stamp):
@@ -825,7 +842,11 @@ class OceanSimSensorPublisher:
           beamwidth of the transmit swath. sonar_proc indexes both per beam, so a
           length-1 tx array reads out of bounds.
         """
-        key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov, frequency_hz)
+        # Bin geometry from the sensor's own grid resolutions (bin centres).
+        range_res = getattr(self._sonar, "range_res", None)
+        angular_res = getattr(self._sonar, "angular_res", None)  # degrees
+        key = (n_range, n_beams, min_range, max_range, hori_fov, vert_fov, frequency_hz,
+               range_res, angular_res)
         cache = self._sonar_geom
         if cache is not None and cache["key"] == key:
             return cache
@@ -839,9 +860,9 @@ class OceanSimSensorPublisher:
             "key": key,
             "beam_directions": [
                 Vector3(x=x, y=y, z=z)
-                for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams)
+                for (x, y, z) in ros2_math.sonar_beam_directions(hori_fov, n_beams, angular_res)
             ],
-            "ranges": ros2_math.sonar_ranges(min_range, max_range, n_range),
+            "ranges": ros2_math.sonar_ranges(min_range, max_range, n_range, range_res),
             "tx_beamwidths": [float(el_bw)] * n_beams,
             "rx_beamwidths": [float(az_bw)] * n_beams,
         }

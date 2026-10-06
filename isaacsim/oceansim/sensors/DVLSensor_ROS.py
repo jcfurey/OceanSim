@@ -55,23 +55,16 @@ class DVLSensor_ROS(DVLsensor):
         return misses < self._num_beams_out_range_threshold
 
     def _compute_velocity_covariance(self) -> list[float]:
-        sqrt_cov = np.asarray(self._mvn_vel.get_sqrt_cov(), dtype=np.float64)
-        if sqrt_cov.shape != (4, 4):
+        vel_cov = np.asarray(self.get_velocity_covariance(), dtype=np.float64)
+        if vel_cov.shape != (3, 3) or not np.isfinite(vel_cov).all():
             return self._default_velocity_covariance
-
-        beam_cov = sqrt_cov @ sqrt_cov.T
-        vel_cov = self._transform @ beam_cov @ self._transform.T
-        if not np.isfinite(vel_cov).all():
-            return self._default_velocity_covariance
-
-        return vel_cov.reshape(9).astype(np.float64).tolist()
+        return vel_cov.reshape(9).tolist()
 
     def _compute_altitude(self) -> float:
-        depth = np.asarray(self.get_depth(), dtype=np.float64)
-        valid_depth = depth[np.isfinite(depth)]
-        if valid_depth.size == 0:
-            return 0.0
-        return float(np.min(valid_depth))
+        # Vertical altitude (beam ranges x cos(beam angle)), not the minimum
+        # slant range, which read ~8% high with 22.5 deg beams.
+        altitude = self.get_altitude()
+        return altitude if np.isfinite(altitude) else 0.0
 
     def _build_payload(self) -> dict:
         sim_time = float(omni.timeline.get_timeline_interface().get_current_time())

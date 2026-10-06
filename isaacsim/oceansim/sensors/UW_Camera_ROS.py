@@ -80,6 +80,13 @@ class UW_Camera_ROS(UW_Camera):
             **kwargs,
         )
 
+        # The image must share CameraInfo's / TF's frame (the camera prim
+        # name); OmniHandler defaults every node's frameId to its graph name.
+        if self._og_node:
+            og.Controller.attribute(
+                self._og_node.get_attribute("inputs:frameId")
+            ).set(self.prim_path.split("/")[-1])
+
         if self._depth_og_node:
             frame_id = self.prim_path.split("/")[-1]
             og.Controller.attribute(
@@ -147,7 +154,14 @@ class UW_Camera_ROS(UW_Camera):
             )
 
         if self._depth_og_node and self._degraded_depth_frame is not None:
-            depth_bytes = self._degraded_depth_frame.view(np.uint8).reshape(-1)
+            # distance_to_camera is RADIAL (along each ray); a 32FC1 depth
+            # image next to CameraInfo must be planar z (depth_image_proc /
+            # RViz), as the rclpy publisher already does. Convert a copy so
+            # _build_pointcloud keeps reading the radial frame. (+12% at the
+            # image edges for the GUI's 53 deg HFOV camera before this.)
+            planar = np.ascontiguousarray(
+                self._planar_from_radial(self._degraded_depth_frame), dtype=np.float32)
+            depth_bytes = planar.view(np.uint8).reshape(-1)
             og.Controller.attribute(
                 self._depth_og_node.get_attribute("inputs:timeStamp")
             ).set(sim_time)
