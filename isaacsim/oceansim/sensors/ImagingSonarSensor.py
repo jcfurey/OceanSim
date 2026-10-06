@@ -815,6 +815,13 @@ class ImagingSonarSensor(Camera):
                                       # stripe, so this is off by default. Set >0 (e.g. 2)
                                       # only to deliberately model a sensor that shows one.
                         central_std: float = 0.001, # spread of the streak (unused when central_peak=0)
+                        # --- optional physical model terms, all OFF by default ---
+                        spreading_exponent: float = 0.0, # two-way spreading loss r^-n (4: point, ~3: area targets)
+                        absorption: float = 0.0, # two-way absorption exp(-2*a*r), a in Np/m
+                        tvg_exponent: float = 0.0, # time-varied gain r^+m applied after the losses
+                        speckle_looks: int = 0, # >0: Gamma(L) speckle (L=1 single-look) instead of 0.5+N(0, gau_noise_param)
+                        speckle_cell: tuple = (1, 1), # speckle correlation cell in (range, azimuth) bins
+                        beam_fwhm_deg: float = 0.0, # >0: Gaussian azimuth beam-pattern blur with this FWHM
                         sim_time: float = None, # sim time this scan is captured at (for
                                       # publisher header stamps); None if unknown/unused.
                         _skip_scan: bool = False, # internal: worker has already run scan() on
@@ -837,6 +844,17 @@ class ImagingSonarSensor(Camera):
             intensity_gain (float): Post-normalization intensity multiplier
             central_peak (float): Central beam streak intensity
             central_std (float): Central beam streak width
+            spreading_exponent / absorption / tvg_exponent (float): range-dependent
+                                echo gain exp(-2 a r) * r^(tvg - spreading) applied per
+                                bin before normalisation. "range" normalisation divides
+                                each range row by its max and so cancels it -- use
+                                normalizing_method="all" to see range effects.
+            speckle_looks (int): >0 replaces the 0.5 + N(0, gau_noise_param) multiplier with
+                                fully developed speckle, Gamma(L, 1/L) (mean 1, contrast
+                                1/sqrt(L)), constant over speckle_cell (range, azimuth) bins.
+            beam_fwhm_deg (float): >0 blurs each range row along azimuth with a Gaussian of
+                                this FWHM -- the beam pattern (e.g. the published
+                                azimuth beamwidth), applied before noise.
     
         """
 
@@ -853,7 +871,10 @@ class ImagingSonarSensor(Camera):
                 query_prop=query_prop, attenuation=attenuation,
                 gau_noise_param=gau_noise_param, ray_noise_param=ray_noise_param,
                 intensity_offset=intensity_offset, intensity_gain=intensity_gain,
-                central_peak=central_peak, central_std=central_std),
+                central_peak=central_peak, central_std=central_std,
+                spreading_exponent=spreading_exponent, absorption=absorption,
+                tvg_exponent=tvg_exponent, speckle_looks=speckle_looks,
+                speckle_cell=speckle_cell, beam_fwhm_deg=beam_fwhm_deg),
                 sim_time=sim_time)
             return
 
@@ -996,6 +1017,20 @@ class ImagingSonarSensor(Camera):
         else:  # "sum" (default)
             binned = self.bin_sum
 
+        # Optional physical model terms (all off by default).
+        if spreading_exponent or absorption or tvg_exponent:
+            wp.launch(kernel=apply_range_gain, dim=binned.shape,
+                      inputs=[binned, self.r, float(spreading_exponent), float(absorption),
+                              float(tvg_exponent)])
+        if beam_fwhm_deg and beam_fwhm_deg > 0.0:
+            sigma_bins = float(beam_fwhm_deg) / 2.3548 / float(self.angular_res)
+            if getattr(self, "_blur_buf", None) is None:
+                self._blur_buf = wp.zeros(shape=self.r.shape, dtype=wp.float32, device=self._device)
+            wp.launch(kernel=azimuth_gaussian_blur, dim=binned.shape,
+                      inputs=[binned, sigma_bins, max(1, int(np.ceil(3.0 * sigma_bins)))],
+                      outputs=[self._blur_buf])
+            binned = self._blur_buf
+
 
         # gau_noise / range_dependent_ray_noise are fully overwritten every frame
         # by normal_2d / range_dependent_rayleigh_2d (which write every cell), so
@@ -1012,18 +1047,26 @@ class ImagingSonarSensor(Camera):
         # additive noise rose and fell together every frame. Splitting the seed
         # space even/odd (2*id vs 2*id+1) keeps the streams disjoint across both
         # kernels AND frames.
-        wp.launch(
-            kernel=normal_2d,
-            dim=self.bin_sum.shape,
-            inputs=[
-                2 * self.id,       # frame-incremented seed, even half
-                0.0,
-                gau_noise_param
-            ],
-            outputs=[
-                self.gau_noise
-            ]
-        )
+        if speckle_looks and int(speckle_looks) > 0:
+            # Fully developed speckle (same even seed half), written as
+            # (multiplier - 0.5) so the map kernels' (0.5 + noise) applies it.
+            cell_r, cell_a = (int(c) for c in speckle_cell)
+            wp.launch(kernel=gamma_speckle_2d, dim=self.bin_sum.shape,
+                      inputs=[2 * self.id, int(speckle_looks), cell_r, cell_a],
+                      outputs=[self.gau_noise])
+        else:
+            wp.launch(
+                kernel=normal_2d,
+                dim=self.bin_sum.shape,
+                inputs=[
+                    2 * self.id,       # frame-incremented seed, even half
+                    0.0,
+                    gau_noise_param
+                ],
+                outputs=[
+                    self.gau_noise
+                ]
+            )
 
         # Calculate additive rayleigh noise (range dependent and mimic central beam)
 

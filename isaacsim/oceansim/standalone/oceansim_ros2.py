@@ -599,6 +599,13 @@ def main(argv):
                 gpu_point_filter=_gpu_filter,
                 async_compute=_async,
                 **_sonar_xform)
+            # Optional make_sonar_data model terms (spreading_exponent,
+            # absorption, tvg_exponent, speckle_looks, speckle_cell,
+            # beam_fwhm_deg, noise params, normalizing_method, ...): all off
+            # unless set under sonar_params.model_params in the config.
+            sonar.make_sonar_data_params = dict(sp.get("model_params") or {})
+            if sonar.make_sonar_data_params:
+                print(f"[oceansim_ros2] sonar model params: {sonar.make_sonar_data_params}")
     if sensors.get("camera"):
         from isaacsim.oceansim.sensors.UW_Camera import UW_Camera
         _cam_parent, _cam_translation, _cam_rpy = _mount("camera", spec.camera_mount)

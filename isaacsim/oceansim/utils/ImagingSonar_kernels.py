@@ -345,6 +345,68 @@ def range_dependent_rayleigh_2d(seed: int,
 
 
 
+
+# --- Optional sonar model terms (all off by default; see make_sonar_data) -----
+
+@wp.kernel
+def apply_range_gain(binned: wp.array(ndim=2, dtype=wp.float32),
+                     r: wp.array(ndim=2, dtype=wp.float32),
+                     spreading_exponent: wp.float32,
+                     absorption: wp.float32,
+                     tvg_exponent: wp.float32):
+    """In place: binned *= exp(-2 * absorption * r) * r^(tvg_exponent - spreading_exponent).
+    Two-way absorption (absorption in Np/m), spreading loss r^-spreading_exponent
+    (4 for point targets, ~3 for area-extensive ones) and a time-varied-gain
+    r^+tvg_exponent. Per-range-row normalisation cancels any factor that only
+    depends on r, so pair this with normalizing_method="all" to see it."""
+    i, j = wp.tid()
+    rr = wp.max(r[i, j], wp.float32(1e-6))
+    g = wp.exp(-wp.float32(2.0) * absorption * rr) * wp.pow(rr, tvg_exponent - spreading_exponent)
+    binned[i, j] = binned[i, j] * g
+
+
+@wp.kernel
+def gamma_speckle_2d(seed: int,
+                     looks: int,
+                     cell_range: int,
+                     cell_azimuth: int,
+                     output: wp.array(ndim=2, dtype=wp.float32)):
+    """Fully developed speckle as a multiplicative field with mean 1: the mean of
+    `looks` unit exponentials (Gamma(L, 1/L); L = 1 is single-look, contrast 1),
+    constant over cells of cell_range x cell_azimuth bins (a resolution cell /
+    beamwidth spans several grid bins). Written as (value - 0.5) so the map
+    kernels' (0.5 + noise) multiplier applies it unchanged."""
+    i, j = wp.tid()
+    ci = i // wp.max(cell_range, 1)
+    cj = j // wp.max(cell_azimuth, 1)
+    n_cj = (output.shape[1] + wp.max(cell_azimuth, 1) - 1) // wp.max(cell_azimuth, 1)
+    state = wp.rand_init(seed, ci * n_cj + cj)
+    acc = wp.float32(0.0)
+    for _k in range(wp.max(looks, 1)):
+        acc = acc - wp.log(wp.float32(1.0) - wp.randf(state))
+    output[i, j] = acc / wp.float32(wp.max(looks, 1)) - wp.float32(0.5)
+
+
+@wp.kernel
+def azimuth_gaussian_blur(src: wp.array(ndim=2, dtype=wp.float32),
+                          sigma_bins: wp.float32,
+                          radius: int,
+                          dst: wp.array(ndim=2, dtype=wp.float32)):
+    """Beam-pattern blur: Gaussian along azimuth (axis 1) with sigma in bins,
+    truncated at +-radius and renormalised at the fan edges."""
+    i, j = wp.tid()
+    n = src.shape[1]
+    acc = wp.float32(0.0)
+    wsum = wp.float32(0.0)
+    for k in range(-radius, radius + 1):
+        jj = j + k
+        if jj >= 0 and jj < n:
+            w = wp.exp(-wp.float32(0.5) * wp.float32(k * k) / (sigma_bins * sigma_bins))
+            acc = acc + w * src[i, jj]
+            wsum = wsum + w
+    dst[i, j] = acc / wsum
+
+
 @wp.kernel
 def make_sonar_map_all(r: wp.array(ndim=2, dtype=wp.float32),
                        azi: wp.array(ndim=2, dtype=wp.float32),

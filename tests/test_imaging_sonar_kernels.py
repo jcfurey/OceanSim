@@ -708,3 +708,53 @@ def test_back_facing_normal_does_not_cancel_return(kern):
     wp.synchronize()
     a, b = out.numpy()
     assert a > 0 and b == pytest.approx(a)
+
+
+# --- optional sonar model terms ---------------------------------------------
+
+def test_apply_range_gain_formula(kern):
+    r = np.array([[0.5, 1.0, 2.0, 4.0]], dtype=np.float32)
+    b = wp.array(np.ones_like(r), dtype=wp.float32, device=DEV)
+    wp.launch(kern.apply_range_gain, dim=r.shape,
+              inputs=[b, wp.array(r, dtype=wp.float32, device=DEV), 4.0, 0.05, 2.0], device=DEV)
+    wp.synchronize()
+    assert np.allclose(b.numpy(), np.exp(-2 * 0.05 * r) * r ** (2.0 - 4.0), rtol=1e-5)
+
+
+@pytest.mark.parametrize("looks", [1, 4])
+def test_gamma_speckle_statistics(kern, looks):
+    """Mean-1 multiplicative speckle with contrast 1/sqrt(L) (the old
+    0.5 + N(0, 0.2) had contrast 0.4 and went negative)."""
+    out = wp.zeros((400, 500), dtype=wp.float32, device=DEV)
+    wp.launch(kern.gamma_speckle_2d, dim=out.shape, inputs=[7, looks, 1, 1], outputs=[out], device=DEV)
+    wp.synchronize()
+    mult = out.numpy() + 0.5
+    assert mult.min() >= 0.0
+    assert mult.mean() == pytest.approx(1.0, abs=0.01)
+    assert mult.std() / mult.mean() == pytest.approx(1.0 / np.sqrt(looks), rel=0.03)
+
+
+def test_gamma_speckle_is_constant_over_cells(kern):
+    out = wp.zeros((12, 20), dtype=wp.float32, device=DEV)
+    wp.launch(kern.gamma_speckle_2d, dim=out.shape, inputs=[3, 1, 3, 5], outputs=[out], device=DEV)
+    wp.synchronize()
+    v = out.numpy()
+    blocks = v.reshape(4, 3, 4, 5)
+    assert np.all(blocks == blocks[:, :1, :, :1])             # constant inside each 3x5 cell
+    assert len(np.unique(blocks[:, 0, :, 0])) > 10            # independent across cells
+
+
+def test_azimuth_blur_preserves_energy_and_width(kern):
+    n = 201
+    src = np.zeros((1, n), dtype=np.float32)
+    src[0, n // 2] = 1.0
+    sigma = 3.0
+    dst = wp.zeros((1, n), dtype=wp.float32, device=DEV)
+    wp.launch(kern.azimuth_gaussian_blur, dim=(1, n),
+              inputs=[wp.array(src, dtype=wp.float32, device=DEV), sigma, int(4 * sigma)],
+              outputs=[dst], device=DEV)
+    wp.synchronize()
+    out = dst.numpy()[0]
+    assert out.sum() == pytest.approx(1.0, rel=1e-4)
+    j = np.arange(n) - n // 2
+    assert np.sqrt(np.sum(out * j * j)) == pytest.approx(sigma, rel=0.02)

@@ -368,8 +368,11 @@ class MHL_Sensor_Example_Scenario():
         # throttle when sonar_tick is None.
         do_sonar = do_sensors if sonar_tick is None else bool(sonar_tick)
         if do_sonar and self._sonar is not None:
+            # make_sonar_data_params: optional per-sensor model/noise settings
+            # (e.g. set by the runner from sonar_params.model_params).
             self._safe_call(self._sonar.make_sonar_data, sim_time=sim_time,
-                            name="sonar make_sonar_data")
+                            name="sonar make_sonar_data",
+                            **getattr(self._sonar, "make_sonar_data_params", {}))
         if do_sensors:
             if self._sensor_update_period > 0.0:
                 # Subtract the period instead of resetting to zero: a reset
