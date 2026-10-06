@@ -18,10 +18,14 @@ were tuned against real data.
   Sonar map coordinates now use the same bin centres as ROS. Constructor
   defaults equal the M3000d preset (10 m working range, 1024-bin budget).
 - **(output change)** Every imaging-sonar preset normalises by the ping maximum
-  (previously only the M3000d did). Oculus presets apply their band's beam
-  response (M370s 2.0°, 1.2 MHz 0.6°, 2.1 MHz 0.4°). `ProjectedSonarImage`
-  `rx_beamwidths` report the beam width actually applied, or the beam spacing
-  when unblurred, and `tx_beamwidths` the sensor's vertical aperture.
+  (previously only the M3000d did) and shows the normalised echo with gamma 0.5,
+  like an Oculus's gamma correction, so weak echoes stay visible beside a strong
+  broadside return (`make_sonar_data(gamma=...)`, default 1 = linear; set
+  `sonar_params.model_params.gamma` to override). Oculus presets apply their
+  band's beam response (M370s 2.0°, 1.2 MHz 0.6°, 2.1 MHz 0.4°).
+  `ProjectedSonarImage` `rx_beamwidths` report the beam width actually applied,
+  or the beam spacing when unblurred, and `tx_beamwidths` the sensor's vertical
+  aperture.
 - **(output change)** Imaging sonar geometry and radiometry: the render covers the
   full vertical FOV across the fan and points outside +-vfov/2 are dropped; points
   are weighted by pixel solid angle so beams integrate their true solid angle (edge

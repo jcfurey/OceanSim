@@ -329,10 +329,11 @@ def test_m3000d_modes_and_resolution_are_distinct(mods, name, freq, fov, limit, 
     assert presets.sonar_kwargs(payload, {"max_range": 1.0})["range_res"] == res
     with pytest.raises(ValueError, match="exceeds"):
         presets.sonar_kwargs(payload, {"max_range": limit + 0.1})
-    assert presets.sonar_model_params(payload) == {"normalizing_method": "all",
+    assert presets.sonar_model_params(payload) == {"normalizing_method": "all", "gamma": 0.5,
                                                    "beam_fwhm_deg": beamwidth}
-    override = presets.sonar_model_params(payload, {"beam_fwhm_deg": 0, "normalizing_method": "range"})
-    assert override == {"beam_fwhm_deg": 0, "normalizing_method": "range"}
+    override = presets.sonar_model_params(
+        payload, {"beam_fwhm_deg": 0, "normalizing_method": "range", "gamma": 1.0})
+    assert override == {"beam_fwhm_deg": 0, "normalizing_method": "range", "gamma": 1.0}
 
 
 def test_every_imaging_sonar_preset_normalises_per_ping(mods):
@@ -345,6 +346,7 @@ def test_every_imaging_sonar_preset_normalises_per_ping(mods):
     for payload in sonars:
         params = sp.sonar_model_params(payload)
         assert params["normalizing_method"] == "all", payload.name
+        assert params["gamma"] == 0.5, payload.name
         beamwidth = payload.params.get("beamwidth_h_deg")
         assert params.get("beam_fwhm_deg") == beamwidth, payload.name
         assert sp.sonar_kwargs(payload)["beam_fwhm_deg"] == (beamwidth or 0.0), payload.name

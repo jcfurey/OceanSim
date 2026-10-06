@@ -179,6 +179,7 @@ class FLS_KittiWriter(Writer):
         self.ray_noise_param = sonar_param['ray_noise_param']
         self.intensity_offset = sonar_param['intensity_offset']
         self.intensity_gain = sonar_param['intensity_gain']
+        self.gamma = sonar_param.get('gamma', 1.0)  # echo display gamma (linear by default)
         self.central_peak = sonar_param['central_peak']
         self.central_std = sonar_param['central_std']
 
@@ -490,7 +491,8 @@ class FLS_KittiWriter(Writer):
                 self.gau_noise,
                 self.range_dependent_ray_noise,
                 self.intensity_offset,
-                self.intensity_gain
+                self.intensity_gain,
+                self.gamma
             ],
             outputs=[
                 self.sonar_data

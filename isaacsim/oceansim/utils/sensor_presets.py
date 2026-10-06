@@ -61,12 +61,16 @@ def sonar_model_params(payload, overrides=None):
 
     Every preset normalises a ping by its global maximum: a range-row maximum
     promotes every weak echo to the same brightness and hides relative target
-    strength and shadows. A payload with a published azimuth resolving power
-    (beamwidth_h_deg) is blurred by a Gaussian with that FWHM, which integrates
-    neighbouring output beams rather than giving every bin independent,
-    infinitely narrow resolving power; without one, beams are not blurred.
+    strength and shadows. A linear scale against that maximum leaves little
+    beside one strong broadside return (a face that gathers a whole elevation
+    column into a single bin), so presets display the echo with gamma 0.5, as
+    Oculus sonars apply gamma correction to their image. A payload with a
+    published azimuth resolving power (beamwidth_h_deg) is blurred by a
+    Gaussian with that FWHM, which integrates neighbouring output beams rather
+    than giving every bin independent, infinitely narrow resolving power;
+    without one, beams are not blurred.
     """
-    params = {"normalizing_method": "all"}
+    params = {"normalizing_method": "all", "gamma": 0.5}
     if "beamwidth_h_deg" in payload.params:
         params["beam_fwhm_deg"] = float(payload.params["beamwidth_h_deg"])
     params.update(overrides or {})

@@ -188,7 +188,7 @@ def test_make_sonar_map_all_zero_guard_no_nan(kern):
 
     wp.launch(kern.make_sonar_map_all, dim=shape,
               inputs=[r, azi, intensity, max_intensity, gau, ray,
-                      wp.float32(0.0), wp.float32(1.0), result],
+                      wp.float32(0.0), wp.float32(1.0), wp.float32(1.0), result],
               device=DEV)
     wp.synchronize()
 
@@ -214,6 +214,7 @@ def test_make_sonar_map_modes_apply_same_op_order(kern):
     gau = wp.array(gau_np, dtype=wp.float32, device=DEV)
     ray = wp.array(ray_np, dtype=wp.float32, device=DEV)
     offset, gain = wp.float32(0.13), wp.float32(1.7)   # non-defaults expose ordering
+    gamma = wp.float32(0.5)
 
     max_all = wp.array(np.array([inten_np.max()], dtype=np.float32),
                        dtype=wp.float32, device=DEV)
@@ -225,15 +226,41 @@ def test_make_sonar_map_modes_apply_same_op_order(kern):
     int_rng = wp.array(inten_np.copy(), dtype=wp.float32, device=DEV)
 
     wp.launch(kern.make_sonar_map_all, dim=shape,
-              inputs=[r, azi, int_all, max_all, gau, ray, offset, gain, out_all],
+              inputs=[r, azi, int_all, max_all, gau, ray, offset, gain, gamma, out_all],
               device=DEV)
     wp.launch(kern.make_sonar_map_range, dim=shape,
-              inputs=[r, azi, int_rng, max_rows, gau, ray, offset, gain, out_rng],
+              inputs=[r, azi, int_rng, max_rows, gau, ray, offset, gain, gamma, out_rng],
               device=DEV)
     wp.synchronize()
 
     np.testing.assert_allclose(out_all.numpy()[:, :, 2], out_rng.numpy()[:, :, 2],
                                rtol=1e-6)
+
+
+@pytest.mark.parametrize("mode", ["all", "range"])
+def test_make_sonar_map_gamma_shapes_the_normalised_echo(kern, mode):
+    """gamma acts on the normalised echo, before the speckle multiplier and the
+    additive floor: out = (x / max)^gamma * (0.5 + speckle) + floor. Gamma 1
+    is linear, and an empty bin stays at the floor (no 0^gamma surprise)."""
+    shape = (1, 4)
+    echo = np.array([[0.0, 0.01, 0.25, 1.0]], np.float32)
+    speckle = np.array([[0.0, 0.1, -0.1, 0.2]], np.float32)
+    floor = np.full(shape, 0.02, np.float32)
+    r = wp.array(np.ones(shape, np.float32), dtype=wp.float32, device=DEV)
+    azi = wp.array(np.full(shape, np.pi / 2, np.float32), dtype=wp.float32, device=DEV)
+    peak = wp.array(np.array([1.0], np.float32), dtype=wp.float32, device=DEV)
+    kernel = kern.make_sonar_map_all if mode == "all" else kern.make_sonar_map_range
+    for gamma in (1.0, 0.5):
+        out = wp.zeros(shape, dtype=wp.vec3, device=DEV)
+        wp.launch(kernel, dim=shape,
+                  inputs=[r, azi, wp.array(echo, dtype=wp.float32, device=DEV), peak,
+                          wp.array(speckle, dtype=wp.float32, device=DEV),
+                          wp.array(floor, dtype=wp.float32, device=DEV),
+                          wp.float32(0.0), wp.float32(1.0), wp.float32(gamma), out], device=DEV)
+        expected = echo ** gamma * (0.5 + speckle) + floor
+        np.testing.assert_allclose(out.numpy()[:, :, 2], expected, rtol=1e-5, atol=1e-7)
+    # A 1% echo shows at 10% of full scale with gamma 0.5, versus 1% linear.
+    assert expected[0, 1] - floor[0, 1] == pytest.approx(0.1 * 0.6, rel=1e-5)
 
 
 def test_make_sonar_image_column_flip_and_bounds(kern):

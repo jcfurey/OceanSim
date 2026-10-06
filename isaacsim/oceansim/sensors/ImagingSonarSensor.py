@@ -818,6 +818,7 @@ class ImagingSonarSensor(Camera):
                         ray_noise_param: float = 0.05, # additive noise parameter
                         intensity_offset: float = 0.0, # offset intensity after normalization
                         intensity_gain: float = 1.0, # scale intensity after normalization
+                        gamma: float = 1.0, # echo display gamma after normalisation; <1 lifts weak echoes
                         central_peak: float = 0.0, # boresight "streak" strength; 0 = OFF.
                                       # A real Oculus has no persistent full-range centre
                                       # stripe, so this is off by default. Set >0 (e.g. 2)
@@ -850,6 +851,10 @@ class ImagingSonarSensor(Camera):
             ray_noise_param (float): Rayleigh noise scale factor
             intensity_offset (float): Post-normalization intensity offset
             intensity_gain (float): Post-normalization intensity multiplier
+            gamma (float): Display gamma (> 0) on the normalised echo, as an Oculus
+                                applies gamma correction: values < 1 compress the echo
+                                dynamic range so weak returns stay visible beside a strong
+                                broadside one. Applied before the speckle and noise floor.
             central_peak (float): Central beam streak intensity
             central_std (float): Central beam streak width
             spreading_exponent / absorption / tvg_exponent (float): range-dependent
@@ -870,6 +875,8 @@ class ImagingSonarSensor(Camera):
 
         if normalizing_method is None:
             normalizing_method = getattr(self, "_normalizing_method", "range")
+        if not gamma > 0.0:
+            raise ValueError(f"[{self._name}] gamma must be positive, got {gamma!r}")
         if beam_fwhm_deg is None:
             beam_fwhm_deg = self.beam_fwhm_deg
         self._applied_beam_fwhm_deg = float(beam_fwhm_deg or 0.0)
@@ -882,7 +889,7 @@ class ImagingSonarSensor(Camera):
                 query_prop=query_prop, attenuation=attenuation,
                 gau_noise_param=gau_noise_param, ray_noise_param=ray_noise_param,
                 intensity_offset=intensity_offset, intensity_gain=intensity_gain,
-                central_peak=central_peak, central_std=central_std,
+                gamma=gamma, central_peak=central_peak, central_std=central_std,
                 spreading_exponent=spreading_exponent, absorption=absorption,
                 tvg_exponent=tvg_exponent, speckle_looks=speckle_looks,
                 speckle_cell=speckle_cell, beam_fwhm_deg=beam_fwhm_deg),
@@ -1129,7 +1136,8 @@ class ImagingSonarSensor(Camera):
                       self.gau_noise,
                       self.range_dependent_ray_noise,
                       intensity_offset,
-                      intensity_gain
+                      intensity_gain,
+                      gamma
                   ],
                   outputs=[
                       self.sonar_map
@@ -1162,7 +1170,8 @@ class ImagingSonarSensor(Camera):
                       self.gau_noise,
                       self.range_dependent_ray_noise,
                       intensity_offset,
-                      intensity_gain
+                      intensity_gain,
+                      gamma
                   ],
                   outputs=[
                       self.sonar_map

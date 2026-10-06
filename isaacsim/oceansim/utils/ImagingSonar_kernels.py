@@ -416,6 +416,7 @@ def make_sonar_map_all(r: wp.array(ndim=2, dtype=wp.float32),
                        range_ray_noise: wp.array(ndim=2, dtype=wp.float32),
                        offset: wp.float32,
                        gain: wp.float32,
+                       gamma: wp.float32,
                        result: wp.array(ndim=2, dtype=wp.vec3)):
     i, j = wp.tid()
     # Guard against an empty frame (no in-grid returns -> global max 0), which
@@ -423,6 +424,12 @@ def make_sonar_map_all(r: wp.array(ndim=2, dtype=wp.float32),
     # per-range guard in make_sonar_map_range.
     if max_intensity[0] != 0.0:
         intensity[i,j] = intensity[i,j]/max_intensity[0]
+    # Display gamma on the normalised echo, like the Oculus gamma correction:
+    # <1 compresses its dynamic range so weak echoes stay visible beside a
+    # strong broadside return. Applied before the speckle and noise floor,
+    # which keep their display-domain scale; gamma 1 leaves the echo linear.
+    if gamma != wp.float32(1.0):
+        intensity[i,j] = wp.pow(wp.max(intensity[i,j], wp.float32(0.0)), gamma)
     # Same op order as make_sonar_map_range: noise on the normalized signal
     # first, display offset/gain last. The two modes used to differ ("all"
     # applied offset/gain BEFORE the noise, so gain scaled the noise in one
@@ -448,11 +455,15 @@ def make_sonar_map_range(r: wp.array(ndim=2, dtype=wp.float32),
                        range_ray_noise: wp.array(ndim=2, dtype=wp.float32),
                        offset: wp.float32,
                        gain: wp.float32,
+                       gamma: wp.float32,
                        result: wp.array(ndim=2, dtype=wp.vec3)):
     i, j = wp.tid()
 
     if max_intensity[i] !=0:
         intensity[i,j] = intensity[i,j]/max_intensity[i]
+    # Display gamma on the normalised echo; see make_sonar_map_all.
+    if gamma != wp.float32(1.0):
+        intensity[i,j] = wp.pow(wp.max(intensity[i,j], wp.float32(0.0)), gamma)
 
     intensity[i,j] *= (0.5 + gau_noise[i,j])
     intensity[i,j] += range_ray_noise[i,j]
