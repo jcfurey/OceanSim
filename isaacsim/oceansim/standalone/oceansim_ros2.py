@@ -69,6 +69,12 @@ def parse_args(argv):
     p.add_argument("--platform", default=None,
                    help="Vehicle platform to import (e.g. 'bluerov2', "
                         "'deeptrekker_revolution'). See utils.platforms.")
+    p.add_argument("--payload", dest="payloads", action="append", default=None,
+                   help="Payload to fit (repeat), e.g. --payload oculus_m750d --payload "
+                        "waterlinked_a50. Default: the platform's standard set. "
+                        "scripts/oceansim_urdf.py list shows the catalogue.")
+    p.add_argument("--no-payloads", dest="no_payloads", action="store_true",
+                   help="Bare vehicle (no payloads).")
     p.add_argument("--urdf", dest="urdf", default=None,
                    help="Import the robot from this URDF (creates the articulation; "
                         "used when you have a URDF but no prebuilt USD). It is also "
@@ -144,6 +150,14 @@ def load_config(args):
         "robot": {},
         # Water density (kg/m^3) for buoyancy: 1000 fresh (the MHL tank), ~1025 sea.
         "water_density": 1000.0,
+        # Payloads fitted to the vehicle (utils.payloads names, e.g.
+        # ["oculus_m750d", "waterlinked_a50", "ping2", "newton_gripper"]). None =
+        # the platform's standard set, [] = bare vehicle. Sensor payloads set the
+        # simulated sonar / DVL / altimeter to that device's datasheet values
+        # (sonar_params still override); every payload adds its mass, buoyancy and
+        # drag, and the vehicle is re-trimmed (robot.trim, default true).
+        # scripts/oceansim_urdf.py list shows what exists.
+        "payloads": None,
         "sensors": {"sonar": True, "camera": True, "dvl": True, "baro": True},
         # Per-sensor GUI windows (sonar + UW camera viewports). False also skips
         # their per-frame set_bytes_data_from_gpu readback; AOVs still render for ROS
@@ -208,6 +222,10 @@ def load_config(args):
         cfg["asset_path"] = args.asset_path
     if args.platform is not None:
         cfg["platform"] = args.platform
+    if args.no_payloads:
+        cfg["payloads"] = []
+    elif args.payloads is not None:
+        cfg["payloads"] = list(args.payloads)
     if args.urdf is not None:
         cfg.setdefault("robot", {})["urdf_path"] = args.urdf
     if args.robot_description is not None:
@@ -409,9 +427,24 @@ def main(argv):
     from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
     from isaacsim.oceansim.utils import platforms
     assets = get_oceansim_assets_path()
+    from isaacsim.oceansim.utils import payloads as payload_catalogue
     spec = platforms.get_platform(cfg.get("platform", platforms.DEFAULT_PLATFORM))
     rob_cfg = cfg.get("robot", {})
+    # A URDF carrying hydrodynamics (OceanSim export, Gazebo Sim or UUV
+    # Simulator plugins) defines the vehicle itself: its dynamics replace the
+    # selected platform's (robot.hydro_from_urdf: false to keep the platform's).
+    _urdf_override = rob_cfg.get("urdf_path")
+    if _urdf_override and os.path.isfile(_urdf_override) and rob_cfg.get("hydro_from_urdf", True):
+        from isaacsim.oceansim.utils import urdf_platform
+        with open(_urdf_override) as _f:
+            _utext = _f.read()
+        if urdf_platform.hydro_source(_utext):
+            spec, _notes = urdf_platform.platform_from_urdf(_utext, _urdf_override, fallback=spec)
+            for _n in _notes:
+                print(f"[oceansim_ros2] URDF vehicle: {_n}")
     print(f"[oceansim_ros2] platform: {spec.name} -- {spec.description}")
+    fitted = payload_catalogue.select_payloads(spec, cfg.get("payloads"))
+    print(f"[oceansim_ros2] payloads: {[p.name for p in fitted] or 'none'}")
 
     robot_path = "/World/rob"
     # Each field falls back to the platform spec unless explicitly overridden in
@@ -426,10 +459,23 @@ def main(argv):
     # USD or URDF? An explicit robot.usd_path / robot.urdf_path wins, else the
     # platform's own assets are used (prefer "usd", or set robot.prefer_source
     # = "urdf"). Resolves to a URDF automatically if that's all that exists.
-    src, why = platforms.resolve_robot_source(
+    _prefer = rob_cfg.get("prefer_source", "usd")
+    src, why = (None, "generated") if _prefer == "generated" else platforms.resolve_robot_source(
         asset_root=assets, platform=spec,
-        usd_path=rob_cfg.get("usd_path"), urdf_path=rob_cfg.get("urdf_path"),
-        prefer=rob_cfg.get("prefer_source", "usd"))
+        usd_path=rob_cfg.get("usd_path"), urdf_path=rob_cfg.get("urdf_path"), prefer=_prefer)
+    generated_urdf = None
+    if src is None and spec.dimensions and spec.hydro is not None:
+        if why.startswith("missing:"):
+            print(f"[oceansim_ros2] WARNING: {spec.name} asset not found ({why[8:]}); "
+                  f"using the generated primitive-shape model instead")
+        # No 3D asset (or robot.prefer_source "generated"): import a URDF built
+        # from the platform data, with primitive shapes and the payloads.
+        from isaacsim.oceansim.utils import urdf_export
+        _gpath, generated_urdf = urdf_export.write_generated_urdf(
+            spec, fitted, out_dir=rob_cfg.get("generated_urdf_dir"),
+            rho=float(cfg.get("water_density", 1000.0)))
+        src = platforms.RobotSource("urdf", _gpath)
+        print(f"[oceansim_ros2] generated URDF for {spec.name} -> {_gpath}")
     if src is None:
         raise FileNotFoundError(
             f"[oceansim_ros2] no robot asset for platform '{spec.name}' ({why}). "
@@ -499,16 +545,24 @@ def main(argv):
     if use_hydro:
         from isaacsim.oceansim.utils import vehicle_dynamics, vehicle_physics
         mass = float(rob_cfg.get("mass", spec.mass))
-        vehicle_physics.configure_prim(robot_prim, spec, mass=mass)
+        _rho = float(cfg.get("water_density", 1000.0))
+        _trim = bool(rob_cfg.get("trim", True))
+        _resolved = vehicle_dynamics.resolve_hydro(spec, fitted, rho=_rho, mass=mass, trim=_trim)
+        vehicle_physics.configure_prim(robot_prim, _resolved)
         vehicle_model = vehicle_dynamics.from_platform(
-            spec, rho=float(cfg.get("water_density", 1000.0)),
-            surface_z=cfg.get("water_surface_z"),
+            spec, rho=_rho, surface_z=cfg.get("water_surface_z"),
             voltage=rob_cfg.get("thruster_voltage"),
-            drag_scale=float(rob_cfg.get("drag_scale", 1.0)), mass=mass)
-        _net = (vehicle_model.rho * spec.hydro.displaced_volume - mass) * vehicle_model.g
+            drag_scale=float(rob_cfg.get("drag_scale", 1.0)), mass=mass,
+            payloads=fitted, trim=_trim)
+        _net = (_rho * _resolved["displaced_volume"] - _resolved["mass"]) * vehicle_model.g
         print(f"[oceansim_ros2] hydrodynamics: {spec.name}, {vehicle_model.thrusters.count} "
               f"thrusters (max {vehicle_model.thrusters.max_forward.max():.1f} N fwd), "
-              f"net buoyancy {_net:+.1f} N, water density {vehicle_model.rho:g}")
+              f"mass {_resolved['mass']:.2f} kg, net buoyancy {_net:+.1f} N, "
+              f"water density {_rho:g}")
+        if _resolved.get("trim"):
+            _t = _resolved["trim"]
+            print(f"[oceansim_ros2] trimmed for payloads: {_t['kind']} {_t['mass']:.3f} kg / "
+                  f"{_t['volume'] * 1e3:.2f} L")
     else:
         print(f"[oceansim_ros2] hydrodynamics off: PhysX damping {lin_d:g}/{ang_d:g} "
               f"stands in for drag")
@@ -620,22 +674,27 @@ def main(argv):
                 n_elements=_n_el, **_sonar_xform)
         else:
             from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+            from isaacsim.oceansim.utils import sensor_presets
             sp = cfg.get("sonar_params", {})
+            # A fitted sonar payload (e.g. oculus_m750d) supplies the device's
+            # FOV, beam spacing and range defaults; sonar_params still win.
+            _sonar_pl = payload_catalogue.sensor_payload(fitted, "sonar")
+            _sk = sensor_presets.sonar_kwargs(_sonar_pl, sp) if _sonar_pl is not None else dict(
+                min_range=sp.get("min_range", 0.2), max_range=sp.get("max_range", 3.0),
+                hori_fov=sp.get("hori_fov_deg", 130.0), vert_fov=sp.get("vert_fov_deg", 20.0),
+                range_res=sp.get("range_res", 0.005), angular_res=sp.get("angular_res", 0.25))
+            if _sonar_pl is not None:
+                print(f"[oceansim_ros2] sonar: {_sonar_pl.description} -> {_sk}")
+            elif any(p.kind == "sonar" for p in fitted):
+                print("[oceansim_ros2] sonar payload is not simulated (scanning sonar); "
+                      "the imaging sonar uses the default parameters")
             _hori_res = int(sp.get("hori_res", 2500))
             _gpu_filter = bool(sp.get("gpu_point_filter", True))
             _async = bool(sp.get("async_compute", False))
             print("[oceansim_ros2] sonar backend: oceansim (custom imaging sonar) "
                   f"hori_res={_hori_res} gpu_point_filter={_gpu_filter} async_compute={_async}")
             sonar = ImagingSonarSensor(
-                # min/max_range + FOV were documented sonar_params keys but were
-                # only plumbed to the rtx_acoustic branch -- on this (default)
-                # backend they were silently ignored. Defaults preserved.
-                min_range=sp.get("min_range", 0.2),
-                max_range=sp.get("max_range", 3.0),
-                hori_fov=sp.get("hori_fov_deg", 130.0),
-                vert_fov=sp.get("vert_fov_deg", 20.0),
-                range_res=sp.get("range_res", 0.005),
-                angular_res=sp.get("angular_res", 0.25),
+                **_sk,
                 hori_res=_hori_res,
                 gpu_point_filter=_gpu_filter,
                 async_compute=_async,
@@ -644,6 +703,8 @@ def main(argv):
             # absorption, tvg_exponent, speckle_looks, speckle_cell,
             # beam_fwhm_deg, noise params, normalizing_method, ...): all off
             # unless set under sonar_params.model_params in the config.
+            if _sonar_pl is not None:
+                sonar.acoustic_frequency = sensor_presets.sonar_frequency(_sonar_pl)
             sonar.make_sonar_data_params = dict(sp.get("model_params") or {})
             if sonar.make_sonar_data_params:
                 print(f"[oceansim_ros2] sonar model params: {sonar.make_sonar_data_params}")
@@ -657,13 +718,37 @@ def main(argv):
         cam = UW_Camera(prim_path=_cam_parent + "/UW_camera",
                         resolution=[1920, 1080], translation=_cam_translation,
                         orientation=euler_angles_to_quat(_cam_rpy, degrees=True))
-        cam.set_focal_length(0.1 * 21)
+        if spec.camera_hfov_deg:
+            from isaacsim.oceansim.utils import sensor_presets
+            cam.set_focal_length(sensor_presets.focal_length_for_hfov(
+                spec.camera_hfov_deg, cam.get_horizontal_aperture()))
+            print(f"[oceansim_ros2] camera: {spec.camera_hfov_deg:g} deg horizontal FOV")
+        else:
+            cam.set_focal_length(0.1 * 21)
         cam.set_clipping_range(0.1, 100)
     if sensors.get("dvl"):
         from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
         _dvl_parent, _dvl_translation, _ = _mount("dvl", spec.dvl_mount)
-        dvl = DVLsensor(max_range=10)
+        from isaacsim.oceansim.utils import sensor_presets
+        _dvl_pl = payload_catalogue.sensor_payload(fitted, "dvl")
+        if _dvl_pl is not None:
+            _dk = sensor_presets.dvl_kwargs(_dvl_pl)
+            print(f"[oceansim_ros2] DVL: {_dvl_pl.description} -> {_dk}")
+            dvl = DVLsensor(**_dk)
+        else:
+            dvl = DVLsensor(max_range=10)
         dvl.attachDVL(rigid_body_path=_dvl_parent, translation=_dvl_translation)
+    altimeter = None
+    _alt_pl = payload_catalogue.sensor_payload(fitted, "altimeter")
+    if _alt_pl is not None and sensors.get("altimeter", True):
+        from isaacsim.oceansim.sensors.AltimeterSensor import AltimeterSensor
+        from isaacsim.oceansim.utils import sensor_presets
+        _alt_parent, _alt_tr, _alt_rpy = _mount("altimeter", spec.mount("altimeter"))
+        altimeter = AltimeterSensor(**sensor_presets.altimeter_kwargs(_alt_pl))
+        altimeter.attach(_alt_parent, translation=_alt_tr,
+                         orientation=euler_angles_to_quat(_alt_rpy, degrees=True))
+        altimeter.rate_hz = float(_alt_pl.params.get("rate_hz", 10.0))
+        print(f"[oceansim_ros2] altimeter: {_alt_pl.description}")
     if sensors.get("baro"):
         from isaacsim.oceansim.sensors.BarometerSensor import BarometerSensor
         baro = BarometerSensor(prim_path=robot_path + "/Baro",
@@ -707,6 +792,10 @@ def main(argv):
     # robot_state_publisher / RViz can articulate the model from the published
     # /joint_states. Precedence: inline string > explicit path (--robot-description
     # / robot.urdf_path) > the platform's registered URDF under the asset root.
+    if "robot_description" not in pub_cfg and generated_urdf is not None:
+        pub_cfg["robot_description"] = generated_urdf
+        print(f"[oceansim_ros2] robot_description from the generated URDF "
+              f"({len(generated_urdf)} chars) -> /robot_description")
     if "robot_description" not in pub_cfg:
         desc_text, desc_src = platforms.resolve_robot_description(
             asset_root=assets, platform=spec,
@@ -765,8 +854,11 @@ def main(argv):
             })
         pub_cfg["publish_static_tf"] = True
         pub_cfg["static_transforms"] = static_tfs
+    if altimeter is not None:
+        pub_cfg.setdefault("altimeter_rate", altimeter.rate_hz)
     publisher = OceanSimSensorPublisher(
-        robot_prim=robot_prim, sonar=sonar, dvl=dvl, baro=baro, config=pub_cfg)
+        robot_prim=robot_prim, sonar=sonar, dvl=dvl, baro=baro, config=pub_cfg,
+        altimeter=altimeter)
     publisher.initialize()
 
     # ---- run loop ---------------------------------------------------------

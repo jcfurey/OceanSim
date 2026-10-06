@@ -23,6 +23,7 @@ from .scenario import MHL_Sensor_Example_Scenario
 from .global_variables import EXTENSION_DESCRIPTION, EXTENSION_TITLE, EXTENSION_LINK
 from isaacsim.oceansim.utils.assets_utils import get_oceansim_assets_path
 from isaacsim.oceansim.utils import platforms
+from isaacsim.oceansim.utils import payloads as payload_catalogue
 
 class UIBuilder():
     def __init__(self):
@@ -180,6 +181,21 @@ class UIBuilder():
                 ) 
                 self._use_baro = False
                 self.wrapped_ui_elements.append(baro_check_box)
+
+                # Payloads (utils.payloads): one picker per kind. "standard" =
+                # the platform's own standard set for that kind. Sensor payloads
+                # configure the matching sensor above with the device's
+                # datasheet values; every payload adds mass / buoyancy / drag
+                # (the vehicle is re-trimmed) and appears in generated models.
+                self._payload_choice = {}
+                for kind, label in (("sonar", "Sonar payload"), ("dvl", "DVL payload"),
+                                    ("gripper", "Gripper"), ("light", "Lights")):
+                    items = ["standard", "none"] + payload_catalogue.available_payloads(kind)
+                    self._payload_choice[kind] = "standard"
+                    dropdown_builder(
+                        label=label, default_val=0, items=items,
+                        tooltip=f"{label} fitted on LOAD ('standard' = the platform's default)",
+                        on_clicked_fn=lambda item, k=kind: self._payload_choice.__setitem__(k, item))
 
                 
         world_controls_frame = CollapsableFrame("World Controls", collapsed=False)
@@ -347,13 +363,35 @@ class UIBuilder():
         # so joint manipulation works. The spec supplies dynamics, collision,
         # spawn pose and sensor mounts.
         spec = platforms.get_platform(self._platform)
-        print(f"[OceanSim] platform: {spec.name} -- {spec.description}")
         robot_prim_path = "/World/rob"
         _urdf_override = self._urdf_path_field.get_value_as_string().strip()
+        # A URDF with hydrodynamics (OceanSim export / Gazebo / UUV Simulator)
+        # defines the vehicle itself.
+        if _urdf_override and os.path.isfile(_urdf_override):
+            from isaacsim.oceansim.utils import urdf_platform
+            with open(_urdf_override) as _f:
+                _utext = _f.read()
+            if urdf_platform.hydro_source(_utext):
+                spec, _notes = urdf_platform.platform_from_urdf(_utext, _urdf_override, fallback=spec)
+                for _n in _notes:
+                    print(f"[OceanSim] URDF vehicle: {_n}")
+        print(f"[OceanSim] platform: {spec.name} -- {spec.description}")
+        self._fitted_payloads = self._selected_payloads(spec)
+        print(f"[OceanSim] payloads: {[p.name for p in self._fitted_payloads] or 'none'}")
         src, why = platforms.resolve_robot_source(
             asset_root=get_oceansim_assets_path(), platform=spec,
             urdf_path=_urdf_override or None,
             prefer="urdf" if _urdf_override else "usd")
+        if src is None and spec.dimensions and spec.hydro is not None:
+            # No 3D asset for this vehicle: import a URDF generated from the
+            # platform data (primitive shapes + the payloads).
+            from isaacsim.oceansim.utils import urdf_export
+            if why.startswith("missing:"):
+                carb.log_warn(f"[OceanSim] {spec.name} asset not found ({why[8:]}); "
+                              f"using the generated primitive-shape model")
+            _gpath, _ = urdf_export.write_generated_urdf(spec, self._fitted_payloads)
+            src = platforms.RobotSource("urdf", _gpath)
+            print(f"[OceanSim] generated URDF for {spec.name} -> {_gpath}")
         if src is None:
             carb.log_error(f"[OceanSim] no robot asset for platform '{spec.name}' ({why}).")
             return
@@ -395,9 +433,10 @@ class UIBuilder():
         self._vehicle_model = None
         if spec.hydro is not None:
             from isaacsim.oceansim.utils import vehicle_dynamics, vehicle_physics
-            vehicle_physics.configure_prim(self._rob, spec)
+            vehicle_physics.configure_prim(
+                self._rob, vehicle_dynamics.resolve_hydro(spec, self._fitted_payloads))
             self._vehicle_model = vehicle_dynamics.from_platform(
-                spec, rho=1000.0, surface_z=self._water_surface)
+                spec, rho=1000.0, surface_z=self._water_surface, payloads=self._fitted_payloads)
             print(f"[OceanSim] hydrodynamics: {spec.name}, "
                   f"{self._vehicle_model.thrusters.count} thrusters")
 
@@ -444,12 +483,15 @@ class UIBuilder():
                 )
             else:
                 from isaacsim.oceansim.sensors.ImagingSonarSensor import ImagingSonarSensor
+            from isaacsim.oceansim.utils import sensor_presets
             _sonar_tr, _sonar_rpy = _mount("sonar", spec.sonar_mount)
+            _sonar_pl = payload_catalogue.sensor_payload(self._fitted_payloads, "sonar")
+            _sk = (sensor_presets.sonar_kwargs(_sonar_pl) if _sonar_pl is not None
+                   else dict(range_res=0.005, angular_res=0.25))
             self._sonar = ImagingSonarSensor(prim_path=robot_prim_path + '/sonar',
                                             translation=_sonar_tr,
                                             orientation=euler_angles_to_quat(_sonar_rpy, degrees=True),
-                                            range_res=0.005,
-                                            angular_res=0.25,
+                                            **_sk,
                                             hori_res=4000,
                                             # On-device point selection, as the headless runner
                                             # uses: the numpy path copies ~89 MB to the host and
@@ -468,7 +510,12 @@ class UIBuilder():
             self._cam = UW_Camera(prim_path=robot_prim_path + '/UW_camera',
                                     resolution=[1920,1080],
                                     translation=_cam_tr)
-            self._cam.set_focal_length(0.1 * self._cam_focal_length)
+            if spec.camera_hfov_deg:
+                from isaacsim.oceansim.utils import sensor_presets
+                self._cam.set_focal_length(sensor_presets.focal_length_for_hfov(
+                    spec.camera_hfov_deg, self._cam.get_horizontal_aperture()))
+            else:
+                self._cam.set_focal_length(0.1 * self._cam_focal_length)
             self._cam.set_clipping_range(0.1, 100)
 
         if self._use_DVL:
@@ -477,8 +524,11 @@ class UIBuilder():
             else:
                 from isaacsim.oceansim.sensors.DVLsensor import DVLsensor
 
+            from isaacsim.oceansim.utils import sensor_presets
             _dvl_tr, _ = _mount("dvl", spec.dvl_mount)
-            self._DVL = DVLsensor(max_range=10)
+            _dvl_pl = payload_catalogue.sensor_payload(self._fitted_payloads, "dvl")
+            self._DVL = (DVLsensor(**sensor_presets.dvl_kwargs(_dvl_pl)) if _dvl_pl is not None
+                         else DVLsensor(max_range=10))
             self._DVL.attachDVL(rigid_body_path=robot_prim_path,
                                 translation=_dvl_tr)
             self._DVL.add_debug_lines()
@@ -622,6 +672,21 @@ class UIBuilder():
     def _on_ctrl_mode_dropdown_clicked(self, model):
         self._ctrl_mode = model
         print(f'Ctrl mode: {model}. Reload the scene for changes to take effect.')
+
+    def _selected_payloads(self, spec):
+        """Payloads for this LOAD from the pickers: per kind, the platform's
+        standard choice, none, or the picked catalogue entry."""
+        choice = getattr(self, "_payload_choice", {})
+        names = []
+        standard = [payload_catalogue.get_payload(n) for n in spec.default_payloads]
+        for kind in ("sonar", "dvl", "gripper", "light"):
+            pick = choice.get(kind, "standard")
+            if pick == "standard":
+                names += [p.name for p in standard if p.kind == kind]
+            elif pick != "none":
+                names.append(pick)
+        names += [p.name for p in standard if p.kind not in ("sonar", "dvl", "gripper", "light")]
+        return payload_catalogue.select_payloads(spec, names)
 
     def _on_platform_dropdown_clicked(self, label):
         """Map the selected dropdown label back to its canonical platform key

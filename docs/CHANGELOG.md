@@ -41,6 +41,22 @@ were tuned against real data.
   `docs/subsections/vehicle_models.md`
 - ROS `thruster control` mode: normalised per-thruster commands on
   `/oceansim/robot/thruster_cmd`
+- Eight more vehicles: Deep Trekker DTG3 and PIVOT, VideoRay Pro 5 and
+  Defender, Chasing M2 Pro Max, QYSEA FIFISH V6 Expert, Saab Seaeye Falcon,
+  Teledyne SeaBotix vLBV300. Their models are estimated from published specs,
+  and each reproduces its published thrust and speeds. Vehicles without a 3D
+  asset are imported from a generated URDF
+- Payload catalogue with datasheet values: Oculus M370s / M750d / M1200d /
+  C550d, Tritech Gemini 720is / 720im, BlueView M900, Ping360, Ping2 altimeter,
+  Water Linked A50 / A125, Nortek DVL500, Teledyne Pathfinder, grippers and
+  lights. Payloads set the sonar / DVL / altimeter to the device, add mass,
+  buoyancy and drag, and the vehicle is re-trimmed. `payloads` config,
+  `--payload`, GUI pickers
+- Altimeter sensor (`sensor_msgs/Range` on `/oceansim/robot/altimeter`)
+- URDF export (primitive geometry, sensor frames, gripper jaws, a lossless
+  `<oceansim>` block; optional Gazebo Sim plugins) and import of vehicles from
+  URDFs carrying OceanSim, Gazebo Sim or UUV Simulator hydrodynamics;
+  `scripts/oceansim_urdf.py` (list / show / export / inspect)
 - Opt-in sonar model terms for `make_sonar_data` / `sonar_params.model_params`, all
   off by default: spreading / absorption / TVG range gain, Gamma speckle with a
   correlation cell, Gaussian beam-pattern blur

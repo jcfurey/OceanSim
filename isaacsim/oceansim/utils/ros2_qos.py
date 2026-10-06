@@ -57,6 +57,7 @@ TOPIC_CONTRACTS = [
     Contract("/oceansim/robot/imu", "pub", SENSOR_DATA, "robot_localization", SENSOR_DATA),
     Contract("/oceansim/robot/dvl/twist", "pub", SENSOR_DATA, "robot_localization", SENSOR_DATA),
     Contract("/oceansim/robot/pressure", "pub", SENSOR_DATA, "depth consumer", SENSOR_DATA),
+    Contract("/oceansim/robot/altimeter", "pub", SENSOR_DATA, "altitude consumer", SENSOR_DATA),
     Contract("/oceansim/robot/sonar", "pub", SENSOR_DATA, "sonar_image_proc", SENSOR_DATA),
     # Nav2 costmap observation sources subscribe with SensorDataQoS.
     Contract("/oceansim/robot/sonar/scan", "pub", SENSOR_DATA, "Nav2 costmap", SENSOR_DATA),

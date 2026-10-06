@@ -8,13 +8,19 @@ platform or a single URDF.
 ## 1. Pick a platform (or bring your own asset)
 
 Vehicles live in a small registry (`isaacsim/oceansim/utils/platforms.py`). Three
-ship today:
+ship with 3D assets:
 
 | Platform key | Vehicle | Notes |
 |---|---|---|
 | `bluerov2` | Blue Robotics BlueROV2 | default |
 | `bluerov2_heavy` | BlueROV2 Heavy (8 thrusters) | same 3D asset |
 | `deeptrekker_revolution` | Deep Trekker REVOLUTION | 26 kg, 6 thrusters |
+
+Eight more vehicles have no 3D asset; they are imported from a generated URDF:
+Deep Trekker DTG3 and PIVOT, VideoRay Pro 5 and Defender, Chasing M2 Pro Max,
+QYSEA FIFISH V6 Expert, Saab Seaeye Falcon and Teledyne SeaBotix vLBV300. Add
+payloads with `--payload` (e.g. `--payload oculus_m750d --payload waterlinked_a50`).
+[Vehicle Models](vehicle_models.md) lists them all, with their payload options.
 
 A platform's spec supplies the USD/URDF asset path, mass/damping, collision,
 spawn pose, sensor mount poses, and the default robot description. Select it:
@@ -67,6 +73,7 @@ their QoS is compatible.
 | `/oceansim/robot/imu` | sensor_msgs/Imu | pub | sensor (best-effort) |
 | `/oceansim/robot/dvl/twist` | geometry_msgs/TwistWithCovarianceStamped | pub | sensor |
 | `/oceansim/robot/pressure` | sensor_msgs/FluidPressure | pub | sensor |
+| `/oceansim/robot/altimeter` | sensor_msgs/Range (altimeter payload) | pub | sensor |
 | `/oceansim/robot/sonar` | marine_acoustic_msgs/ProjectedSonarImage | pub | sensor |
 | `/oceansim/robot/sonar/scan` | sensor_msgs/LaserScan (opt-in, §7) | pub | sensor |
 | `/oceansim/robot/sonar/points` | sensor_msgs/PointCloud2 (opt-in, §7) | pub | sensor |

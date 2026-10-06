@@ -17,18 +17,17 @@ import numpy as np
 from isaacsim.oceansim.utils import vehicle_dynamics
 
 
-def configure_prim(robot_prim, spec, mass=None):
-    """Give the robot body the platform's mass properties (mass, principal
-    inertia, CoG at the prim origin) and zero PhysX damping -- drag comes from
-    the hydrodynamic model. ``mass`` overrides the spec's. Call before
-    world.play()."""
+def configure_prim(robot_prim, hydro):
+    """Give the robot body the resolved model's mass properties -- total mass,
+    principal inertia and CoG (``vehicle_dynamics.resolve_hydro``, so fitted
+    payloads and trim are included) -- and zero PhysX damping: drag comes from
+    the hydrodynamic model. Call before world.play()."""
     from pxr import Gf, PhysxSchema, UsdPhysics
-    h = spec.hydro
     mass_api = UsdPhysics.MassAPI.Apply(robot_prim)
-    mass_api.CreateMassAttr().Set(float(spec.mass if mass is None else mass))
-    mass_api.CreateDiagonalInertiaAttr().Set(Gf.Vec3f(*[float(v) for v in h.inertia]))
+    mass_api.CreateMassAttr().Set(float(hydro["mass"]))
+    mass_api.CreateDiagonalInertiaAttr().Set(Gf.Vec3f(*[float(v) for v in hydro["inertia"]]))
     mass_api.CreatePrincipalAxesAttr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    mass_api.CreateCenterOfMassAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    mass_api.CreateCenterOfMassAttr().Set(Gf.Vec3f(*[float(v) for v in hydro["cog"]]))
     rb = PhysxSchema.PhysxRigidBodyAPI.Apply(robot_prim)
     rb.CreateLinearDampingAttr().Set(0.0)
     rb.CreateAngularDampingAttr().Set(0.0)

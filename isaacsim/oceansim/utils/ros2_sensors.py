@@ -19,6 +19,7 @@ Topic (default)                   Message type                                So
 ``/oceansim/robot/dvl/twist``     ``geometry_msgs/TwistWithCovarianceStamped``  ``DVLsensor.get_linear_vel()``
 ``/oceansim/robot/pressure``      ``sensor_msgs/FluidPressure``               ``BarometerSensor.get_pressure()``
 ``/oceansim/robot/sonar``         ``marine_acoustic_msgs/ProjectedSonarImage``  ``ImagingSonarSensor``
+``/oceansim/robot/altimeter``     ``sensor_msgs/Range``                       altimeter payload (e.g. Ping2)
 ``/oceansim/robot/sonar/scan``    ``sensor_msgs/LaserScan`` (opt-in)          nearest sonar detection per beam
 ``/oceansim/robot/sonar/points``  ``sensor_msgs/PointCloud2`` (opt-in)        all sonar detections (z = 0)
 ``/tf`` odom -> base_link          ``tf2_msgs/TFMessage`` (opt-in)             ground-truth pose (as odom)
@@ -126,6 +127,7 @@ class OceanSimSensorPublisher:
         "dvl_frame_id": "base_link",
         "baro_frame_id": "base_link",
         "sonar_frame_id": "sonar0/optical_frame",
+        "altimeter_frame_id": "altimeter_link",
         # topics
         "odom_topic": "/oceansim/robot/odom",
         "imu_topic": "/oceansim/robot/imu",
@@ -133,6 +135,7 @@ class OceanSimSensorPublisher:
         "baro_topic": "/oceansim/robot/pressure",
         "sonar_topic": "/oceansim/robot/sonar",
         "sonar_scan_topic": "/oceansim/robot/sonar/scan",
+        "altimeter_topic": "/oceansim/robot/altimeter",
         "sonar_cloud_topic": "/oceansim/robot/sonar/points",
         "clock_topic": "/clock",
         "robot_description_topic": "/robot_description",
@@ -144,6 +147,7 @@ class OceanSimSensorPublisher:
         "dvl_rate": 10.0,
         "baro_rate": 10.0,
         "sonar_rate": 5.0,
+        "altimeter_rate": 10.0,
         "joint_state_rate": 30.0,
         # Robot description (URDF XML string) to latch on robot_description_topic
         # so robot_state_publisher / RViz can load the platform model. None ->
@@ -204,11 +208,12 @@ class OceanSimSensorPublisher:
         "gravity": 9.81,
     }
 
-    def __init__(self, robot_prim, sonar=None, dvl=None, baro=None, config=None):
+    def __init__(self, robot_prim, sonar=None, dvl=None, baro=None, config=None, altimeter=None):
         self._robot_prim = robot_prim
         self._sonar = sonar
         self._dvl = dvl
         self._baro = baro
+        self._altimeter = altimeter
 
         self._cfg = dict(self.DEFAULT_CONFIG)
         if config:
@@ -225,6 +230,7 @@ class OceanSimSensorPublisher:
         self._dvl_pub = None
         self._baro_pub = None
         self._sonar_pub = None
+        self._altimeter_pub = None
         self._sonar_scan_pub = None    # opt-in LaserScan from sonar detections
         self._sonar_cloud_pub = None   # opt-in PointCloud2 from sonar detections
         self._pc2_fields = None
@@ -246,6 +252,7 @@ class OceanSimSensorPublisher:
         self._dvl_gate = _RateGate(self._cfg["dvl_rate"])
         self._baro_gate = _RateGate(self._cfg["baro_rate"])
         self._sonar_gate = _RateGate(self._cfg["sonar_rate"])
+        self._altimeter_gate = _RateGate(self._cfg["altimeter_rate"])
         self._joint_state_gate = _RateGate(self._cfg["joint_state_rate"])
 
         # IMU finite-difference state (world-frame velocity, for specific force)
@@ -297,6 +304,11 @@ class OceanSimSensorPublisher:
         if self._baro is not None:
             self._baro_pub = self._node.create_publisher(
                 FluidPressure, self._cfg["baro_topic"], _sensor_qos())
+
+        if self._altimeter is not None:
+            from sensor_msgs.msg import Range
+            self._altimeter_pub = self._node.create_publisher(
+                Range, self._cfg["altimeter_topic"], _sensor_qos())
 
         if self._sonar is not None:
             try:
@@ -534,6 +546,8 @@ class OceanSimSensorPublisher:
             self._safe(self._publish_dvl, stamp)
         if self._baro_pub is not None and self._baro_gate.ready(sim_time):
             self._safe(self._publish_baro, stamp)
+        if self._altimeter_pub is not None and self._altimeter_gate.ready(sim_time):
+            self._safe(self._publish_altimeter, stamp)
         if self._sonar_outputs() and self._sonar_gate.ready(sim_time):
             self._safe(self._publish_sonar, stamp)
         if self._joint_state_pub is not None and self._joint_state_gate.ready(sim_time):
@@ -808,6 +822,21 @@ class OceanSimSensorPublisher:
         msg.fluid_pressure = float(self._baro.get_pressure())  # Pascals
         msg.variance = float(getattr(self._baro, "get_pressure_variance", lambda: 0.0)())  # Pa^2
         self._baro_pub.publish(msg)
+
+    def _publish_altimeter(self, stamp):
+        """sensor_msgs/Range: +inf when nothing is in range (REP-117)."""
+        from sensor_msgs.msg import Range
+        alt = self._altimeter
+        r = alt.get_range()
+        msg = Range()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self._cfg["altimeter_frame_id"]
+        msg.radiation_type = Range.ULTRASOUND
+        msg.field_of_view = math.radians(alt.beamwidth_deg)
+        msg.min_range = float(alt.min_range)
+        msg.max_range = float(alt.max_range)
+        msg.range = float(r) if math.isfinite(r) else float("inf")
+        self._altimeter_pub.publish(msg)
 
     def _publish_sonar(self, stamp):
         """Build a ProjectedSonarImage from the OceanSim imaging sonar.
