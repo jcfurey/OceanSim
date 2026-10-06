@@ -34,6 +34,11 @@ Compose defaults to Cyclone DDS and ROS domain **71** for standalone work. Match
 `RMW_IMPLEMENTATION` and `ROS_DOMAIN_ID` in your subscribers, or set them before
 launching to join your existing robot graph. With Zenoh, start your router first.
 
+The Docker launchers disable the optional OmniHub cache by default, avoiding
+daemon launch retries when loading local scenes. To use a working Hub service,
+set `OMNICLIENT_HUB_MODE=shared` before launching. This switch follows
+[NVIDIA's client-library configuration](https://docs.omniverse.nvidia.com/kit/docs/client_library/latest/index.html#hub).
+
 ```bash
 # Switch to the reef scene.
 OCEANSIM_ENVIRONMENT=reef docker compose up -d --force-recreate

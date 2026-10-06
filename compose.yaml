@@ -19,6 +19,8 @@ services:
     environment:
       ACCEPT_EULA: "Y"
       PRIVACY_CONSENT: "Y"
+      # Local scenes do not need Hub; avoid failed daemon launches at startup.
+      OMNICLIENT_HUB_MODE: ${OMNICLIENT_HUB_MODE:-disabled}
       NVIDIA_DRIVER_CAPABILITIES: all
       NVIDIA_VISIBLE_DEVICES: all
       OCEANSIM_ROOT: /isaac-sim/extsUser/OceanSim

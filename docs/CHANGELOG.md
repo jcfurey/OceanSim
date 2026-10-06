@@ -70,6 +70,9 @@ were tuned against real data.
 
 ### Fixed
 
+- Docker launchers disable the optional Hub cache by default to avoid failed
+  daemon-launch retries with local scenes; `OMNICLIENT_HUB_MODE=shared` enables
+  it explicitly.
 - ROS force control applies the Wrench in N / N·m through a rigid-body view.
   `PhysxForceAPI` defaulted to acceleration mode, so newtons were read as m/s²
   (26x too strong on the 26 kg Revolution), and upstream found it stopped the IMU

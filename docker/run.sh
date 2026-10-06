@@ -12,6 +12,8 @@
 # Set OCEANSIM_DETACH=1 to leave an explicit GUI/runner command in the background.
 # Override the image's Zenoh default with, for example,
 # RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ./docker/run.sh
+# Local demos disable the optional Hub daemon. Set OMNICLIENT_HUB_MODE=shared
+# to enable Hub caching when a working Hub service is available.
 set -euo pipefail
 
 IMAGE="${OCEANSIM_IMAGE:-oceansim:6.1.0}"
@@ -106,6 +108,7 @@ docker run --name "$CONTAINER_NAME" --rm "${TERMINAL_ARGS[@]}" \
     --entrypoint bash \
     -e "ACCEPT_EULA=Y" \
     -e "PRIVACY_CONSENT=Y" \
+    -e "OMNICLIENT_HUB_MODE=${OMNICLIENT_HUB_MODE:-disabled}" \
     -e "DISPLAY=${DISPLAY:-:0}" \
     -e "QT_X11_NO_MITSHM=1" \
     -e "NVIDIA_DRIVER_CAPABILITIES=all" \
