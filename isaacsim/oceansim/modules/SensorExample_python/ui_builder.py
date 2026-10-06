@@ -653,8 +653,10 @@ class UIBuilder():
                 self._ros2_control_mode_model = dropdown_builder(
                     label='ROS2 Control Mode',
                     default_val=0,
-                    items=['velocity control', 'force control'],
-                    tooltip='Select preferred ROS2 control mode',
+                    items=['velocity control', 'force control', 'dynamic velocity control'],
+                    tooltip=('velocity control: sets the body velocity (kinematic); '
+                             'force control: Wrench in N / N*m; dynamic velocity control: '
+                             'cmd_vel tracked by a PI loop through forces'),
                     on_clicked_fn=self._on_ros2_control_mode_dropdown_clicked
                 )
 

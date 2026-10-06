@@ -1,6 +1,6 @@
 # Omniverse import
 import numpy as np
-from pxr import Gf, PhysxSchema
+from pxr import Gf
 
 # Isaac sim import
 from isaacsim.core.prims import RigidPrim, SingleRigidPrim
@@ -143,9 +143,8 @@ class MHL_Sensor_Example_Scenario():
                                         "RIGHT": [10.0, 0.0, 0.0],
                                       })
         elif ctrl_mode == "ROS control":
-            self._rob_forceAPI = PhysxSchema.PhysxForceAPI.Apply(self._rob)
-
-            # initialize ROS2ControlReceiver
+            # initialize ROS2ControlReceiver (it applies forces through a
+            # RigidPrim view, not PhysxForceAPI -- see ros2_control)
             self._setup_ros2_control(control_params)
 
         self._running_scenario = True
@@ -215,19 +214,24 @@ class MHL_Sensor_Example_Scenario():
             return
 
         control_params = control_params or {}
+        if control_params.get("ros2_mode"):
+            self._ros2_control_mode = control_params["ros2_mode"]
         try:
             self._ros2_control_receiver = ROS2ControlReceiver(
                 self._rob, "ROS2ControlReceiver",
                 max_linear_vel=control_params.get("max_linear_vel"),
                 max_angular_vel=control_params.get("max_angular_vel"),
                 max_force=control_params.get("max_force"),
-                max_torque=control_params.get("max_torque"))
+                max_torque=control_params.get("max_torque"),
+                velocity_pi=control_params.get("velocity_pi"))
 
-            if hasattr(self, '_rob_forceAPI') and self._rob_forceAPI is not None:
-                self._ros2_control_receiver.set_scenario_force_api(self._rob_forceAPI)
-
+            topics = {k: control_params[k] for k in ("vel_topic", "force_topic")
+                      if control_params.get(k)}
             self._ros2_control_receiver.initialize(
-                enable_ros2=True
+                enable_ros2=True,
+                stamped_vel=bool(control_params.get("stamped_cmd_vel", False)),
+                command_timeout=control_params.get("command_timeout"),
+                **topics
             )
 
             self._ros2_control_receiver._setup_ros2_control_mode(
@@ -436,7 +440,7 @@ class MHL_Sensor_Example_Scenario():
             self._rob_rigid.set_linear_velocity(np.array([0.5,0,0]))
         elif self._ctrl_mode=="ROS control":
             if self._ros2_control_receiver is not None:
-                self._ros2_control_receiver.update_control()
+                self._ros2_control_receiver.update_control(step)
             elif not getattr(self, "_warned_no_receiver", False):
                 # Once, not every physics step (60 Hz of identical lines).
                 self._warned_no_receiver = True

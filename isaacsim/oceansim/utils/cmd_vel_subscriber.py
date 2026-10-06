@@ -3,6 +3,8 @@ ROS2 cmd_vel subscriber using Isaac Sim's built-in ROS2 bridge
 Subscribes to /cmd_vel and applies forces to the robot
 """
 
+import time
+
 import omni.graph.core as og
 from pxr import PhysxSchema
 import carb
@@ -12,8 +14,17 @@ class CmdVelController:
     """
     Subscribes to /cmd_vel using Isaac Sim's ROS2 bridge and applies forces
     """
-    def __init__(self, robot_prim_path="/World/rob"):
+    def __init__(self, robot_prim_path="/World/rob", command_timeout=1.0):
         self._robot_prim_path = robot_prim_path
+        # Dead-man watchdog: ROS2SubscribeTwist keeps outputting the last
+        # message forever, so a crashed teleop / planner left the vehicle
+        # thrusting. A Counter node on the subscriber's execOut (fires once per
+        # received message) tells update() when a message last arrived.
+        self._command_timeout = float(command_timeout)
+        self._counter_attr = None
+        self._last_count = None
+        self._last_rx = None
+        self._stale_warned = False
         self._robot_prim = None
         self._force_api = None
         self._graph_path = None
@@ -62,6 +73,7 @@ class CmdVelController:
 
             # Store references to read velocities
             self._twist_node = nodes[1]  # ROS2SubscribeTwist node
+            self._setup_watchdog_counter()
 
             carb.log_info(f"[CmdVelController] Initialized cmd_vel subscriber for robot at {self._robot_prim_path}")
             carb.log_info(f"[CmdVelController] Listening to /cmd_vel topic")
@@ -70,6 +82,41 @@ class CmdVelController:
             carb.log_error(f"[CmdVelController] Error setting up cmd_vel subscriber: {e}")
             import traceback
             traceback.print_exc()
+
+    def _setup_watchdog_counter(self):
+        """Count received messages (separate edit, so a missing node type only
+        disables the watchdog, not the subscriber)."""
+        try:
+            keys = og.Controller.Keys
+            og.Controller.edit(self._graph_path, {
+                keys.CREATE_NODES: [("RxCounter", "omni.graph.action.Counter")],
+                keys.CONNECT: [("ROS2SubscribeTwist.outputs:execOut", "RxCounter.inputs:execIn")],
+            })
+            self._counter_attr = og.Controller.attribute(
+                f"{self._graph_path}/RxCounter.outputs:count")
+        except Exception as e:  # noqa: BLE001
+            self._counter_attr = None
+            carb.log_warn(f"[CmdVelController] no command watchdog ({e}); the last "
+                          f"/cmd_vel is held until a new one arrives")
+
+    def _command_stale(self):
+        """True when no Twist arrived within the timeout (or none yet)."""
+        if self._counter_attr is None:
+            return False
+        count = og.Controller.get(self._counter_attr)
+        now = time.monotonic()
+        if count is not None:
+            # Only an increase is a new message; the Counter's state resets on
+            # stop / play, which must not read as a fresh command.
+            if self._last_count is not None and count > self._last_count:
+                self._last_rx = now
+            self._last_count = count
+        stale = self._last_rx is None or (now - self._last_rx) > self._command_timeout
+        if stale and self._last_rx is not None and not self._stale_warned:
+            carb.log_warn(f"[CmdVelController] no /cmd_vel for over "
+                          f"{self._command_timeout}s -- zeroing command (watchdog)")
+        self._stale_warned = stale and self._last_rx is not None
+        return stale
 
     def update(self, robot_prim):
         """Update robot with current velocity commands"""
@@ -88,6 +135,9 @@ class CmdVelController:
                 self._current_linear_vel = linear_vel
             if angular_vel is not None:
                 self._current_angular_vel = angular_vel
+            if self._command_stale():
+                self._current_linear_vel = [0.0, 0.0, 0.0]
+                self._current_angular_vel = [0.0, 0.0, 0.0]
 
             # Apply forces if we have valid commands
             if any(v != 0 for v in self._current_linear_vel) or any(v != 0 for v in self._current_angular_vel):

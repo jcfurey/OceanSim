@@ -3,7 +3,7 @@ import os
 import numpy as np
 from enum import Enum
 
-from isaacsim.core.prims import SingleRigidPrim
+from isaacsim.core.prims import RigidPrim, SingleRigidPrim
 from isaacsim.core.utils.prims import get_prim_path
 from isaacsim.core.utils.rotations import quat_to_rot_matrix
 
@@ -21,18 +21,26 @@ from isaacsim.oceansim.utils import ros2_context
 from isaacsim.oceansim.utils import ros2_control_math
 
 try:
-    from pxr import Gf, PhysxSchema
+    from pxr import PhysxSchema
     PXR_AVAILABLE = True
 except ImportError:
     PXR_AVAILABLE = False
-    Gf = None 
     PhysxSchema = None
 
 ROS2_AVAILABLE = False
 
 class ROS2_CONTROL_MODE(Enum):
-    VEL = 1     # velocity control mode
-    FORCE = 2   # force control mode
+    VEL = 1          # velocity control: kinematic, sets the body velocity each step
+    FORCE = 2        # force control: body-frame Wrench applied as force / torque
+    VEL_DYNAMIC = 3  # dynamic velocity control: cmd_vel -> PI -> force / torque
+
+
+# Mode names as the GUI dropdown / runner config spell them.
+CONTROL_MODE_NAMES = {
+    "velocity control": ROS2_CONTROL_MODE.VEL,
+    "force control": ROS2_CONTROL_MODE.FORCE,
+    "dynamic velocity control": ROS2_CONTROL_MODE.VEL_DYNAMIC,
+}
 
 class ROS2ControlReceiver:
     """
@@ -43,7 +51,7 @@ class ROS2ControlReceiver:
     
     def __init__(self, robot_prim, name="ROS2ControlReceiver",
                  max_linear_vel=None, max_angular_vel=None,
-                 max_force=None, max_torque=None):
+                 max_force=None, max_torque=None, velocity_pi=None):
         """
         initialize ROS2 Control Receiver
 
@@ -54,10 +62,16 @@ class ROS2ControlReceiver:
                 vector's magnitude (m/s). None (default) = unbounded.
             max_angular_vel (float | None): clamp on the incoming angular-velocity
                 vector's magnitude (rad/s). None (default) = unbounded.
-            max_force (float | None): clamp on the incoming force vector's
-                magnitude (N). None (default) = unbounded.
-            max_torque (float | None): clamp on the incoming torque vector's
-                magnitude (N*m). None (default) = unbounded.
+            max_force (float | None): clamp on the force magnitude (N), for both
+                force control and the dynamic velocity loop's output. None
+                (default) = unbounded.
+            max_torque (float | None): clamp on the torque magnitude (N*m), as
+                max_force. None (default) = unbounded.
+            velocity_pi (dict | None): ros2_control_math.BodyVelocityPI keyword
+                overrides for dynamic velocity control (kp_lin, ki_lin, kp_ang,
+                ki_ang, i_limit_lin, i_limit_ang, damping_lin, damping_ang). The
+                damping feedforward defaults to the prim's PhysX linear /
+                angular damping.
         """
         self._name = name
         self._robot_prim = robot_prim
@@ -105,13 +119,24 @@ class ROS2ControlReceiver:
         self.verbose = False
         self._update_count = 0
         
-        # Physics API - using scenario.py created instance
-        self._force_api = None
-        self._scenario_force_api = None 
+        # Forces go through a RigidPrim tensor view (N, N*m, body frame), like
+        # the scenario's manual control: PhysxForceAPI's default "acceleration"
+        # mode read a Wrench's newtons as m/s^2 (26x too strong on a 26 kg
+        # vehicle) and, per upstream, stopped the IMU updating. Built lazily
+        # after world.play(); mass / inertia diagonal read from it.
+        self._view = None
+        self._view_failed_warned = False
+        self._mass = 1.0
+        self._inertia = np.ones(3)
+        self._velocity_pi_params = dict(velocity_pi or {})
+        self._vel_pi = None
+        self._stamped_vel = False
         
         print(f"[{self._name}] Initialized for robot prim")
         
-    def initialize(self, enable_ros2=True, vel_topic="/oceansim/robot/vel_cmd", force_topic="/oceansim/robot/force_cmd"):
+    def initialize(self, enable_ros2=True, vel_topic="/oceansim/robot/vel_cmd",
+                   force_topic="/oceansim/robot/force_cmd", stamped_vel=False,
+                   command_timeout=None):
         """
         initialize receiver function
         
@@ -119,17 +144,23 @@ class ROS2ControlReceiver:
             enable_ros2 (bool): whether using ros2
             vel_topic (str): topic name of vel
             force_topic (str): topic name of force(include torque)
+            stamped_vel (bool): subscribe to geometry_msgs/TwistStamped instead
+                of Twist on vel_topic (Nav2's enable_stamped_cmd_vel; the
+                default from Kilted on).
+            command_timeout (float | None): dead-man timeout (s); None keeps 2.0.
         """
         self._enable_ros2 = enable_ros2
         self._vel_topic = vel_topic
         self._force_topic = force_topic
+        self._stamped_vel = bool(stamped_vel)
+        if command_timeout is not None:
+            self.command_timeout = float(command_timeout)
         
         if not self._enable_ros2:
             print(f'[{self._name}] ROS2 disabled by configuration')
             return
         
         self._setup_subscriber()
-        self._setup_physics()
         
         print(f'[{self._name}] Control Receiver Initialized:')
         print(f'[{self._name}] ROS2 Bridge: {self._enable_ros2}')
@@ -139,30 +170,63 @@ class ROS2ControlReceiver:
             print(f'[{self._name}] Robot Prim: {self._robot_prim}')
 
     def set_scenario_force_api(self, scenario_force_api):
-        """
-        setting the force api
-        """
-        self._scenario_force_api = scenario_force_api
-        
-    def _setup_physics(self):
-        """
-        setting the physics control API(PXR)
-        """
-        if not PXR_AVAILABLE:
-            print(f'[{self._name}] PXR not available, physics API disabled')
-            return
-            
+        """Deprecated no-op: forces are applied through a RigidPrim view now
+        (see __init__), not PhysxForceAPI. Kept so older callers don't break."""
+
+    def _ensure_view(self):
+        """The robot's RigidPrim view, created on first use after world.play()
+        (it needs the physics simulation view). Returns None until then."""
+        if self._view is not None:
+            return self._view
         try:
-            if self._scenario_force_api is not None:
-                self._force_api = self._scenario_force_api
-            else:
-                if self._robot_prim.HasAPI(PhysxSchema.PhysxForceAPI):
-                    self._force_api = PhysxSchema.PhysxForceAPI(self._robot_prim)
-                else:
-                    self._force_api = PhysxSchema.PhysxForceAPI.Apply(self._robot_prim)
-                
-        except Exception as e:
-            print(f'[{self._name}] Physics API set failed: {e}')
+            view = RigidPrim(prim_paths_expr=get_prim_path(self._robot_prim))
+            view.initialize()
+        except Exception as e:  # noqa: BLE001 - physics not live yet: retry next step
+            if not self._view_failed_warned:
+                self._view_failed_warned = True
+                print(f'[{self._name}] rigid-body view not ready yet ({e}); retrying')
+            return None
+        self._view = view
+
+        def _np(a):
+            return a.numpy() if hasattr(a, "numpy") else np.asarray(a)
+        try:
+            mass = float(_np(view.get_masses()).reshape(-1)[0])
+            inertia = _np(view.get_inertias()).reshape(-1, 9)[0]
+            diag = np.array([inertia[0], inertia[4], inertia[8]], dtype=float)
+            if mass > 0.0:
+                self._mass = mass
+            if np.all(np.isfinite(diag)) and np.all(diag > 0.0):
+                self._inertia = diag
+        except Exception as e:  # noqa: BLE001
+            print(f'[{self._name}] could not read mass / inertia ({e}); '
+                  f'dynamic velocity control uses unit mass / inertia')
+        return view
+
+    def _prim_damping(self):
+        """(linear, angular) PhysX damping (1/s) of the robot body -- the
+        platforms' water-drag proxy, used as the velocity loop's feedforward."""
+        if not PXR_AVAILABLE or self._robot_prim is None:
+            return 0.0, 0.0
+        try:
+            api = PhysxSchema.PhysxRigidBodyAPI(self._robot_prim)
+            lin = api.GetLinearDampingAttr().Get()
+            ang = api.GetAngularDampingAttr().Get()
+            return float(lin or 0.0), float(ang or 0.0)
+        except Exception:  # noqa: BLE001 - API not applied: no feedforward
+            return 0.0, 0.0
+
+    def _ensure_vel_pi(self):
+        if self._vel_pi is None:
+            params = dict(self._velocity_pi_params)
+            lin_d, ang_d = self._prim_damping()
+            params.setdefault("damping_lin", lin_d)
+            params.setdefault("damping_ang", ang_d)
+            self._vel_pi = ros2_control_math.BodyVelocityPI(**params)
+            print(f'[{self._name}] dynamic velocity control: kp={self._vel_pi.kp[[0, 3]].tolist()}, '
+                  f'ki={self._vel_pi.ki[[0, 3]].tolist()}, '
+                  f'damping feedforward={self._vel_pi.damping[[0, 3]].tolist()} 1/s')
+        return self._vel_pi
     
     def _setup_subscriber(self):
         """
@@ -170,9 +234,7 @@ class ROS2ControlReceiver:
         """
         try:
             # import ROS2 module
-            from sensor_msgs.msg import Image
-            from geometry_msgs.msg import Twist, Wrench
-            from std_msgs.msg import Header
+            from geometry_msgs.msg import Twist, TwistStamped, Wrench
             
             # Initialize/share the rclpy context (ref-counted across components)
             ros2_context.acquire()
@@ -182,7 +244,7 @@ class ROS2ControlReceiver:
             node_name = f'oceansim_rob_velocity_control_{self._name.lower()}'.replace(' ', '_')
             self._ros2_vel_node = rclpy.create_node(node_name)
             self._ros2_vel_subscriber = self._ros2_vel_node.create_subscription(
-                Twist,
+                TwistStamped if self._stamped_vel else Twist,
                 self._vel_topic,
                 self._vel_callback,
                 10
@@ -215,12 +277,12 @@ class ROS2ControlReceiver:
             print(f'[{self._name}] ROS2 subscriber setup failed: {e}')
 
     def _setup_ros2_control_mode(self, ctrl_mode):
-        new_mode = None
-        if ctrl_mode == "velocity control":
-            new_mode = ROS2_CONTROL_MODE.VEL
-        elif ctrl_mode == "force control":
-            new_mode = ROS2_CONTROL_MODE.FORCE
-        if new_mode is None or new_mode == self._ros2_control_mode:
+        new_mode = CONTROL_MODE_NAMES.get(ctrl_mode)
+        if new_mode is None:
+            print(f'[{self._name}] unknown ROS2 control mode {ctrl_mode!r}; '
+                  f'expected one of {list(CONTROL_MODE_NAMES)}')
+            return
+        if new_mode == self._ros2_control_mode:
             return
         # Mode switch safety:
         # 1. Flush both nodes' queues with callbacks discarding, so a command
@@ -229,9 +291,8 @@ class ROS2ControlReceiver:
         #    replayed as a fresh command -- defeating the dead-man watchdog.
         # 2. Zero the cached commands and mark them stale, so nothing actuates
         #    until a genuinely fresh post-switch command arrives.
-        # 3. Clear any residual PhysxForceAPI force/torque: the attrs persist on
-        #    the prim, so leaving force mode used to keep the last wrench
-        #    applied forever underneath the new velocity control.
+        # (Forces go through the tensor view and last one step, so nothing
+        # persists across the switch; the velocity loop's integral is reset.)
         self._discard_commands = True
         try:
             for node in (self._ros2_vel_node, self._ros2_force_node):
@@ -246,22 +307,20 @@ class ROS2ControlReceiver:
         self.force_cmd = [0.0, 0.0, 0.0]
         self.torque_cmd = [0.0, 0.0, 0.0]
         self.last_command_time = time.monotonic() - (self.command_timeout + 1.0)
-        if PXR_AVAILABLE and self._force_api:
-            try:
-                self._force_api.CreateForceAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-                self._force_api.CreateTorqueAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-            except Exception as e:  # noqa: BLE001
-                print(f'[{self._name}] could not clear residual force on mode switch: {e}')
+        if self._vel_pi is not None:
+            self._vel_pi.reset()
         self._ros2_control_mode = new_mode
     
     def _vel_callback(self, msg):
         """
-        msg type: geometry_msgs/Twist
+        msg type: geometry_msgs/Twist, or TwistStamped with stamped_vel
 
         include linear and angular velocity
         """
         if self._discard_commands:
             return  # mode-switch queue flush in progress
+        if self._stamped_vel:
+            msg = msg.twist
         if self.verbose:
             print(f'[{self._name}] receive ROS2 msg, type: {type(msg).__name__}, linear: {msg.linear}, angular: {msg.angular}')
 
@@ -323,11 +382,13 @@ class ROS2ControlReceiver:
         """
         return ros2_control_math.clamp_magnitude(vec, max_mag)
 
-    def update_control(self):
+    def update_control(self, dt=None):
         """
         update control
         
         this function will be called in each simulation step. ( in scenario.update_scenario() )
+        dt (float | None): the physics step, for the dynamic velocity loop's
+        integral (None: P + feedforward only this step).
         """
         if not self._enable_ros2 or not self._ros2_vel_node or not self._ros2_force_node:
             return
@@ -359,26 +420,55 @@ class ROS2ControlReceiver:
                 self._rigid_prim.set_linear_velocity(lin_w)
                 self._rigid_prim.set_angular_velocity(ang_w)
 
+            elif self._ros2_control_mode == ROS2_CONTROL_MODE.VEL_DYNAMIC:
+                self._drain_node(self._ros2_vel_node)
+                stale = self._is_command_stale()
+                view = self._ensure_view()
+                if view is None:
+                    return
+                # Dead-man: a stale link commands zero velocity -- the loop
+                # actively brakes and holds, like the kinematic mode's stop.
+                lin_cmd = [0.0, 0.0, 0.0] if stale else self.linear_vel
+                ang_cmd = [0.0, 0.0, 0.0] if stale else self.angular_vel
+                lin_b, ang_b = self._body_velocity(view)
+                acc_lin, acc_ang = self._ensure_vel_pi().update(
+                    lin_cmd, ang_cmd, lin_b, ang_b, dt)
+                force, torque = ros2_control_math.body_wrench(
+                    acc_lin, acc_ang, self._mass, self._inertia)
+                self._apply_body_wrench(view, force, torque)
+
             elif self._ros2_control_mode == ROS2_CONTROL_MODE.FORCE: # force mode
-                # using PXR API to control
-                if PXR_AVAILABLE:
-                    self._drain_node(self._ros2_force_node)
-                    stale = self._is_command_stale()
-
-                    force_cmd = [0.0, 0.0, 0.0] if stale else self.force_cmd
-                    torque_cmd = [0.0, 0.0, 0.0] if stale else self.torque_cmd
-                    force_gf = Gf.Vec3f(float(force_cmd[0]), float(force_cmd[1]), float(force_cmd[2]))
-                    torque_gf = Gf.Vec3f(float(torque_cmd[0]), float(torque_cmd[1]), float(torque_cmd[2]))
-
-                    if self._force_api:
-                        try:
-                            self._force_api.CreateForceAttr().Set(force_gf)
-                            self._force_api.CreateTorqueAttr().Set(torque_gf)
-                        except Exception as e:
-                            print(f'[{self._name}] Force API Update Failed: {e}')
+                self._drain_node(self._ros2_force_node)
+                if self._is_command_stale():
+                    return  # view forces last one step: nothing applied = zero wrench
+                view = self._ensure_view()
+                if view is None:
+                    return
+                self._apply_body_wrench(view, self.force_cmd, self.torque_cmd)
 
         except Exception as e:
             print(f'[{self._name}] Control Update Failed: {e}')
+
+    def _body_velocity(self, view):
+        """Measured (linear m/s, angular rad/s) body-frame velocity."""
+        def _np(a):
+            return a.numpy() if hasattr(a, "numpy") else np.asarray(a)
+        _, quats = view.get_world_poses()
+        quat = _np(quats).reshape(-1, 4)[0]
+        lin_w = _np(view.get_linear_velocities()).reshape(-1, 3)[0]
+        ang_w = _np(view.get_angular_velocities()).reshape(-1, 3)[0]
+        return (ros2_control_math.world_to_body(quat, lin_w),
+                ros2_control_math.world_to_body(quat, ang_w))
+
+    def _apply_body_wrench(self, view, force, torque):
+        """Apply a body-frame force (N) / torque (N*m) at the centre of mass for
+        this physics step, clamped to max_force / max_torque."""
+        force = self._clamp_magnitude(force, self._max_force)
+        torque = self._clamp_magnitude(torque, self._max_torque)
+        view.apply_forces_and_torques_at_pos(
+            forces=np.asarray(force, dtype=np.float32).reshape(1, 3),
+            torques=np.asarray(torque, dtype=np.float32).reshape(1, 3),
+            is_global=False)
 
     def _drain_node(self, node, max_msgs: int = 16):
         """Dispatch every queued callback on ``node`` (bounded), stopping as soon
@@ -434,6 +524,8 @@ class ROS2ControlReceiver:
                 self._ros2_force_node = None
 
             self._update_count = 0
+            self._view = None
+            self._vel_pi = None
             self.force_cmd = [0.0, 0.0, 0.0]
             self.torque_cmd = [0.0, 0.0, 0.0]
             self.linear_vel = [0.0, 0.0, 0.0]

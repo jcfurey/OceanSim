@@ -109,12 +109,22 @@ def load_config(args):
         "physics_dt": 1.0 / 60.0,
         "rendering_dt": 1.0 / 60.0,
         "control_mode": "ROS control",
-        # Optional clamps on incoming ROS2 vel/force commands (magnitude,
-        # direction-preserving). None = unbounded. No repo-documented
-        # physical limits exist yet for this vehicle -- set real numbers
-        # here once they're known.
+        # ROS control. ros2_mode: "velocity control" (kinematic: sets the body
+        # velocity every step), "force control" (geometry_msgs/Wrench in N /
+        # N*m, body frame) or "dynamic velocity control" (cmd_vel tracked by a
+        # PI loop through forces, so buoyancy / drag / collisions still act --
+        # see ros2_control_math.BodyVelocityPI; velocity_pi overrides its
+        # gains). stamped_cmd_vel subscribes TwistStamped (Nav2
+        # enable_stamped_cmd_vel). command_timeout is the dead-man timeout (s).
+        # max_* clamp command / wrench magnitudes (direction-preserving); None =
+        # unbounded -- no repo-documented physical limits exist yet.
         "control_params": {"max_linear_vel": None, "max_angular_vel": None,
-                           "max_force": None, "max_torque": None},
+                           "max_force": None, "max_torque": None,
+                           "ros2_mode": "velocity control",
+                           "vel_topic": "/oceansim/robot/vel_cmd",
+                           "force_topic": "/oceansim/robot/force_cmd",
+                           "stamped_cmd_vel": False, "command_timeout": 2.0,
+                           "velocity_pi": {}},
         "scene_usd": "",
         "asset_path": "",
         # Vehicle platform (utils.platforms). Its spec provides the USD, mass,
