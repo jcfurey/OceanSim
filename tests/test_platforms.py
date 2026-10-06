@@ -27,8 +27,9 @@ def p():
 
 # --- registry --------------------------------------------------------------
 
-def test_both_platforms_registered(p):
-    assert set(p.available_platforms()) == {"bluerov2", "deeptrekker_revolution"}
+def test_platforms_registered(p):
+    assert set(p.available_platforms()) == {"bluerov2", "bluerov2_heavy", "deeptrekker_revolution"}
+    assert p.get_platform("bluerov2heavy").name == "bluerov2_heavy"
 
 
 def test_lookup_is_case_and_alias_insensitive(p):
@@ -46,11 +47,12 @@ def test_unknown_platform_raises_with_options(p):
 
 
 def test_bluerov2_values_locked(p):
-    """Regression lock: selecting bluerov2 must reproduce the values that were
-    hardcoded before the registry (behaviour-preserving refactor)."""
+    """Regression lock: selecting bluerov2 reproduces the values that were
+    hardcoded before the registry, except the in-air mass, which is now the
+    real 11.5 kg (it was 5.0) for the hydrodynamic model."""
     b = p.get_platform("bluerov2")
     assert b.usd_subpath == os.path.join("Bluerov", "BROV_low.usd")
-    assert b.mass == 5.0
+    assert b.mass == 11.5
     assert b.linear_damping == 10.0 and b.angular_damping == 10.0
     assert b.collision_approximation == "boundingCube"
     assert b.spawn_translation == (-2.0, 0.0, -0.8)
@@ -165,3 +167,102 @@ def test_source_missing_reports_paths(p, tmp_path):
 def test_source_nothing_configured(p):
     src, why = p.resolve_robot_source()
     assert src is None and why == "none"
+
+
+# --- hydrodynamic models ----------------------------------------------------------
+
+_VD_PATH = os.path.join(os.path.dirname(__file__), "..", "isaacsim", "oceansim",
+                        "utils", "vehicle_dynamics.py")
+
+
+@pytest.fixture(scope="module")
+def vd():
+    pytest.importorskip("numpy")
+    spec = importlib.util.spec_from_file_location("vehicle_dynamics", _VD_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+KNOT = 0.514444
+
+
+def _top_speed(vd, plat, axis, sign=1.0):
+    """Steady speed along body ``axis`` (0-5) at full thrust in that direction."""
+    import numpy as np
+    model = vd.from_platform(plat)
+    d = np.zeros(6)
+    d[axis] = sign
+    f = float(model.max_wrench(d)[axis]) * sign
+    q = model.hydro.quadratic_damping[axis]
+    lin = model.hydro.linear_damping[axis]
+    return (-lin + (lin * lin + 4 * q * f) ** 0.5) / (2 * q)
+
+
+@pytest.mark.parametrize("name", ["bluerov2", "bluerov2_heavy", "deeptrekker_revolution"])
+def test_hydro_models_are_physical(p, vd, name):
+    import numpy as np
+    plat = p.get_platform(name)
+    h = plat.hydro
+    assert h is not None and h.sources
+    model = vd.from_platform(plat)
+    # near neutral: |net buoyancy| within 2% of weight in fresh water
+    net = 1000.0 * h.displaced_volume - plat.mass
+    assert abs(net) < 0.02 * plat.mass
+    assert h.cob[2] > 0.0                                  # statically stable
+    assert all(v > 0 for v in h.inertia)
+    assert all(v >= 0 for v in h.added_mass + h.linear_damping + h.quadratic_damping)
+    rank = np.linalg.matrix_rank(model.thrusters.B)
+    assert rank == (6 if name == "bluerov2_heavy" else 5)   # 6-thruster frames: no pitch
+    for axis in (0, 1, 2, 5):
+        assert np.abs(model.max_wrench(np.eye(6)[axis])[axis]) > 1.0
+
+
+def test_bluerov2_speeds_bracketed_by_measurement_and_claim(p, vd):
+    """0.72 m/s measured by von Benzon et al. at lower thrust (tethered),
+    1.5 m/s quoted by Blue Robotics: the model sits between."""
+    u = _top_speed(vd, p.get_platform("bluerov2"), 0)
+    assert 0.72 < u < 1.5
+    assert _top_speed(vd, p.get_platform("bluerov2_heavy"), 2) > _top_speed(
+        vd, p.get_platform("bluerov2"), 2)          # 4 vertical thrusters vs 2
+
+
+def test_revolution_matches_listed_speeds(p, vd):
+    rev = p.get_platform("deeptrekker_revolution")
+    assert _top_speed(vd, rev, 0) == pytest.approx(3 * KNOT, rel=0.01)
+    assert _top_speed(vd, rev, 0, -1.0) == pytest.approx(3 * KNOT, rel=0.01)
+    assert _top_speed(vd, rev, 1) == pytest.approx(2 * KNOT, rel=0.01)
+    assert _top_speed(vd, rev, 2) == pytest.approx(3 * KNOT, rel=0.01)
+    import numpy as np
+    assert np.abs(vd.from_platform(rev).max_wrench(np.eye(6)[0])[0]) == pytest.approx(12 * 9.81, rel=1e-3)
+
+
+def test_revolution_added_mass_is_the_ellipsoid_estimate(p, vd):
+    rev = p.get_platform("deeptrekker_revolution")
+    est = vd.ellipsoid_added_mass(0.717 / 2, 0.44 / 2, 0.235 / 2, 1000.0,
+                                  rev.hydro.displaced_volume)
+    assert list(rev.hydro.added_mass) == pytest.approx(est.tolist(), rel=2e-3)
+
+
+def test_thruster_voltage_and_drag_overrides(p, vd):
+    plat = p.get_platform("bluerov2")
+    hi = vd.from_platform(plat, voltage=20.0)
+    assert hi.thrusters.max_forward[0] == pytest.approx(6.7 * 9.81)
+    slow = vd.from_platform(plat, drag_scale=2.0)
+    assert slow.hydro.quadratic_damping[0] == pytest.approx(282.0)
+
+
+def test_strip_theory_rotational_drag_checked_on_bluerov2(p):
+    """The Revolution's rotational drag comes from strip theory. Applied to the
+    BlueROV2 Heavy (0.46 x 0.58 x 0.38 m, Table 5 of von Benzon et al.) with its
+    measured translational drag coefficients, the same formulas land within a
+    factor of two of its measured rotational coefficients."""
+    rho, length, width, height = 1000.0, 0.46, 0.58, 0.38
+    q = p.get_platform("bluerov2_heavy").hydro.quadratic_damping
+    cd_y = 2 * q[1] / (rho * 0.1131)          # A_v
+    cd_z = 2 * q[2] / (rho * 0.2049)          # A_w
+    strip = (rho * cd_z * length * width ** 4 / 64,
+             rho * cd_z * width * length ** 4 / 64,
+             rho * cd_y * height * length ** 4 / 64)
+    for est, measured in zip(strip, q[3:]):
+        assert 0.5 < est / measured < 2.0
